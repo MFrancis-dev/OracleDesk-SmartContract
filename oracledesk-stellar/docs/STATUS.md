@@ -1,9 +1,10 @@
 # Status
 
-Last updated: 2026-09-21 (contributor addenda 2026-10-16 — see the sections
-after this intro). This is the honest account of what works, what's
-unverified, and what's left. Everything marked "verified" was demonstrated
-with real command output in the session that wrote this file, not asserted.
+Last updated: 2026-09-21 (contributor addenda 2026-10-16 and 2026-10-17 —
+see the first section after this intro). This is the honest account of what
+works, what's unverified, and what's left. Everything marked "verified" was
+demonstrated with real command output in the session that wrote this file,
+not asserted.
 
 ## Contributor addendum: 2026-10-16
 
@@ -21,6 +22,12 @@ intended diffs. **Not** (re)verified: no testnet redeploy — the deployed
 contracts and `deployments/testnet.json` predate these changes, so the new
 entrypoints have contract-level and off-chain tests only, not a real-ledger
 transaction.
+
+### Merge follow-up: 2026-10-17
+
+The work above landed on `develop` as merge commit `581a3ec` (PR #153,
+merged 2026-10-16), so the feature-branch reference above is historical and
+`develop` is the source of truth for #8, #10, #12 and #13.
 
 ## Contributor addendum: 2026-10-16 — categorical (#6), scalar (#7), dynamic fees (#9)
 
