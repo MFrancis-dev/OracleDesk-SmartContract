@@ -97,3 +97,9 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
   and treasury genuinely only ever interact with market-core's wasm, never
   its Rust source) and was the officially documented pattern for this in
   soroban-sdk's own `contractimport!` example.
+- **Vendoring `reasoning_registry.wasm` in `resolver`**: Similarly, to support
+  verifying cryptographic traces for attestation evidence (#34) without pulling
+  the reasoning-registry crate into cdylib builds, `contracts/resolver/reasoning_registry.wasm`
+  is imported via `soroban_sdk::contractimport!(file = "reasoning_registry.wasm")`.
+  `make build` ensures both `market_core.wasm` and `reasoning_registry.wasm` are
+  compiled and placed prior to resolver compilation.

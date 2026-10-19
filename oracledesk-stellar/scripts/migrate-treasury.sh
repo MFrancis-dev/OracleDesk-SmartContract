@@ -74,6 +74,19 @@ CONFIG_MARKET_CORE=$(jq -r '.market_core' <<<"$CONFIG")
 MAX_TRADE=$(jq -r '.max_trade' <<<"$CONFIG")
 MAX_MARKET=$(jq -r '.max_market' <<<"$CONFIG")
 MAX_DAILY=$(jq -r '.max_daily' <<<"$CONFIG")
+# Treasuries deployed before the net cap have no get_net_cap; fall back to an
+# explicit MAX_NET_EXPOSURE, else max_daily (the contract's own fallback).
+if [ -z "${MAX_NET_EXPOSURE:-}" ]; then
+  MAX_NET_EXPOSURE=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- get_net_cap 2>/dev/null | tr -d '"' || true)
+  MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
+fi
+# Treasuries deployed before the config timelock have no config_delay.
+if [ -z "${CONFIG_DELAY:-}" ]; then
+  CONFIG_DELAY=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- config_delay 2>/dev/null | tr -d '"' || true)
+  CONFIG_DELAY=${CONFIG_DELAY:-86400}
+fi
 if [ "$CONFIG_MARKET_CORE" != "$MARKET_CORE" ]; then
   log "warning: old treasury points at $CONFIG_MARKET_CORE, $OUT records $MARKET_CORE"
 fi
@@ -94,7 +107,9 @@ if [ -z "$NEW_TREASURY" ]; then
     --market_core "$MARKET_CORE" \
     --max_trade "$MAX_TRADE" \
     --max_market "$MAX_MARKET" \
-    --max_daily "$MAX_DAILY")
+    --max_daily "$MAX_DAILY" \
+    --max_net_exposure "$MAX_NET_EXPOSURE" \
+    --config_delay "$CONFIG_DELAY")
   json_set --arg id "$NEW_TREASURY" '.contracts.treasury_successor = $id'
 else
   log "successor treasury already recorded: $NEW_TREASURY"

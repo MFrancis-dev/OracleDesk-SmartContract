@@ -24,6 +24,12 @@ mod market_core {
 }
 use market_core::{Client as MarketCoreClient, MarketKind, Outcome};
 
+#[allow(clippy::too_many_arguments)]
+mod reasoning_registry {
+    soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
+}
+use reasoning_registry::Client as RegistryClient;
+
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
@@ -49,6 +55,20 @@ const ATTEST_DOMAIN: &[u8] = b"oracledesk-attest-v1";
 /// void it through [`Resolver::expire_market`]. A compile-time constant on
 /// purpose: an admin setter could shorten it and void markets early.
 pub const RESOLUTION_GRACE_SECS: u64 = 30 * 86_400;
+
+/// Maximum members a reusable committee registry may have.
+pub const MAX_COMMITTEE: u32 = 32;
+/// Minimum time-lock delay for proposing and executing committee rotations (1 day).
+pub const MIN_ROTATION_DELAY: u64 = 86_400;
+
+/// Grace period for revealing specs before guardian void is allowed (3 days).
+pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
+/// Grace period for oracle recovery before guardian void is allowed (1 day).
+pub const ORACLE_GRACE_SECS: u64 = 86_400;
+/// Grace period for stalled signers before guardian void is allowed (7 days).
+pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
+/// Maximum number of proposal cancellations per market allowed by the guardian.
+pub const MAX_CANCELS_PER_MARKET: u32 = 2;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +103,8 @@ pub enum ResolutionState {
     Expired,
     /// A bonded dispute is open; finalization is frozen until it settles.
     Disputed,
+    HybridPricePending,
+    HybridFallbackOpen,
 }
 
 impl ResolutionState {
@@ -121,11 +143,65 @@ pub struct SignerConfig {
     pub dispute_window: u64,
 }
 
+/// Legacy proposal shape, stored under [`DataKey::Proposal`]. Only read (as a
+/// fallback) by resolvers that inherited state from before `AttestedOutcome`;
+/// see [`SignerProposalV2`] and `docs/adr/0003-attested-outcome-migration.md`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignerProposal {
     pub outcome: Outcome,
     pub proposed_at: u64,
+}
+
+/// What a signer attests to. Resolver-local so market-core's `Outcome` (and
+/// the vendored `market_core.wasm`) never gains an `Invalid` variant: an
+/// `Invalid` proposal finalizes through market-core's `void_market` instead
+/// of `resolve`. Never part of a `ResolutionSpec`, so commitment hashes are
+/// unaffected (ADR 0001).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttestedOutcome {
+    Yes,
+    No,
+    /// The question is ambiguous or unanswerable; finalizing voids the market.
+    Invalid,
+}
+
+impl AttestedOutcome {
+    /// The market-core outcome this settles to; `None` for `Invalid` (void).
+    fn to_market(self) -> Option<Outcome> {
+        match self {
+            Self::Yes => Some(Outcome::Yes),
+            Self::No => Some(Outcome::No),
+            Self::Invalid => None,
+        }
+    }
+
+    fn from_market(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Yes => Self::Yes,
+            Outcome::No => Self::No,
+        }
+    }
+}
+
+/// The pending proposal of a signer-mode market, stored under
+/// [`DataKey::ProposalV2`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerProposalV2 {
+    pub outcome: AttestedOutcome,
+    pub proposed_at: u64,
+}
+
+/// A price read pinned by [`Resolver::snapshot_price`] so resolution survives
+/// the oracle aging the `close_time` record out of its history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceSnapshot {
+    pub data: PriceData,
+    pub taken_at: u64,
+    pub taken_by: Address,
 }
 
 /// Who rules on a dispute.
@@ -239,6 +315,89 @@ pub struct ScalarPriceConfig {
     pub max_staleness: u64,
 }
 
+/// Reusable committee managed by an admin under time-locked rotation rules.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Committee {
+    pub admin: Address,
+    pub members: Vec<Address>,
+    pub threshold: u32,
+    pub epoch: u32,
+    pub rotation_delay: u64,
+}
+
+/// A proposed rotation of committee members/threshold waiting for its delay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRotation {
+    pub members: Vec<Address>,
+    pub threshold: u32,
+    pub executable_at: u64,
+}
+
+/// Binds a market to a reusable committee registry subject to rotation bounds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeRef {
+    pub committee_id: u64,
+    pub min_epoch: u32,
+    pub max_rotation_delta: u32,
+    pub dispute_window: u64,
+}
+
+/// Dual-path resolution mode: price feed first, falling back to signers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HybridConfig {
+    pub price: PriceConfig,
+    pub fallback: SignerConfig,
+    pub fallback_after: u64,
+}
+
+/// Evidence policy governing whether attestation evidence is required.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidencePolicy {
+    Disabled,
+    Optional,
+    Required,
+}
+
+/// Stored link connecting an attestation to a reasoning registry trace.
+/// `outcome` was a market-core `Outcome` before `Invalid` attestations; the
+/// two enums encode `Yes`/`No` identically, so earlier entries still decode.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationEvidence {
+    pub signer: Address,
+    pub outcome: AttestedOutcome,
+    pub trace_id: u64,
+    pub trace_hash: BytesN<32>,
+    pub attested_at: u64,
+}
+
+/// Reason code constraining guardian interventions.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianReason {
+    /// Past close_time + REVEAL_GRACE_SECS, no spec revealed.
+    UnrevealedSpec,
+    /// Price mode, past close_time + ORACLE_GRACE_SECS, price feed unavailable or stale.
+    OracleUnavailable,
+    /// Signer mode, past close_time + SIGNER_GRACE_SECS, no proposal.
+    SignersStalled,
+    /// Proposal exists and dispute window is currently active.
+    DisputeUpheld,
+}
+
+/// Guardian action type emitted for audit trails.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianActionKind {
+    Void,
+    CancelProposal,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
@@ -258,6 +417,8 @@ pub enum ResolutionSpec {
     /// Scalar counterpart of `Price` (appended, tag 5): the binary pool
     /// settles at a fractional LONG payout instead of a side.
     Scalar(ScalarPriceConfig),
+    Committee(CommitteeRef),
+    Hybrid(HybridConfig),
 }
 
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
@@ -322,8 +483,25 @@ pub enum Error {
     TooManySignatures = 23,
     DisputeWindowClosed = 24,
     NoDispute = 25,
+    CommitteeNotFound = 26,
+    RotationPending = 27,
+    RotationNotReady = 28,
+    RotationBoundExceeded = 29,
+    DuplicateMember = 30,
+    CommitteeTooLarge = 31,
+    EvidenceDisabled = 32,
+    EvidenceRequired = 33,
+    EvidenceNotFound = 34,
+    EvidenceAuthorMismatch = 35,
+    EvidenceMarketMismatch = 36,
+    EvidenceTooEarly = 37,
+    EvidenceAlreadyUsed = 38,
+    GuardianNotAllowed = 39,
+    TooManyCancels = 40,
+    SnapshotExists = 41,
+
     /// `attest_cat` outcome index not below the committed `outcome_count`.
-    InvalidOutcomeIndex = 26,
+    InvalidOutcomeIndex = 42,
 }
 
 #[contracttype]
@@ -332,6 +510,9 @@ pub enum DataKey {
     MarketCore,
     Price(u64),
     Signers(u64),
+    /// Legacy (pre-`AttestedOutcome`) keys: never written any more, only read
+    /// as a fallback and deleted on migration. See `ProposalV2`/`AttestationV2`/
+    /// `CountV2` and `docs/adr/0003-attested-outcome-migration.md`.
     Proposal(u64),
     Attestation(u64, Outcome, Address),
     Count(u64, Outcome),
@@ -347,6 +528,27 @@ pub enum DataKey {
     Dispute(u64),
     EscalationVote(u64, Address),
     EscalationCount(u64, Verdict),
+    NextCommitteeId,
+    Committee(u64),
+    Rotation(u64),
+    CommitteeSpec(u64),
+    MemberAt(u64, u32),
+    AttestEpoch(u64, Address),
+    Hybrid(u64),
+    EvidenceConfig,
+    EvidencePolicy(u64),
+    EvidenceUsed(u64),
+    EvidenceCount(u64),
+    Evidence(u64, u32),
+    Cancels(u64),
+    /// Versioned rather than reusing `Attestation`/`Count`/`Proposal` with a
+    /// new payload type: explicit V2 keys keep the migration auditable and do
+    /// not depend on the two outcome enums happening to share an encoding.
+    AttestationV2(u64, AttestedOutcome, Address),
+    CountV2(u64, AttestedOutcome),
+    ProposalV2(u64),
+    Snapshot(u64),
+
     // appended (new variants only ever go at the end — the XDR tag is the
     // variant position)
     /// Registered `CatSignerConfig` of a categorical market.
@@ -360,21 +562,25 @@ pub enum DataKey {
     Scalar(u64),
 }
 
-/// The registered signer committee, whichever kind the market committed to.
+/// The registered signer group/authority, whichever kind the market committed to.
 /// Gives `finalize_signers` and `expire_market` one view of "dispute window"
 /// and "does this outcome have quorum".
-enum Committee {
+enum SignerAuthority {
     Signers(SignerConfig),
     Weighted(WeightedKeyConfig),
     Disputable(DisputableSignerConfig),
+    Committee(CommitteeRef, Committee),
+    Hybrid(HybridConfig),
 }
 
-impl Committee {
+impl SignerAuthority {
     fn dispute_window(&self) -> u64 {
         match self {
             Self::Signers(cfg) => cfg.dispute_window,
             Self::Weighted(cfg) => cfg.dispute_window,
             Self::Disputable(cfg) => cfg.dispute_window,
+            Self::Committee(r, _) => r.dispute_window,
+            Self::Hybrid(cfg) => cfg.fallback.dispute_window,
         }
     }
 }
@@ -389,6 +595,32 @@ pub struct PriceResolution {
     pub outcome: Outcome,
 }
 
+/// `PriceResolution` plus whether the price came from a stored
+/// [`PriceSnapshot`]. Both are emitted for one release so indexers decoding
+/// `PriceResolution` keep working while they move to this event.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceResolutionV2 {
+    #[topic]
+    pub market_id: u64,
+    pub price: i128,
+    pub price_timestamp: u64,
+    pub outcome: Outcome,
+    pub from_snapshot: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceSnapshotted {
+    #[topic]
+    pub market_id: u64,
+    pub price: i128,
+    pub price_timestamp: u64,
+    pub taken_by: Address,
+}
+
+/// No longer emitted (superseded by [`ResolutionFinalizedV2`]); kept in the
+/// contract spec so clients can still decode historical events.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionFinalized {
@@ -398,6 +630,8 @@ pub struct ResolutionFinalized {
     pub finalized_at: u64,
 }
 
+/// No longer emitted (superseded by [`ResolutionProposedV2`]); kept in the
+/// contract spec so clients can still decode historical events.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionProposed {
@@ -405,6 +639,35 @@ pub struct ResolutionProposed {
     pub market_id: u64,
     pub outcome: Outcome,
     pub proposed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionFinalizedV2 {
+    #[topic]
+    pub market_id: u64,
+    pub outcome: AttestedOutcome,
+    pub finalized_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionProposedV2 {
+    #[topic]
+    pub market_id: u64,
+    pub outcome: AttestedOutcome,
+    pub proposed_at: u64,
+}
+
+/// A signer committee finalized an `Invalid` proposal and voided the market.
+/// Distinguishes committee voids from `GuardianAction { action: Void }`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeVoided {
+    #[topic]
+    pub market_id: u64,
+    pub finalized_at: u64,
+    pub invalid_count: u32,
 }
 
 #[contractevent]
@@ -420,9 +683,12 @@ pub struct Disputed {
 
 /// `disputer_won` is true when the bond returns to the disputer because the
 /// ruling overturned the proposal. A timeout (`expire_dispute`) also refunds
-/// the bond but is reported as `verdict: Invalid, disputer_won: false`: a
-/// ruling of `Invalid` always overturns, so that pair identifies a timeout.
-/// `payout` is the escrowed bond, claimable by its payee.
+/// the bond but is reported as `verdict: Invalid, disputer_won: false`. That
+/// pair also describes a ruling of `Invalid` that upholds an `Invalid`
+/// proposal; the two differ in the bond's payee (disputer on timeout,
+/// market-core treasury when upheld), readable from the `Dispute` entry
+/// until `claim_dispute_bond` runs. `payout` is the escrowed bond, claimable
+/// by its payee.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeSettled {
@@ -473,6 +739,80 @@ pub struct ScalarPriceResolution {
     pub price: i128,
     pub price_timestamp: u64,
     pub payout_long_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeCreated {
+    #[topic]
+    pub committee_id: u64,
+    pub admin: Address,
+    pub threshold: u32,
+    pub members: Vec<Address>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationProposed {
+    #[topic]
+    pub committee_id: u64,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationExecuted {
+    #[topic]
+    pub committee_id: u64,
+    pub epoch: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationCancelled {
+    #[topic]
+    pub committee_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FallbackOpened {
+    #[topic]
+    pub market_id: u64,
+    pub opened_at: u64,
+    pub last_error: u32,
+}
+
+/// `proposal_outcome` (like `Attested::outcome`) was a market-core `Outcome`;
+/// `Yes`/`No` encode identically, so only `Invalid` is new to decoders.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FallbackSuperseded {
+    #[topic]
+    pub market_id: u64,
+    pub proposal_outcome: AttestedOutcome,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attested {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub signer: Address,
+    pub outcome: AttestedOutcome,
+    pub trace_id: Option<u64>,
+    pub count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianAction {
+    #[topic]
+    pub market_id: u64,
+    pub action: GuardianActionKind,
+    pub reason: GuardianReason,
+    pub at: u64,
 }
 
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
@@ -574,22 +914,351 @@ impl Resolver {
         Self::reveal(&env, market_id, &spec.rule, &spec_v2_hash(&env, &spec))
     }
 
-    /// Guardian action: withdraws an unfinalized signer proposal, e.g. because
-    /// evidence surfaced during the dispute window that it is wrong. For
-    /// address-based signers voting can restart once the counts are cleared by
-    /// re-attesting; a weighted-key market moves to a fresh round, which makes
-    /// every signature collected so far unusable. Works for both the binary
-    /// and the categorical proposal slot.
-    pub fn cancel_proposal(env: Env, market_id: u64) -> Result<(), Error> {
+    /// Registers a reusable committee specification for `market_id`.
+    pub fn register_committee_spec(
+        env: Env,
+        market_id: u64,
+        spec: CommitteeRef,
+    ) -> Result<(), Error> {
+        Self::assert_unconfigured(&env, market_id)?;
+        let committee = Self::load_committee(&env, spec.committee_id)?;
+        if committee.epoch < spec.min_epoch {
+            return Err(Error::RotationBoundExceeded);
+        }
+        if spec.dispute_window == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let rule = ResolutionSpec::Committee(spec);
+        Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
+        Self::store_rule(&env, market_id, &rule);
+        Ok(())
+    }
+
+    /// Registers a hybrid resolution specification (price feed with attested fallback).
+    pub fn register_hybrid_spec(env: Env, market_id: u64, spec: HybridConfig) -> Result<(), Error> {
+        let rule = ResolutionSpec::Hybrid(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
+    /// Creates a reusable committee with an admin, member set, threshold, and time-lock delay.
+    pub fn create_committee(
+        env: Env,
+        admin: Address,
+        members: Vec<Address>,
+        threshold: u32,
+        rotation_delay: u64,
+    ) -> Result<u64, Error> {
+        Self::validate_committee_members(&members)?;
+        if threshold == 0 || threshold > members.len() {
+            return Err(Error::InvalidConfig);
+        }
+        if rotation_delay < MIN_ROTATION_DELAY {
+            return Err(Error::InvalidConfig);
+        }
+        let id_key = DataKey::NextCommitteeId;
+        let id: u64 = env.storage().instance().get(&id_key).unwrap_or(0);
+        env.storage().instance().set(&id_key, &(id + 1));
+
+        let committee = Committee {
+            admin: admin.clone(),
+            members: members.clone(),
+            threshold,
+            epoch: 1,
+            rotation_delay,
+        };
+        let comm_key = DataKey::Committee(id);
+        Self::persist(&env, &comm_key, &committee);
+
+        let snap_key = DataKey::MemberAt(id, 1);
+        Self::persist(&env, &snap_key, &(members.clone(), threshold));
+
+        CommitteeCreated {
+            committee_id: id,
+            admin,
+            threshold,
+            members,
+        }
+        .publish(&env);
+        Ok(id)
+    }
+
+    /// Proposes a new member set and threshold for a committee, executable after rotation_delay.
+    pub fn propose_rotation(
+        env: Env,
+        committee_id: u64,
+        members: Vec<Address>,
+        threshold: u32,
+    ) -> Result<u64, Error> {
+        let committee: Committee = Self::load_committee(&env, committee_id)?;
+        committee.admin.require_auth();
+        let rot_key = DataKey::Rotation(committee_id);
+        if env.storage().persistent().has(&rot_key) {
+            return Err(Error::RotationPending);
+        }
+        Self::validate_committee_members(&members)?;
+        if threshold == 0 || threshold > members.len() {
+            return Err(Error::InvalidConfig);
+        }
+        let executable_at = env
+            .ledger()
+            .timestamp()
+            .saturating_add(committee.rotation_delay);
+        let pending = PendingRotation {
+            members,
+            threshold,
+            executable_at,
+        };
+        Self::persist(&env, &rot_key, &pending);
+        RotationProposed {
+            committee_id,
+            executable_at,
+        }
+        .publish(&env);
+        Ok(executable_at)
+    }
+
+    /// Permissionlessly executes a matured rotation for a committee, bumping its epoch.
+    pub fn execute_rotation(env: Env, committee_id: u64) -> Result<u32, Error> {
+        let mut committee: Committee = Self::load_committee(&env, committee_id)?;
+        let rot_key = DataKey::Rotation(committee_id);
+        let pending: PendingRotation = env
+            .storage()
+            .persistent()
+            .get(&rot_key)
+            .ok_or(Error::RotationNotReady)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::RotationNotReady);
+        }
+        env.storage().persistent().remove(&rot_key);
+        let new_epoch = committee.epoch.checked_add(1).ok_or(Error::InvalidConfig)?;
+        committee.epoch = new_epoch;
+        committee.members = pending.members.clone();
+        committee.threshold = pending.threshold;
+        Self::persist(&env, &DataKey::Committee(committee_id), &committee);
+        Self::persist(
+            &env,
+            &DataKey::MemberAt(committee_id, new_epoch),
+            &(pending.members, pending.threshold),
+        );
+        RotationExecuted {
+            committee_id,
+            epoch: new_epoch,
+        }
+        .publish(&env);
+        Ok(new_epoch)
+    }
+
+    /// Cancels a pending rotation for a committee (admin only).
+    pub fn cancel_rotation(env: Env, committee_id: u64) -> Result<(), Error> {
+        let committee: Committee = Self::load_committee(&env, committee_id)?;
+        committee.admin.require_auth();
+        let rot_key = DataKey::Rotation(committee_id);
+        if !env.storage().persistent().has(&rot_key) {
+            return Err(Error::RotationNotReady);
+        }
+        env.storage().persistent().remove(&rot_key);
+        RotationCancelled { committee_id }.publish(&env);
+        Ok(())
+    }
+
+    /// Reads committee state and extends its storage TTL.
+    pub fn get_committee(env: Env, committee_id: u64) -> Result<Committee, Error> {
+        Self::load_committee(&env, committee_id)
+    }
+
+    /// Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.
+    pub fn open_fallback(env: Env, market_id: u64) -> Result<(), Error> {
+        let config: HybridConfig = Self::load(&env, DataKey::Hybrid(market_id))?;
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let now = env.ledger().timestamp();
+        let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
+        if now < fallback_deadline {
+            return Err(Error::DeadlineNotReached);
+        }
+        // If the price feed recovered and returns a valid price, resolve by price instead of opening fallback.
+        match Self::price_outcome(&env, market_id, &config.price, market.close_time) {
+            Ok((outcome, data, from_snapshot)) => {
+                Self::settle_price(
+                    &env,
+                    &market_core,
+                    market_id,
+                    &outcome,
+                    &data,
+                    from_snapshot,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                Self::set_state(&env, market_id, ResolutionState::HybridFallbackOpen);
+                FallbackOpened {
+                    market_id,
+                    opened_at: now,
+                    last_error: err as u32,
+                }
+                .publish(&env);
+                Ok(())
+            }
+        }
+    }
+
+    /// Configures the reasoning registry contract address and evidence policy (admin only).
+    pub fn set_evidence_config(
+        env: Env,
+        registry: Address,
+        policy: EvidencePolicy,
+    ) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EvidenceConfig, &(registry, policy));
+        Ok(())
+    }
+
+    /// Reads the currently configured evidence settings, if any.
+    pub fn evidence_config(env: Env) -> Option<(Address, EvidencePolicy)> {
+        env.storage().instance().get(&DataKey::EvidenceConfig)
+    }
+
+    /// Total evidence citations recorded for `market_id`.
+    pub fn evidence_count(env: Env, market_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceCount(market_id))
+            .unwrap_or(0)
+    }
+
+    /// Reads the evidence citation at `index` for `market_id`.
+    pub fn evidence_at(env: Env, market_id: u64, index: u32) -> Result<AttestationEvidence, Error> {
+        let key = DataKey::Evidence(market_id, index);
+        let evidence: AttestationEvidence = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EvidenceNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(evidence)
+    }
+
+    /// Total proposal cancellations executed by the guardian for `market_id`.
+    pub fn cancel_count(env: Env, market_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Cancels(market_id))
+            .unwrap_or(0)
+    }
+
+    /// Returns the guardian reason codes valid for `market_id` right now.
+    pub fn guardian_options(env: Env, market_id: u64) -> Vec<GuardianReason> {
+        let mut reasons = Vec::new(&env);
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return reasons;
+        }
+        let Ok(market_core) = Self::instance_get::<Address>(&env, DataKey::MarketCore) else {
+            return reasons;
+        };
+        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let now = env.ledger().timestamp();
+        let storage = env.storage().persistent();
+
+        if let Some(proposal) = Self::load_proposal(&env, market_id) {
+            if let Ok(authority) = Self::signer_authority(&env, market_id) {
+                if now
+                    < proposal
+                        .proposed_at
+                        .saturating_add(authority.dispute_window())
+                {
+                    reasons.push_back(GuardianReason::DisputeUpheld);
+                }
+            }
+        }
+
+        if now >= market.close_time {
+            if Self::expiry_mode(&env, market_id) == ExpiryMode::Unrevealed
+                && now >= market.close_time.saturating_add(REVEAL_GRACE_SECS)
+            {
+                reasons.push_back(GuardianReason::UnrevealedSpec);
+            }
+
+            let price_cfg = if let Some(cfg) =
+                storage.get::<_, PriceConfig>(&DataKey::Price(market_id))
+            {
+                Some(cfg)
+            } else if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+                Some(h.price)
+            } else {
+                None
+            };
+            if let Some(cfg) = price_cfg {
+                if now >= market.close_time.saturating_add(ORACLE_GRACE_SECS) {
+                    if let Err(Error::PriceUnavailable | Error::StalePrice) =
+                        Self::price_outcome(&env, market_id, &cfg, market.close_time)
+                    {
+                        reasons.push_back(GuardianReason::OracleUnavailable);
+                    }
+                }
+            }
+
+            let is_signer_mode = storage.has(&DataKey::Signers(market_id))
+                || storage.has(&DataKey::Disputable(market_id))
+                || storage.has(&DataKey::WeightedKeys(market_id))
+                || storage.has(&DataKey::CommitteeSpec(market_id))
+                || (storage.has(&DataKey::Hybrid(market_id))
+                    && Self::resolution_state(&env, market_id)
+                        == ResolutionState::HybridFallbackOpen);
+            if is_signer_mode
+                && !Self::has_proposal(&env, market_id)
+                && now >= market.close_time.saturating_add(SIGNER_GRACE_SECS)
+            {
+                reasons.push_back(GuardianReason::SignersStalled);
+            }
+        }
+        reasons
+    }
+
+    /// Guardian action: withdraws an unfinalized signer proposal during the dispute window
+    /// subject to a rate limit of MAX_CANCELS_PER_MARKET.
+    ///
+    /// Works the same for an `Invalid` proposal. Only the proposal is removed:
+    /// attestations and per-outcome counts stay, so the next attestation that
+    /// brings any outcome to threshold (for example a further `Yes` once
+    /// `Yes` already has quorum) proposes again. A categorical market keeps its
+    /// pending winner in a separate slot, cleared the same way.
+    pub fn cancel_proposal(env: Env, market_id: u64, reason: GuardianReason) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if reason != GuardianReason::DisputeUpheld {
+            return Err(Error::GuardianNotAllowed);
+        }
         Self::assert_not_disputed(&env, market_id)?;
         let storage = env.storage().persistent();
-        let key = DataKey::Proposal(market_id);
         let cat_key = DataKey::CatProposal(market_id);
-        if !storage.has(&key) && !storage.has(&cat_key) {
-            return Err(Error::NoProposal);
+        let cat_proposal: Option<CatProposal> = storage.get(&cat_key);
+        let proposed_at = match (Self::load_proposal(&env, market_id), &cat_proposal) {
+            (Some(p), _) => p.proposed_at,
+            (None, Some(p)) => p.proposed_at,
+            (None, None) => return Err(Error::NoProposal),
+        };
+        let dispute_window =
+            if let Some(cfg) = storage.get::<_, CatSignerConfig>(&DataKey::CatSigners(market_id)) {
+                cfg.dispute_window
+            } else {
+                Self::signer_authority(&env, market_id)?.dispute_window()
+            };
+        if env.ledger().timestamp() >= proposed_at.saturating_add(dispute_window) {
+            return Err(Error::DisputeWindowClosed);
         }
-        storage.remove(&key);
+        let cancel_key = DataKey::Cancels(market_id);
+        let cancels: u32 = storage.get(&cancel_key).unwrap_or(0);
+        if cancels >= MAX_CANCELS_PER_MARKET {
+            return Err(Error::TooManyCancels);
+        }
+        Self::persist(&env, &cancel_key, &(cancels + 1));
+        Self::remove_proposal(&env, market_id);
         storage.remove(&cat_key);
         if storage.has(&DataKey::WeightedKeys(market_id)) {
             Self::persist(
@@ -598,26 +1267,114 @@ impl Resolver {
                 &(Self::round(&env, market_id) + 1),
             );
         }
+        GuardianAction {
+            market_id,
+            action: GuardianActionKind::CancelProposal,
+            reason: GuardianReason::DisputeUpheld,
+            at: env.ledger().timestamp(),
+        }
+        .publish(&env);
         Ok(())
     }
 
-    /// Guardian action: voids an unresolvable market directly through
-    /// market-core. The resolver is the direct caller, so market-core's
-    /// `require_resolver` check passes the same way `resolve_price` does.
-    pub fn guardian_void_market(env: Env, market_id: u64) -> Result<(), Error> {
+    /// Guardian action: voids a market subject to verified on-chain reason codes and grace periods.
+    pub fn guardian_void_market(
+        env: Env,
+        market_id: u64,
+        reason: GuardianReason,
+    ) -> Result<(), Error> {
         Self::require_admin(&env)?;
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        MarketCoreClient::new(&env, &market_core).void_market(&market_id);
+        let core = MarketCoreClient::new(&env, &market_core);
+        let market = core.get_market(&market_id);
+        let now = env.ledger().timestamp();
+
+        if reason != GuardianReason::DisputeUpheld && now < market.close_time {
+            return Err(Error::GuardianNotAllowed);
+        }
+
+        match reason {
+            GuardianReason::UnrevealedSpec => {
+                if Self::expiry_mode(&env, market_id) != ExpiryMode::Unrevealed {
+                    return Err(Error::GuardianNotAllowed);
+                }
+                if now < market.close_time.saturating_add(REVEAL_GRACE_SECS) {
+                    return Err(Error::GuardianNotAllowed);
+                }
+            }
+            GuardianReason::OracleUnavailable => {
+                let storage = env.storage().persistent();
+                let config: PriceConfig = if let Some(cfg) = storage.get(&DataKey::Price(market_id))
+                {
+                    cfg
+                } else if let Some(hybrid) =
+                    storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id))
+                {
+                    hybrid.price
+                } else {
+                    return Err(Error::GuardianNotAllowed);
+                };
+                if now < market.close_time.saturating_add(ORACLE_GRACE_SECS) {
+                    return Err(Error::GuardianNotAllowed);
+                }
+                match Self::price_outcome(&env, market_id, &config, market.close_time) {
+                    Err(Error::PriceUnavailable | Error::StalePrice) => {}
+                    _ => return Err(Error::GuardianNotAllowed),
+                }
+            }
+            GuardianReason::SignersStalled => {
+                let storage = env.storage().persistent();
+                let is_signer_mode = storage.has(&DataKey::Signers(market_id))
+                    || storage.has(&DataKey::Disputable(market_id))
+                    || storage.has(&DataKey::WeightedKeys(market_id))
+                    || storage.has(&DataKey::CommitteeSpec(market_id))
+                    || (storage.has(&DataKey::Hybrid(market_id))
+                        && Self::resolution_state(&env, market_id)
+                            == ResolutionState::HybridFallbackOpen);
+                if !is_signer_mode || Self::has_proposal(&env, market_id) {
+                    return Err(Error::GuardianNotAllowed);
+                }
+                if now < market.close_time.saturating_add(SIGNER_GRACE_SECS) {
+                    return Err(Error::GuardianNotAllowed);
+                }
+            }
+            GuardianReason::DisputeUpheld => {
+                let Some(proposal) = Self::load_proposal(&env, market_id) else {
+                    return Err(Error::GuardianNotAllowed);
+                };
+                let dispute_window = Self::signer_authority(&env, market_id)?.dispute_window();
+                if now >= proposal.proposed_at.saturating_add(dispute_window) {
+                    return Err(Error::GuardianNotAllowed);
+                }
+            }
+        }
+
+        core.void_market(&market_id);
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        GuardianAction {
+            market_id,
+            action: GuardianActionKind::Void,
+            reason,
+            at: now,
+        }
+        .publish(&env);
         Ok(())
     }
 
     pub fn resolve_price(env: Env, market_id: u64) -> Result<Outcome, Error> {
-        let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
+        let (config, is_hybrid) = if let Ok(cfg) =
+            Self::load::<PriceConfig>(&env, DataKey::Price(market_id))
+        {
+            (cfg, false)
+        } else if let Ok(hybrid) = Self::load::<HybridConfig>(&env, DataKey::Hybrid(market_id)) {
+            (hybrid.price, true)
+        } else {
+            return Err(Error::WrongMode);
+        };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
         if env.ledger().timestamp() < market.close_time {
@@ -626,9 +1383,85 @@ impl Resolver {
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
-        let (outcome, data) = Self::try_price_outcome(&env, &config, market.close_time)?;
-        Self::settle_price(&env, &market_core, market_id, &outcome, &data);
+        // A stored snapshot takes precedence and skips the oracle call; see
+        // `snapshot_price`.
+        let (outcome, data, from_snapshot) =
+            Self::price_outcome(&env, market_id, &config, market.close_time)?;
+        if is_hybrid {
+            if let Some(proposal) = Self::load_proposal(&env, market_id) {
+                Self::remove_proposal(&env, market_id);
+                FallbackSuperseded {
+                    market_id,
+                    proposal_outcome: proposal.outcome,
+                }
+                .publish(&env);
+            }
+        }
+        Self::settle_price(
+            &env,
+            &market_core,
+            market_id,
+            &outcome,
+            &data,
+            from_snapshot,
+        );
         Ok(outcome)
+    }
+
+    /// Pins the committed feed's price for `close_time` in resolver storage,
+    /// so `resolve_price` still works after the oracle's bounded history has
+    /// aged that record out (SEP-40 `price(asset, timestamp)` returns `None`
+    /// outside the retained window). Permissionless: `caller` only authorizes
+    /// being recorded as `taken_by`.
+    ///
+    /// Callable any time after `close_time` while the market is unresolved,
+    /// but in practice it must run within the oracle's retention window (see
+    /// `docs/architecture.md`, "Oracle history retention"). The first valid
+    /// snapshot wins (`SnapshotExists` afterwards): for a fixed
+    /// `(asset, close_time)` the answer is deterministic, and freezing it
+    /// deliberately prefers determinism over an oracle later rewriting
+    /// history. A price `resolve_price` would reject is never stored.
+    pub fn snapshot_price(env: Env, market_id: u64, caller: Address) -> Result<PriceData, Error> {
+        caller.require_auth();
+        let config = Self::price_config(&env, market_id)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let now = env.ledger().timestamp();
+        if now < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let key = DataKey::Snapshot(market_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::SnapshotExists);
+        }
+        let data = Self::read_feed(&env, &config, market.close_time)?;
+        Self::persist(
+            &env,
+            &key,
+            &PriceSnapshot {
+                data: data.clone(),
+                taken_at: now,
+                taken_by: caller.clone(),
+            },
+        );
+        PriceSnapshotted {
+            market_id,
+            price: data.price,
+            price_timestamp: data.timestamp,
+            taken_by: caller,
+        }
+        .publish(&env);
+        Ok(data)
+    }
+
+    /// The price pinned by `snapshot_price`, if any.
+    pub fn snapshot(env: Env, market_id: u64) -> Option<PriceSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(market_id))
     }
 
     /// Resolves a scalar market from its Reflector feed. The reading is
@@ -686,10 +1519,17 @@ impl Resolver {
         match mode {
             ExpiryMode::Price => {
                 let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
-                match Self::try_price_outcome(&env, &config, close_time) {
-                    Ok((outcome, data)) => {
+                match Self::price_outcome(&env, market_id, &config, close_time) {
+                    Ok((outcome, data, from_snapshot)) => {
                         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-                        Self::settle_price(&env, &market_core, market_id, &outcome, &data);
+                        Self::settle_price(
+                            &env,
+                            &market_core,
+                            market_id,
+                            &outcome,
+                            &data,
+                            from_snapshot,
+                        );
                         return Ok(());
                     }
                     // Only an unusable feed lets the market expire; any other
@@ -734,61 +1574,40 @@ impl Resolver {
         Ok(())
     }
 
+    /// Records `signer`'s vote for `outcome` (allowed only once `close_time`
+    /// has passed). `Invalid` claims the question is unanswerable; an
+    /// `Invalid` proposal finalizes by voiding the market.
+    ///
+    /// Split votes: every outcome, `Invalid` included, has its own counter,
+    /// and a signer is deduplicated per `(outcome, signer)`, so one signer may
+    /// attest several outcomes (existing behaviour, extended to `Invalid`).
+    /// The first outcome to reach threshold becomes the proposal and later
+    /// `Yes`/`No` quorums never move it. The one exception: `Invalid` reaching
+    /// threshold replaces a pending `Yes`/`No` proposal and restarts the
+    /// dispute window, because a quorum saying the question cannot be
+    /// answered outranks an answer to it. An `Invalid` proposal is never
+    /// replaced. (Requiring `Invalid` to beat every other count is a possible
+    /// follow-up.)
     pub fn attest(
         env: Env,
         market_id: u64,
         signer: Address,
-        outcome: Outcome,
+        outcome: AttestedOutcome,
     ) -> Result<(), Error> {
         signer.require_auth();
-        let (signers, threshold) = match Self::committee(&env, market_id)? {
-            Committee::Signers(cfg) => (cfg.signers, cfg.threshold),
-            Committee::Disputable(cfg) => (cfg.signers, cfg.threshold),
-            Committee::Weighted(_) => return Err(Error::WrongMode),
-        };
-        if !Self::contains(&signers, &signer) {
-            return Err(Error::NotSigner);
-        }
-        Self::assert_not_disputed(&env, market_id)?;
-        if Self::resolution_state(&env, market_id).is_terminal() {
-            return Err(Error::AlreadyFinalized);
-        }
-        if env.storage().persistent().has(&DataKey::Attestation(
-            market_id,
-            outcome.clone(),
-            signer.clone(),
-        )) {
-            return Err(Error::AlreadyAttested);
-        }
-        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
-        if env.ledger().timestamp() < market.close_time {
-            return Err(Error::MarketNotClosed);
-        }
-        env.storage().persistent().set(
-            &DataKey::Attestation(market_id, outcome.clone(), signer),
-            &true,
-        );
-        let count_key = DataKey::Count(market_id, outcome.clone());
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let count = count + 1;
-        env.storage().persistent().set(&count_key, &count);
-        if count >= threshold {
-            let proposal = SignerProposal {
-                outcome: outcome.clone(),
-                proposed_at: env.ledger().timestamp(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::Proposal(market_id), &proposal);
-            ResolutionProposed {
-                market_id,
-                outcome,
-                proposed_at: proposal.proposed_at,
-            }
-            .publish(&env);
-        }
-        Ok(())
+        Self::record_attestation(&env, market_id, signer, outcome, None)
+    }
+
+    /// Attests to an outcome backed by an on-chain reasoning trace in reasoning-registry.
+    pub fn attest_with_evidence(
+        env: Env,
+        market_id: u64,
+        signer: Address,
+        outcome: AttestedOutcome,
+        trace_id: u64,
+    ) -> Result<(), Error> {
+        signer.require_auth();
+        Self::record_attestation(&env, market_id, signer, outcome, Some(trace_id))
     }
 
     /// Counts Ed25519 signatures from a weighted committee. Permissionless: the
@@ -848,22 +1667,11 @@ impl Resolver {
             &weight,
         );
 
-        let proposal_key = DataKey::Proposal(market_id);
         if before < config.weight_threshold
             && weight >= config.weight_threshold
-            && !storage.has(&proposal_key)
+            && !Self::has_proposal(&env, market_id)
         {
-            let proposal = SignerProposal {
-                outcome: outcome.clone(),
-                proposed_at: env.ledger().timestamp(),
-            };
-            storage.set(&proposal_key, &proposal);
-            ResolutionProposed {
-                market_id,
-                outcome,
-                proposed_at: proposal.proposed_at,
-            }
-            .publish(&env);
+            Self::propose(&env, market_id, AttestedOutcome::from_market(&outcome));
         }
         Ok(())
     }
@@ -874,24 +1682,45 @@ impl Resolver {
         Self::round(&env, market_id)
     }
 
-    pub fn finalize_signers(env: Env, market_id: u64) -> Result<Outcome, Error> {
+    /// Settles the pending proposal once its dispute window has elapsed:
+    /// `Yes`/`No` resolve the market, `Invalid` voids it (and emits
+    /// `CommitteeVoided`). market-core's `void_market` has no `close_time`
+    /// guard, but every attestation path requires `now >= close_time` before
+    /// any write, so no proposal (and no void) can exist before close.
+    pub fn finalize_signers(env: Env, market_id: u64) -> Result<AttestedOutcome, Error> {
         Self::assert_not_disputed(&env, market_id)?;
-        let committee = Self::committee(&env, market_id)?;
-        let proposal: SignerProposal =
-            Self::load(&env, DataKey::Proposal(market_id)).map_err(|_| Error::NoProposal)?;
-        if env.ledger().timestamp() < proposal.proposed_at + committee.dispute_window() {
+        let authority = Self::signer_authority(&env, market_id)?;
+        let proposal = Self::load_proposal(&env, market_id).ok_or(Error::NoProposal)?;
+        if env.ledger().timestamp() < proposal.proposed_at + authority.dispute_window() {
             return Err(Error::DisputeWindowOpen);
         }
-        if !Self::has_quorum(&env, &committee, market_id, &proposal.outcome) {
+        if !Self::has_quorum(&env, &authority, market_id, proposal.outcome) {
             return Err(Error::ThresholdNotReached);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        MarketCoreClient::new(&env, &market_core).resolve(&market_id, &proposal.outcome);
+        let core = MarketCoreClient::new(&env, &market_core);
+        let now = env.ledger().timestamp();
+        match proposal.outcome.to_market() {
+            Some(outcome) => core.resolve(&market_id, &outcome),
+            None => {
+                core.void_market(&market_id);
+                CommitteeVoided {
+                    market_id,
+                    finalized_at: now,
+                    invalid_count: Self::attestation_count(
+                        &env,
+                        market_id,
+                        AttestedOutcome::Invalid,
+                    ),
+                }
+                .publish(&env);
+            }
+        }
         Self::set_state(&env, market_id, ResolutionState::Finalized);
-        ResolutionFinalized {
+        ResolutionFinalizedV2 {
             market_id,
-            outcome: proposal.outcome.clone(),
-            finalized_at: env.ledger().timestamp(),
+            outcome: proposal.outcome,
+            finalized_at: now,
         }
         .publish(&env);
         Ok(proposal.outcome)
@@ -993,8 +1822,8 @@ impl Resolver {
     /// finalization until the escalation authority rules or
     /// `escalation_timeout` lapses. `alternative` is the outcome the disputer
     /// claims is correct (`None`: the market is invalid); it only informs the
-    /// ruling and must differ from the proposal. The disputer may also be a
-    /// proposing signer.
+    /// ruling and must differ from the proposal (so `None` is rejected for an
+    /// `Invalid` proposal). The disputer may also be a proposing signer.
     pub fn dispute(
         env: Env,
         market_id: u64,
@@ -1007,13 +1836,15 @@ impl Resolver {
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
-        let proposal: SignerProposal =
-            Self::load(&env, DataKey::Proposal(market_id)).map_err(|_| Error::NoProposal)?;
+        let proposal = Self::load_proposal(&env, market_id).ok_or(Error::NoProposal)?;
         let now = env.ledger().timestamp();
         if now >= proposal.proposed_at.saturating_add(config.dispute_window) {
             return Err(Error::DisputeWindowClosed);
         }
-        if alternative == Some(proposal.outcome) {
+        let claimed = alternative
+            .as_ref()
+            .map_or(AttestedOutcome::Invalid, AttestedOutcome::from_market);
+        if claimed == proposal.outcome {
             return Err(Error::InvalidConfig);
         }
 
@@ -1210,7 +2041,10 @@ impl Resolver {
 
     fn expiry_mode(env: &Env, market_id: u64) -> ExpiryMode {
         let storage = env.storage().persistent();
-        if storage.has(&DataKey::Price(market_id)) {
+        if storage.has(&DataKey::Price(market_id))
+            || (storage.has(&DataKey::Hybrid(market_id))
+                && Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen)
+        {
             ExpiryMode::Price
         } else if storage.has(&DataKey::Scalar(market_id)) {
             ExpiryMode::Scalar
@@ -1218,6 +2052,9 @@ impl Resolver {
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::WeightedKeys(market_id))
             || storage.has(&DataKey::CatSigners(market_id))
+            || storage.has(&DataKey::CommitteeSpec(market_id))
+            || (storage.has(&DataKey::Hybrid(market_id))
+                && Self::resolution_state(env, market_id) == ResolutionState::HybridFallbackOpen)
         {
             ExpiryMode::Signers
         } else {
@@ -1259,15 +2096,16 @@ impl Resolver {
     /// bond to the treasury; any other ruling returns it to the disputer.
     fn apply_verdict(env: &Env, market_id: u64, verdict: Verdict) -> Result<(), Error> {
         let mut dispute = Self::open_dispute(env, market_id)?;
-        let proposal: SignerProposal = Self::load(env, DataKey::Proposal(market_id))?;
+        let proposal = Self::load_proposal(env, market_id).ok_or(Error::MarketNotConfigured)?;
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
         let core = MarketCoreClient::new(env, &market_core);
 
-        let upheld = match verdict {
-            Verdict::Yes => proposal.outcome == Outcome::Yes,
-            Verdict::No => proposal.outcome == Outcome::No,
-            Verdict::Invalid => false,
-        };
+        let upheld = proposal.outcome
+            == match verdict {
+                Verdict::Yes => AttestedOutcome::Yes,
+                Verdict::No => AttestedOutcome::No,
+                Verdict::Invalid => AttestedOutcome::Invalid,
+            };
         match verdict {
             Verdict::Yes => core.resolve(&market_id, &Outcome::Yes),
             Verdict::No => core.resolve(&market_id, &Outcome::No),
@@ -1290,38 +2128,144 @@ impl Resolver {
         Ok(())
     }
 
-    fn attestation_count(env: &Env, market_id: u64, outcome: &Outcome) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Count(market_id, outcome.clone()))
-            .unwrap_or(0)
+    // ----- legacy_reads: V2 keys with fallback to pre-`AttestedOutcome` keys --
+    //
+    // A redeployed resolver never has legacy entries; these helpers only
+    // matter if the contract is upgraded in place (ADR 0003, option B). Reads
+    // combine both key generations; every write goes to the V2 key and
+    // deletes the matching legacy key in the same invocation, so nothing is
+    // ever counted twice.
+
+    /// Attestations for `outcome`: `CountV2` plus any legacy `Count` (Yes/No
+    /// only; `Invalid` has no legacy key).
+    fn attestation_count(env: &Env, market_id: u64, outcome: AttestedOutcome) -> u32 {
+        let storage = env.storage().persistent();
+        let current: u32 = storage
+            .get(&DataKey::CountV2(market_id, outcome))
+            .unwrap_or(0);
+        let legacy: u32 = outcome
+            .to_market()
+            .and_then(|o| storage.get(&DataKey::Count(market_id, o)))
+            .unwrap_or(0);
+        current + legacy
     }
 
-    fn committee(env: &Env, market_id: u64) -> Result<Committee, Error> {
+    /// Stores `count` under `CountV2` and drops the legacy `Count`, whose value
+    /// `count` already includes (it came from `attestation_count`).
+    fn save_attestation_count(env: &Env, market_id: u64, outcome: AttestedOutcome, count: u32) {
+        Self::persist(env, &DataKey::CountV2(market_id, outcome), &count);
+        if let Some(o) = outcome.to_market() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Count(market_id, o));
+        }
+    }
+
+    fn has_attested(env: &Env, market_id: u64, outcome: AttestedOutcome, signer: &Address) -> bool {
+        let storage = env.storage().persistent();
+        storage.has(&DataKey::AttestationV2(market_id, outcome, signer.clone()))
+            || outcome
+                .to_market()
+                .is_some_and(|o| storage.has(&DataKey::Attestation(market_id, o, signer.clone())))
+    }
+
+    fn load_proposal(env: &Env, market_id: u64) -> Option<SignerProposalV2> {
+        let storage = env.storage().persistent();
+        storage.get(&DataKey::ProposalV2(market_id)).or_else(|| {
+            storage
+                .get::<_, SignerProposal>(&DataKey::Proposal(market_id))
+                .map(|p| SignerProposalV2 {
+                    outcome: AttestedOutcome::from_market(&p.outcome),
+                    proposed_at: p.proposed_at,
+                })
+        })
+    }
+
+    fn has_proposal(env: &Env, market_id: u64) -> bool {
+        let storage = env.storage().persistent();
+        storage.has(&DataKey::ProposalV2(market_id)) || storage.has(&DataKey::Proposal(market_id))
+    }
+
+    fn remove_proposal(env: &Env, market_id: u64) {
+        let storage = env.storage().persistent();
+        storage.remove(&DataKey::ProposalV2(market_id));
+        storage.remove(&DataKey::Proposal(market_id));
+    }
+
+    /// Records `outcome` as the pending proposal (replacing any earlier one,
+    /// legacy included) and starts its dispute window now.
+    fn propose(env: &Env, market_id: u64, outcome: AttestedOutcome) {
+        let proposal = SignerProposalV2 {
+            outcome,
+            proposed_at: env.ledger().timestamp(),
+        };
+        Self::remove_proposal(env, market_id);
+        Self::persist(env, &DataKey::ProposalV2(market_id), &proposal);
+        ResolutionProposedV2 {
+            market_id,
+            outcome,
+            proposed_at: proposal.proposed_at,
+        }
+        .publish(env);
+    }
+
+    fn signer_authority(env: &Env, market_id: u64) -> Result<SignerAuthority, Error> {
         let storage = env.storage().persistent();
         if let Some(cfg) = storage.get(&DataKey::Signers(market_id)) {
-            return Ok(Committee::Signers(cfg));
+            return Ok(SignerAuthority::Signers(cfg));
         }
         if let Some(cfg) = storage.get(&DataKey::Disputable(market_id)) {
-            return Ok(Committee::Disputable(cfg));
+            return Ok(SignerAuthority::Disputable(cfg));
         }
         if let Some(cfg) = storage.get(&DataKey::WeightedKeys(market_id)) {
-            return Ok(Committee::Weighted(cfg));
+            return Ok(SignerAuthority::Weighted(cfg));
+        }
+        if let Some(ref_spec) = storage.get::<_, CommitteeRef>(&DataKey::CommitteeSpec(market_id)) {
+            let comm = Self::load_committee(env, ref_spec.committee_id)?;
+            return Ok(SignerAuthority::Committee(ref_spec, comm));
+        }
+        if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Ok(SignerAuthority::Hybrid(cfg));
         }
         Err(Error::MarketNotConfigured)
     }
 
     /// Whether `outcome` currently has enough attestations / signature weight
     /// (in the current round) to be finalized.
-    fn has_quorum(env: &Env, committee: &Committee, market_id: u64, outcome: &Outcome) -> bool {
-        match committee {
-            Committee::Signers(SignerConfig { threshold, .. })
-            | Committee::Disputable(DisputableSignerConfig { threshold, .. }) => {
+    fn has_quorum(
+        env: &Env,
+        authority: &SignerAuthority,
+        market_id: u64,
+        outcome: AttestedOutcome,
+    ) -> bool {
+        match authority {
+            SignerAuthority::Signers(SignerConfig { threshold, .. })
+            | SignerAuthority::Disputable(DisputableSignerConfig { threshold, .. }) => {
                 Self::attestation_count(env, market_id, outcome) >= *threshold
             }
-            Committee::Weighted(cfg) => {
+            // Weighted keys sign market-core outcomes only (the signed message
+            // encodes `Outcome`), so they can never propose `Invalid`.
+            SignerAuthority::Weighted(cfg) => outcome.to_market().is_some_and(|o| {
                 let round = Self::round(env, market_id);
-                Self::round_weight(env, market_id, round, outcome) >= cfg.weight_threshold
+                Self::round_weight(env, market_id, round, &o) >= cfg.weight_threshold
+            }),
+            SignerAuthority::Committee(ref_spec, comm) => {
+                let current = comm.epoch;
+                if current < ref_spec.min_epoch
+                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
+                {
+                    return false;
+                }
+                let mut votes: u32 = 0;
+                for member in comm.members.iter() {
+                    if Self::has_attested(env, market_id, outcome, &member) {
+                        votes += 1;
+                    }
+                }
+                votes >= comm.threshold
+            }
+            SignerAuthority::Hybrid(cfg) => {
+                Self::attestation_count(env, market_id, outcome) >= cfg.fallback.threshold
             }
         }
     }
@@ -1329,19 +2273,15 @@ impl Resolver {
     /// A proposal exists whose outcome still has quorum, so `finalize_signers`
     /// will succeed once the dispute window elapses.
     fn has_valid_proposal(env: &Env, market_id: u64) -> Result<bool, Error> {
-        let Some(proposal) = env
-            .storage()
-            .persistent()
-            .get::<_, SignerProposal>(&DataKey::Proposal(market_id))
-        else {
+        let Some(proposal) = Self::load_proposal(env, market_id) else {
             return Ok(false);
         };
-        let committee = Self::committee(env, market_id)?;
+        let authority = Self::signer_authority(env, market_id)?;
         Ok(Self::has_quorum(
             env,
-            &committee,
+            &authority,
             market_id,
-            &proposal.outcome,
+            proposal.outcome,
         ))
     }
 
@@ -1407,15 +2347,6 @@ impl Resolver {
 
     /// The exact bytes weighted-key signers sign (never hashed first, so any
     /// Ed25519 library can reproduce it):
-    ///
-    /// `"oracledesk-attest-v1" || network_id(32) || ScVal-XDR(resolver address)
-    ///  || market_id(u64 BE) || round(u32 BE) || outcome(0 = Yes, 1 = No)
-    ///  || resolution_hash(32)`
-    ///
-    /// Every field but the address is fixed length and the address XDR is
-    /// self-delimiting, so the encoding is unambiguous. Network, resolver,
-    /// market, round and the committed spec are all bound, which stops replay
-    /// across networks, deployments, markets, cancelled rounds and committees.
     fn attestation_message(
         env: &Env,
         market_id: u64,
@@ -1480,29 +2411,84 @@ impl Resolver {
         cfg.weight_threshold != 0 && cfg.weight_threshold <= total
     }
 
-    /// Reads the committed feed at `close_time` and applies the committed
-    /// comparison. `PriceUnavailable` also covers a feed contract that traps,
-    /// so a broken oracle address cannot make `expire_market` revert forever.
-    fn try_price_outcome(
-        env: &Env,
+    /// The single rule for whether a feed read may settle a market, shared by
+    /// `snapshot_price` and every resolution path so a snapshot can never pin
+    /// a price resolution would reject. The place to add further checks (for
+    /// example rejecting `price <= 0`).
+    fn validate_price(
         config: &PriceConfig,
         close_time: u64,
-    ) -> Result<(Outcome, PriceData), Error> {
+        data: &PriceData,
+    ) -> Result<(), Error> {
+        if data.timestamp > close_time || close_time - data.timestamp > config.max_staleness {
+            return Err(Error::StalePrice);
+        }
+        Ok(())
+    }
+
+    /// Applies the committed comparison.
+    fn outcome_for(config: &PriceConfig, price: i128) -> Outcome {
+        let hit = match config.direction {
+            PriceDirection::Above => price > config.threshold,
+            PriceDirection::AtOrAbove => price >= config.threshold,
+            PriceDirection::Below => price < config.threshold,
+            PriceDirection::AtOrBelow => price <= config.threshold,
+        };
+        if hit {
+            Outcome::Yes
+        } else {
+            Outcome::No
+        }
+    }
+
+    /// Reads the committed feed at `close_time` and validates it. A missing
+    /// record or a trapping oracle is `PriceUnavailable`, never a host error.
+    fn read_feed(env: &Env, config: &PriceConfig, close_time: u64) -> Result<PriceData, Error> {
         let Ok(Ok(Some(data))) =
             ReflectorPriceClient::new(env, &config.reflector).try_price(&config.asset, &close_time)
         else {
             return Err(Error::PriceUnavailable);
         };
-        if data.timestamp > close_time || close_time - data.timestamp > config.max_staleness {
-            return Err(Error::StalePrice);
-        }
-        let hit = match config.direction {
-            PriceDirection::Above => data.price > config.threshold,
-            PriceDirection::AtOrAbove => data.price >= config.threshold,
-            PriceDirection::Below => data.price < config.threshold,
-            PriceDirection::AtOrBelow => data.price <= config.threshold,
+        Self::validate_price(config, close_time, &data)?;
+        Ok(data)
+    }
+
+    /// The outcome the market's price rule gives, from its stored snapshot
+    /// when there is one (re-validated, no oracle call), else from a live
+    /// read. The flag reports whether the snapshot was used.
+    fn price_outcome(
+        env: &Env,
+        market_id: u64,
+        config: &PriceConfig,
+        close_time: u64,
+    ) -> Result<(Outcome, PriceData, bool), Error> {
+        let key = DataKey::Snapshot(market_id);
+        let storage = env.storage().persistent();
+        let (data, from_snapshot) = match storage.get::<_, PriceSnapshot>(&key) {
+            Some(snapshot) => {
+                storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+                Self::validate_price(config, close_time, &snapshot.data)?;
+                (snapshot.data, true)
+            }
+            None => (Self::read_feed(env, config, close_time)?, false),
         };
-        Ok((if hit { Outcome::Yes } else { Outcome::No }, data))
+        Ok((Self::outcome_for(config, data.price), data, from_snapshot))
+    }
+
+    /// The price rule of a price or hybrid market. Signer-mode markets are
+    /// `WrongMode`; markets with no revealed spec `MarketNotConfigured`.
+    fn price_config(env: &Env, market_id: u64) -> Result<PriceConfig, Error> {
+        let storage = env.storage().persistent();
+        if let Some(cfg) = storage.get(&DataKey::Price(market_id)) {
+            return Ok(cfg);
+        }
+        if let Some(hybrid) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Ok(hybrid.price);
+        }
+        match Self::signer_authority(env, market_id) {
+            Ok(_) => Err(Error::WrongMode),
+            Err(_) => Err(Error::MarketNotConfigured),
+        }
     }
 
     fn settle_price(
@@ -1511,6 +2497,7 @@ impl Resolver {
         market_id: u64,
         outcome: &Outcome,
         data: &PriceData,
+        from_snapshot: bool,
     ) {
         MarketCoreClient::new(env, market_core).resolve(&market_id, outcome);
         Self::set_state(env, market_id, ResolutionState::Finalized);
@@ -1519,6 +2506,14 @@ impl Resolver {
             price: data.price,
             price_timestamp: data.timestamp,
             outcome: outcome.clone(),
+        }
+        .publish(env);
+        PriceResolutionV2 {
+            market_id,
+            price: data.price,
+            price_timestamp: data.timestamp,
+            outcome: outcome.clone(),
+            from_snapshot,
         }
         .publish(env);
     }
@@ -1582,17 +2577,15 @@ impl Resolver {
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::CatSigners(market_id))
             || storage.has(&DataKey::Scalar(market_id))
+            || storage.has(&DataKey::CommitteeSpec(market_id))
+            || storage.has(&DataKey::Hybrid(market_id))
         {
             return Err(Error::MarketAlreadyConfigured);
         }
         Ok(())
     }
 
-    /// Shared reveal pipeline for every entrypoint: the market must be
-    /// unconfigured, the rule well-formed, and `commitment` (the hash of
-    /// whatever preimage the caller supplied) equal to the market's
-    /// `resolution_hash`. Validation precedes the cross-contract call so
-    /// malformed input is rejected without touching market-core.
+    /// Shared reveal pipeline for every entrypoint.
     fn reveal(
         env: &Env,
         market_id: u64,
@@ -1631,6 +2624,18 @@ impl Resolver {
                     && cfg.lower < cfg.upper
                     && cfg.upper <= i128::MAX / BPS
                     && cfg.max_staleness != 0
+            }
+
+            ResolutionSpec::Committee(cfg) => cfg.dispute_window != 0,
+            ResolutionSpec::Hybrid(cfg) => {
+                cfg.price.threshold >= 0
+                    && cfg.price.max_staleness != 0
+                    && !cfg.fallback.signers.is_empty()
+                    && cfg.fallback.threshold != 0
+                    && cfg.fallback.threshold <= cfg.fallback.signers.len()
+                    && cfg.fallback.dispute_window != 0
+                    && cfg.fallback_after > 0
+                    && cfg.fallback_after >= cfg.price.max_staleness
             }
         };
         if valid {
@@ -1673,9 +2678,208 @@ impl Resolver {
                 storage.set(&key, cfg);
                 (key, ResolutionState::Unconfigured)
             }
+
+            ResolutionSpec::Committee(cfg) => {
+                let key = DataKey::CommitteeSpec(market_id);
+                storage.set(&key, cfg);
+                (key, ResolutionState::SignersPending)
+            }
+            ResolutionSpec::Hybrid(cfg) => {
+                let key = DataKey::Hybrid(market_id);
+                storage.set(&key, cfg);
+                (key, ResolutionState::HybridPricePending)
+            }
         };
         storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        if let Some((_, policy)) = Self::evidence_config_internal(env) {
+            let p_key = DataKey::EvidencePolicy(market_id);
+            storage.set(&p_key, &policy);
+            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+        }
         Self::set_state(env, market_id, state);
+    }
+
+    fn evidence_config_internal(env: &Env) -> Option<(Address, EvidencePolicy)> {
+        env.storage().instance().get(&DataKey::EvidenceConfig)
+    }
+
+    fn validate_committee_members(members: &Vec<Address>) -> Result<(), Error> {
+        if members.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        if members.len() > MAX_COMMITTEE {
+            return Err(Error::CommitteeTooLarge);
+        }
+        for (i, member) in members.iter().enumerate() {
+            if members.iter().take(i).any(|earlier| earlier == member) {
+                return Err(Error::DuplicateMember);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_committee(env: &Env, committee_id: u64) -> Result<Committee, Error> {
+        let key = DataKey::Committee(committee_id);
+        let comm: Committee = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(comm)
+    }
+
+    fn record_attestation(
+        env: &Env,
+        market_id: u64,
+        signer: Address,
+        outcome: AttestedOutcome,
+        evidence: Option<u64>,
+    ) -> Result<(), Error> {
+        let authority = Self::signer_authority(env, market_id)?;
+        let (threshold, members_opt) = match &authority {
+            SignerAuthority::Signers(cfg) => {
+                if !Self::contains(&cfg.signers, &signer) {
+                    return Err(Error::NotSigner);
+                }
+                (cfg.threshold, None)
+            }
+            SignerAuthority::Disputable(cfg) => {
+                if !Self::contains(&cfg.signers, &signer) {
+                    return Err(Error::NotSigner);
+                }
+                (cfg.threshold, None)
+            }
+            SignerAuthority::Weighted(_) => return Err(Error::WrongMode),
+            SignerAuthority::Committee(ref_spec, comm) => {
+                let current = comm.epoch;
+                if current < ref_spec.min_epoch
+                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
+                {
+                    return Err(Error::RotationBoundExceeded);
+                }
+                if !Self::contains(&comm.members, &signer) {
+                    return Err(Error::NotSigner);
+                }
+                (comm.threshold, Some(current))
+            }
+            SignerAuthority::Hybrid(cfg) => {
+                if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
+                    return Err(Error::WrongMode);
+                }
+                if !Self::contains(&cfg.fallback.signers, &signer) {
+                    return Err(Error::NotSigner);
+                }
+                (cfg.fallback.threshold, None)
+            }
+        };
+
+        let storage = env.storage().persistent();
+        let policy = storage
+            .get(&DataKey::EvidencePolicy(market_id))
+            .or_else(|| Self::evidence_config_internal(env).map(|(_, p)| p))
+            .unwrap_or(EvidencePolicy::Disabled);
+
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
+        // Before any write: this is what keeps an `Invalid` proposal (and so
+        // `void_market`, which has no close-time guard) from existing before
+        // close.
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+
+        if let Some(trace_id) = evidence {
+            if policy == EvidencePolicy::Disabled {
+                return Err(Error::EvidenceDisabled);
+            }
+            let Some((registry, _)) = Self::evidence_config_internal(env) else {
+                return Err(Error::EvidenceDisabled);
+            };
+            if storage.has(&DataKey::EvidenceUsed(trace_id)) {
+                return Err(Error::EvidenceAlreadyUsed);
+            }
+            let Ok(Ok(trace)) = RegistryClient::new(env, &registry).try_get_trace(&trace_id) else {
+                return Err(Error::EvidenceNotFound);
+            };
+            if trace.agent != signer {
+                return Err(Error::EvidenceAuthorMismatch);
+            }
+            if trace.market_id != market_id {
+                return Err(Error::EvidenceMarketMismatch);
+            }
+            if trace.published_at < market.close_time {
+                return Err(Error::EvidenceTooEarly);
+            }
+            let count_key = DataKey::EvidenceCount(market_id);
+            let count: u32 = storage.get(&count_key).unwrap_or(0);
+            let ev_key = DataKey::Evidence(market_id, count);
+            let att_ev = AttestationEvidence {
+                signer: signer.clone(),
+                outcome,
+                trace_id,
+                trace_hash: trace.trace_hash,
+                attested_at: env.ledger().timestamp(),
+            };
+            Self::persist(env, &ev_key, &att_ev);
+            Self::persist(env, &count_key, &(count + 1));
+            Self::persist(env, &DataKey::EvidenceUsed(trace_id), &true);
+        } else if policy == EvidencePolicy::Required {
+            return Err(Error::EvidenceRequired);
+        }
+
+        Self::assert_not_disputed(env, market_id)?;
+        if Self::resolution_state(env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        if Self::has_attested(env, market_id, outcome, &signer) {
+            return Err(Error::AlreadyAttested);
+        }
+
+        Self::persist(
+            env,
+            &DataKey::AttestationV2(market_id, outcome, signer.clone()),
+            &true,
+        );
+        if let Some(epoch) = members_opt {
+            Self::persist(
+                env,
+                &DataKey::AttestEpoch(market_id, signer.clone()),
+                &epoch,
+            );
+        }
+
+        let count = Self::attestation_count(env, market_id, outcome) + 1;
+        Self::save_attestation_count(env, market_id, outcome, count);
+
+        Attested {
+            market_id,
+            signer,
+            outcome,
+            trace_id: evidence,
+            count,
+        }
+        .publish(env);
+
+        let quorum_reached = if members_opt.is_some() {
+            Self::has_quorum(env, &authority, market_id, outcome)
+        } else {
+            count >= threshold
+        };
+
+        // See `attest` for the split-vote rule.
+        let may_propose = match Self::load_proposal(env, market_id) {
+            None => true,
+            Some(pending) => {
+                outcome == AttestedOutcome::Invalid && pending.outcome != AttestedOutcome::Invalid
+            }
+        };
+        if quorum_reached && may_propose {
+            Self::propose(env, market_id, outcome);
+        }
+        Ok(())
     }
 
     /// Verifies `commitment` equals the market's `resolution_hash`, read from
@@ -2057,15 +3261,20 @@ mod test {
         f.resolver.register_signer_spec(&f.market_id, &spec);
         f.env.ledger().set_timestamp(2_000);
 
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
 
         assert_eq!(
             f.resolver.try_finalize_signers(&f.market_id),
             Err(Ok(Error::DisputeWindowOpen))
         );
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
             MarketStatus::Resolved(Outcome::No)
@@ -2186,18 +3395,22 @@ mod test {
             f.resolver.try_finalize_cat(&f.market_id),
             Err(Ok(Error::NoProposal))
         );
-        f.resolver.attest_cat(&f.market_id, &f.signer_b, &0u32);
 
-        // Past the grace deadline a live proposal still blocks expiry...
+        // The quorum that opens the proposal lands past the grace deadline, so
+        // the pending winner blocks expiry…
         f.env
             .ledger()
             .set_timestamp(2_000 + RESOLUTION_GRACE_SECS + 1);
+        f.resolver.attest_cat(&f.market_id, &f.signer_b, &0u32);
         assert_eq!(
             f.resolver.try_expire_market(&f.market_id),
             Err(Ok(Error::ResolutionAvailable))
         );
-        // ...until the guardian cancels it, after which the market voids.
-        f.resolver.cancel_proposal(&f.market_id);
+        // …and the guardian can still withdraw it, because `cancel_proposal`
+        // is bounded by the proposal's own dispute window. Afterwards the
+        // market voids.
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_cat_market(&f.market_id).status,
@@ -2490,10 +3703,13 @@ mod test {
         };
         f.resolver.register_signer_spec(&f.market_id, &spec);
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
 
-        f.resolver.cancel_proposal(&f.market_id);
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
         f.env.ledger().set_timestamp(2_100);
         assert_eq!(
             f.resolver.try_finalize_signers(&f.market_id),
@@ -2526,10 +3742,15 @@ mod test {
         );
 
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::Yes);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
@@ -2757,23 +3978,30 @@ mod test {
     fn expire_refuses_when_signer_proposal_is_finalizable() {
         let f = signer_fixture();
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
 
         f.env.ledger().set_timestamp(DEADLINE);
         assert_eq!(
             f.resolver.try_expire_market(&f.market_id),
             Err(Ok(Error::ResolutionAvailable))
         );
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
     }
 
     #[test]
     fn expire_waits_for_open_dispute_window() {
         let f = signer_fixture();
         f.env.ledger().set_timestamp(DEADLINE - 50);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::Yes);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::Yes);
 
         // Deadline passes with 50s of the 100s dispute window left.
         f.env.ledger().set_timestamp(DEADLINE);
@@ -2782,16 +4010,22 @@ mod test {
             Err(Ok(Error::ResolutionAvailable))
         );
         f.env.ledger().set_timestamp(DEADLINE + 50);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
     fn expire_voids_signer_market_once_proposal_is_cancelled() {
         let f = signer_fixture();
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
-        f.resolver.cancel_proposal(&f.market_id);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
 
         f.env.ledger().set_timestamp(DEADLINE);
         f.resolver.expire_market(&f.market_id);
@@ -2819,7 +4053,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.resolver
-                .try_attest(&f.market_id, &f.signer_a, &Outcome::Yes),
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes),
             Err(Ok(Error::AlreadyFinalized))
         );
     }
@@ -2830,7 +4064,8 @@ mod test {
         f.env.ledger().set_timestamp(DEADLINE);
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
-            f.resolver.try_guardian_void_market(&f.market_id),
+            f.resolver
+                .try_guardian_void_market(&f.market_id, &GuardianReason::SignersStalled),
             Err(Ok(Error::AlreadyFinalized))
         );
         assert_eq!(
@@ -2948,7 +4183,10 @@ mod test {
             Err(Ok(Error::DisputeWindowOpen))
         );
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
             MarketStatus::Resolved(Outcome::No)
@@ -2975,7 +4213,10 @@ mod test {
         f.resolver
             .submit_signatures(&f.market_id, &Outcome::Yes, &0, &one(1));
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
@@ -3018,7 +4259,10 @@ mod test {
         f.resolver
             .submit_signatures(&f.market_id, &Outcome::Yes, &0, &batch);
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
@@ -3042,7 +4286,10 @@ mod test {
         f.resolver
             .submit_signatures(&f.market_id, &Outcome::Yes, &0, &good);
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
@@ -3056,7 +4303,8 @@ mod test {
             .submit_signatures(&f.market_id, &Outcome::Yes, &0, &old);
         assert_eq!(f.resolver.current_round(&f.market_id), 0);
 
-        f.resolver.cancel_proposal(&f.market_id);
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
         assert_eq!(f.resolver.current_round(&f.market_id), 1);
         assert_eq!(
             f.resolver
@@ -3076,7 +4324,10 @@ mod test {
         f.resolver
             .submit_signatures(&f.market_id, &Outcome::No, &1, &fresh);
         f.env.ledger().set_timestamp(2_100);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::No);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
     }
 
     #[test]
@@ -3172,7 +4423,10 @@ mod test {
             f.resolver.try_expire_market(&f.market_id),
             Err(Ok(Error::ResolutionAvailable))
         );
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
     }
 
     #[test]
@@ -3294,8 +4548,10 @@ mod test {
         };
         f.resolver.register_disputable_spec(&f.market_id, &spec);
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &Outcome::No);
-        f.resolver.attest(&f.market_id, &f.signer_b, &Outcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
 
         let disputer = Address::generate(&f.env);
         let collateral = f.market_core.get_config().collateral;
@@ -3362,7 +4618,10 @@ mod test {
             d.f.resolver.try_dispute(&d.f.market_id, &d.disputer, &None),
             Err(Ok(Error::DisputeWindowClosed))
         );
-        assert_eq!(d.f.resolver.finalize_signers(&d.f.market_id), Outcome::No);
+        assert_eq!(
+            d.f.resolver.finalize_signers(&d.f.market_id),
+            AttestedOutcome::No
+        );
 
         let d = dispute_fixture(false);
         d.f.env.ledger().set_timestamp(2_099);
@@ -3389,7 +4648,8 @@ mod test {
                 .try_dispute(&d.f.market_id, &d.disputer, &Some(Outcome::No)),
             Err(Ok(Error::InvalidConfig))
         );
-        d.f.resolver.cancel_proposal(&d.f.market_id);
+        d.f.resolver
+            .cancel_proposal(&d.f.market_id, &GuardianReason::DisputeUpheld);
         assert_eq!(
             d.f.resolver.try_dispute(&d.f.market_id, &d.disputer, &None),
             Err(Ok(Error::NoProposal))
@@ -3562,7 +4822,7 @@ mod test {
         open(&d);
         assert_eq!(
             d.f.resolver
-                .try_attest(&d.f.market_id, &d.f.signer_a, &Outcome::Yes),
+                .try_attest(&d.f.market_id, &d.f.signer_a, &AttestedOutcome::Yes),
             Err(Ok(Error::DisputeActive))
         );
     }
@@ -3572,7 +4832,8 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         assert_eq!(
-            d.f.resolver.try_cancel_proposal(&d.f.market_id),
+            d.f.resolver
+                .try_cancel_proposal(&d.f.market_id, &GuardianReason::DisputeUpheld),
             Err(Ok(Error::DisputeActive))
         );
     }
@@ -3592,7 +4853,8 @@ mod test {
     fn guardian_void_while_disputed_refunds_bond() {
         let d = dispute_fixture(false);
         open(&d);
-        d.f.resolver.guardian_void_market(&d.f.market_id);
+        d.f.resolver
+            .guardian_void_market(&d.f.market_id, &GuardianReason::DisputeUpheld);
         assert_eq!(status(&d), MarketStatus::Void);
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -3603,7 +4865,10 @@ mod test {
     fn undisputed_disputable_market_finalizes_normally() {
         let d = dispute_fixture(false);
         d.f.env.ledger().set_timestamp(2_100);
-        assert_eq!(d.f.resolver.finalize_signers(&d.f.market_id), Outcome::No);
+        assert_eq!(
+            d.f.resolver.finalize_signers(&d.f.market_id),
+            AttestedOutcome::No
+        );
         assert_escrow(&d, 0);
     }
 
@@ -3741,13 +5006,651 @@ mod test {
                 invoke: &MockAuthInvoke {
                     contract: &f.resolver_id,
                     fn_name: "guardian_void_market",
-                    args: (f.market_id,).into_val(&f.env),
+                    args: (f.market_id, GuardianReason::UnrevealedSpec).into_val(&f.env),
                     sub_invokes: &[],
                 },
             }])
-            .try_guardian_void_market(&f.market_id)
+            .try_guardian_void_market(&f.market_id, &GuardianReason::UnrevealedSpec)
             .is_err());
         let _ = f.admin;
+    }
+
+    // ----- Invalid attestations (committee voids) -------------------------
+
+    fn attest_both(f: &Fixture, outcome: AttestedOutcome) {
+        f.resolver.attest(&f.market_id, &f.signer_a, &outcome);
+        f.resolver.attest(&f.market_id, &f.signer_b, &outcome);
+    }
+
+    fn stored_proposal(f: &Fixture) -> Option<SignerProposalV2> {
+        f.env.as_contract(&f.resolver_id, || {
+            Resolver::load_proposal(&f.env, f.market_id)
+        })
+    }
+
+    #[test]
+    fn invalid_attestations_void_market_after_dispute_window() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Invalid);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Invalid
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Void
+        );
+        assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+    }
+
+    #[test]
+    fn invalid_cannot_be_attested_before_close_time() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(1_999);
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid),
+            Err(Ok(Error::MarketNotClosed))
+        );
+        assert_eq!(stored_proposal(&f), None);
+        f.env.as_contract(&f.resolver_id, || {
+            assert_eq!(
+                Resolver::attestation_count(&f.env, f.market_id, AttestedOutcome::Invalid),
+                0
+            );
+        });
+        // So `void_market`, which has no close-time guard, is unreachable
+        // before close through the committee path.
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Open
+        );
+    }
+
+    #[test]
+    fn split_vote_invalid_overrides_yes_proposal_and_restarts_window() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        assert_eq!(
+            stored_proposal(&f),
+            Some(SignerProposalV2 {
+                outcome: AttestedOutcome::Yes,
+                proposed_at: 2_000
+            })
+        );
+
+        f.env.ledger().set_timestamp(2_050);
+        attest_both(&f, AttestedOutcome::Invalid);
+        assert_eq!(
+            stored_proposal(&f),
+            Some(SignerProposalV2 {
+                outcome: AttestedOutcome::Invalid,
+                proposed_at: 2_050
+            })
+        );
+        // The Yes window would have closed at 2_100; Invalid's runs to 2_150.
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_150);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Invalid
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Void
+        );
+    }
+
+    #[test]
+    fn yes_quorum_never_replaces_an_invalid_proposal() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Invalid);
+        f.env.ledger().set_timestamp(2_050);
+        attest_both(&f, AttestedOutcome::Yes);
+        assert_eq!(
+            stored_proposal(&f).map(|p| (p.outcome, p.proposed_at)),
+            Some((AttestedOutcome::Invalid, 2_000))
+        );
+    }
+
+    #[test]
+    fn guardian_cancel_of_invalid_proposal_then_yes_finalizes() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Invalid);
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
+        assert_eq!(stored_proposal(&f), None);
+
+        f.env.ledger().set_timestamp(2_010);
+        attest_both(&f, AttestedOutcome::Yes);
+        f.env.ledger().set_timestamp(2_110);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
+
+    /// Documents existing behaviour, extended to `Invalid`: dedupe is per
+    /// `(outcome, signer)`, so one signer can back several outcomes.
+    #[test]
+    fn signer_can_attest_invalid_and_yes_independently_documented_behavior() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid);
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid),
+            Err(Ok(Error::AlreadyAttested))
+        );
+        f.env.as_contract(&f.resolver_id, || {
+            for outcome in [AttestedOutcome::Yes, AttestedOutcome::Invalid] {
+                assert_eq!(Resolver::attestation_count(&f.env, f.market_id, outcome), 1);
+            }
+        });
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+    }
+
+    #[test]
+    fn legacy_count_and_attestation_keys_are_read_and_migrated() {
+        let f = signer_fixture();
+        let storage = || f.env.storage().persistent();
+        f.env.as_contract(&f.resolver_id, || {
+            storage().set(&DataKey::Count(f.market_id, Outcome::Yes), &1u32);
+            storage().set(
+                &DataKey::Attestation(f.market_id, Outcome::Yes, f.signer_a.clone()),
+                &true,
+            );
+        });
+        f.env.ledger().set_timestamp(2_000);
+        // The legacy dedupe flag still applies.
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes),
+            Err(Ok(Error::AlreadyAttested))
+        );
+        // signer_b's vote plus the legacy one reaches the threshold of 2.
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::Yes);
+        f.env.as_contract(&f.resolver_id, || {
+            assert_eq!(
+                storage().get::<_, u32>(&DataKey::CountV2(f.market_id, AttestedOutcome::Yes)),
+                Some(2)
+            );
+            assert!(!storage().has(&DataKey::Count(f.market_id, Outcome::Yes)));
+        });
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
+    }
+
+    #[test]
+    fn legacy_keys_not_double_counted_after_migration() {
+        let f = signer_fixture();
+        f.env.as_contract(&f.resolver_id, || {
+            f.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Count(f.market_id, Outcome::No), &1u32);
+        });
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        // Further writes for other outcomes leave the migrated count alone.
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid);
+        f.env.as_contract(&f.resolver_id, || {
+            assert_eq!(
+                Resolver::attestation_count(&f.env, f.market_id, AttestedOutcome::No),
+                2
+            );
+            assert_eq!(
+                Resolver::attestation_count(&f.env, f.market_id, AttestedOutcome::Invalid),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_proposal_is_finalized_through_fallback() {
+        let f = signer_fixture();
+        f.env.as_contract(&f.resolver_id, || {
+            let storage = f.env.storage().persistent();
+            storage.set(&DataKey::Count(f.market_id, Outcome::No), &2u32);
+            storage.set(
+                &DataKey::Proposal(f.market_id),
+                &SignerProposal {
+                    outcome: Outcome::No,
+                    proposed_at: 2_000,
+                },
+            );
+        });
+        f.env.ledger().set_timestamp(2_050);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::No)
+        );
+    }
+
+    #[test]
+    fn committee_voided_event_emitted() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::Invalid);
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [
+                soroban_sdk::Event::to_xdr(
+                    &Attested {
+                        market_id: f.market_id,
+                        signer: f.signer_b.clone(),
+                        outcome: AttestedOutcome::Invalid,
+                        trace_id: None,
+                        count: 2,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &ResolutionProposedV2 {
+                        market_id: f.market_id,
+                        outcome: AttestedOutcome::Invalid,
+                        proposed_at: 2_000,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+            ]
+        );
+
+        f.env.ledger().set_timestamp(2_100);
+        f.resolver.finalize_signers(&f.market_id);
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [
+                soroban_sdk::Event::to_xdr(
+                    &CommitteeVoided {
+                        market_id: f.market_id,
+                        finalized_at: 2_100,
+                        invalid_count: 2,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+                soroban_sdk::Event::to_xdr(
+                    &ResolutionFinalizedV2 {
+                        market_id: f.market_id,
+                        outcome: AttestedOutcome::Invalid,
+                        finalized_at: 2_100,
+                    },
+                    &f.env,
+                    &f.resolver_id
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn price_mode_market_rejects_attest() {
+        let f = price_fixture(2_500, 1_999);
+        f.env.ledger().set_timestamp(2_000);
+        for outcome in [AttestedOutcome::Yes, AttestedOutcome::Invalid] {
+            assert_eq!(
+                f.resolver.try_attest(&f.market_id, &f.signer_a, &outcome),
+                Err(Ok(Error::MarketNotConfigured))
+            );
+        }
+    }
+
+    #[test]
+    fn dispute_of_invalid_proposal_must_name_an_outcome_and_invalid_ruling_upholds() {
+        let d = dispute_fixture(false);
+        // dispute_fixture proposes No; replace it with an Invalid proposal.
+        d.f.resolver
+            .attest(&d.f.market_id, &d.f.signer_a, &AttestedOutcome::Invalid);
+        d.f.resolver
+            .attest(&d.f.market_id, &d.f.signer_b, &AttestedOutcome::Invalid);
+        assert_eq!(
+            d.f.resolver.try_dispute(&d.f.market_id, &d.disputer, &None),
+            Err(Ok(Error::InvalidConfig))
+        );
+        open(&d);
+        let treasury = d.f.market_core.get_config().treasury;
+        d.f.resolver
+            .settle_dispute(&d.f.market_id, &Verdict::Invalid);
+        assert_eq!(status(&d), MarketStatus::Void);
+        d.f.resolver.claim_dispute_bond(&d.f.market_id);
+        assert_eq!(balance(&d, &treasury), BOND);
+    }
+
+    // ----- price snapshots (oracle history retention) ---------------------
+
+    /// SEP-40 feed with bounded history: `price(ts)` returns the newest
+    /// record at or before `ts`, but only among the last `retention` pushed.
+    #[contract]
+    struct RetentionReflector;
+
+    #[contractimpl]
+    impl RetentionReflector {
+        pub fn push(env: Env, price: i128, timestamp: u64) {
+            let mut history: Vec<PriceData> = env
+                .storage()
+                .instance()
+                .get(&0u32)
+                .unwrap_or(Vec::new(&env));
+            history.push_back(PriceData { price, timestamp });
+            env.storage().instance().set(&0u32, &history);
+        }
+
+        pub fn set_retention(env: Env, n: u32) {
+            env.storage().instance().set(&1u32, &n);
+        }
+
+        pub fn price(env: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
+            let history: Vec<PriceData> = env
+                .storage()
+                .instance()
+                .get(&0u32)
+                .unwrap_or(Vec::new(&env));
+            let retention: u32 = env.storage().instance().get(&1u32).unwrap_or(u32::MAX);
+            let oldest = history.len().saturating_sub(retention);
+            (oldest..history.len())
+                .rev()
+                .map(|i| history.get_unchecked(i))
+                .find(|record| record.timestamp <= timestamp)
+        }
+    }
+
+    /// A revealed price market (threshold 2_000 Above, max_staleness 10,
+    /// close 2_000) on a `RetentionReflector` keeping 3 records, at t = 2_001.
+    fn retention_fixture() -> (Fixture, RetentionReflectorClient<'static>) {
+        let f = fixture(|env, _r, _a, _b| {
+            let feed = env.register(RetentionReflector, ());
+            ResolutionSpec::Price(price_spec(env, &feed))
+        });
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        let feed = RetentionReflectorClient::new(&f.env, &spec.reflector);
+        feed.set_retention(&3);
+        f.env.ledger().set_timestamp(2_001);
+        (f, feed)
+    }
+
+    fn age_out(feed: &RetentionReflectorClient) {
+        for ts in [2_010_u64, 2_020, 2_030] {
+            feed.push(&1_000, &ts);
+        }
+    }
+
+    fn last_price_resolution(f: &Fixture) -> PriceResolutionV2 {
+        use soroban_sdk::{xdr, TryFromVal};
+        let events = f.env.events().all().filter_by_contract(&f.resolver_id);
+        let last = events.events().last().unwrap().clone();
+        let xdr::ContractEventBody::V0(body) = last.body;
+        let data = soroban_sdk::Val::try_from_val(&f.env, &body.data).unwrap();
+        let map: soroban_sdk::Map<Symbol, soroban_sdk::Val> =
+            soroban_sdk::Map::try_from_val(&f.env, &data).unwrap();
+        let get = |name: &str| map.get(Symbol::new(&f.env, name)).unwrap();
+        PriceResolutionV2 {
+            market_id: f.market_id,
+            price: i128::try_from_val(&f.env, &get("price")).unwrap(),
+            price_timestamp: u64::try_from_val(&f.env, &get("price_timestamp")).unwrap(),
+            outcome: Outcome::try_from_val(&f.env, &get("outcome")).unwrap(),
+            from_snapshot: bool::try_from_val(&f.env, &get("from_snapshot")).unwrap(),
+        }
+    }
+
+    #[test]
+    fn snapshot_then_resolve_after_retention_expired() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.snapshot_price(&f.market_id, &caller),
+            PriceData {
+                price: 2_500,
+                timestamp: 2_000
+            }
+        );
+        assert_eq!(
+            f.env.events().all().filter_by_contract(&f.resolver_id),
+            [soroban_sdk::Event::to_xdr(
+                &PriceSnapshotted {
+                    market_id: f.market_id,
+                    price: 2_500,
+                    price_timestamp: 2_000,
+                    taken_by: caller.clone(),
+                },
+                &f.env,
+                &f.resolver_id
+            )]
+        );
+        let stored = f.resolver.snapshot(&f.market_id).unwrap();
+        assert_eq!((stored.taken_at, stored.taken_by), (2_001, caller));
+
+        age_out(&feed);
+        let asset = OracleAsset::Other(Symbol::new(&f.env, "XLM"));
+        assert_eq!(feed.price(&asset, &2_000), None);
+
+        f.env.ledger().set_timestamp(2_040);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+        assert!(last_price_resolution(&f).from_snapshot);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
+
+    #[test]
+    fn resolve_without_snapshot_uses_live_read() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+        assert_eq!(
+            last_price_resolution(&f),
+            PriceResolutionV2 {
+                market_id: f.market_id,
+                price: 2_500,
+                price_timestamp: 2_000,
+                outcome: Outcome::Yes,
+                from_snapshot: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_without_snapshot_after_retention_fails_price_unavailable() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        age_out(&feed);
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::PriceUnavailable))
+        );
+    }
+
+    #[test]
+    fn snapshot_after_retention_fails_and_stores_nothing() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        age_out(&feed);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::PriceUnavailable))
+        );
+        assert_eq!(f.resolver.snapshot(&f.market_id), None);
+    }
+
+    #[test]
+    fn snapshot_rejects_stale_price_and_stores_nothing() {
+        let (f, feed) = retention_fixture();
+        // 11s before close with max_staleness 10.
+        feed.push(&2_500, &1_989);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::StalePrice))
+        );
+        assert_eq!(f.resolver.snapshot(&f.market_id), None);
+    }
+
+    #[test]
+    fn second_snapshot_rejected_snapshot_exists() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        let caller = Address::generate(&f.env);
+        f.resolver.snapshot_price(&f.market_id, &caller);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::SnapshotExists))
+        );
+    }
+
+    #[test]
+    fn snapshot_before_close_rejected() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &1_999);
+        f.env.ledger().set_timestamp(1_999);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::MarketNotClosed))
+        );
+    }
+
+    #[test]
+    fn snapshot_on_signer_market_rejected_wrong_mode() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::WrongMode))
+        );
+        let unrevealed =
+            fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        unrevealed.env.ledger().set_timestamp(2_000);
+        assert_eq!(
+            unrevealed
+                .resolver
+                .try_snapshot_price(&unrevealed.market_id, &Address::generate(&unrevealed.env)),
+            Err(Ok(Error::MarketNotConfigured))
+        );
+    }
+
+    #[test]
+    fn snapshot_after_finalize_rejected() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        f.resolver.resolve_price(&f.market_id);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+    }
+
+    #[test]
+    fn snapshot_boundary_equal_max_staleness_accepted() {
+        let (f, feed) = retention_fixture();
+        // Exactly max_staleness (10s) before close: accepted (`>` comparison).
+        feed.push(&2_000, &1_990);
+        let caller = Address::generate(&f.env);
+        f.resolver.snapshot_price(&f.market_id, &caller);
+        age_out(&feed);
+        // 2_000 is not Above the 2_000 threshold.
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::No);
+    }
+
+    #[test]
+    fn snapshot_with_trapping_oracle_is_price_unavailable() {
+        // `a` has no contract deployed, so the feed call fails in the host.
+        let f = fixture(|env, _reflector, a, _b| ResolutionSpec::Price(price_spec(env, a)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        f.env.ledger().set_timestamp(2_000);
+        let caller = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_snapshot_price(&f.market_id, &caller),
+            Err(Ok(Error::PriceUnavailable))
+        );
+    }
+
+    #[test]
+    fn snapshot_blocks_oracle_unavailable_void_and_expiry_resolves_from_it() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        let caller = Address::generate(&f.env);
+        f.resolver.snapshot_price(&f.market_id, &caller);
+        age_out(&feed);
+
+        f.env.ledger().set_timestamp(2_000 + ORACLE_GRACE_SECS);
+        assert_eq!(
+            f.resolver
+                .try_guardian_void_market(&f.market_id, &GuardianReason::OracleUnavailable),
+            Err(Ok(Error::GuardianNotAllowed))
+        );
+        f.env.ledger().set_timestamp(DEADLINE);
+        f.resolver.expire_market(&f.market_id);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
+
+    #[test]
+    fn snapshot_requires_caller_auth() {
+        let (f, feed) = retention_fixture();
+        feed.push(&2_500, &2_000);
+        let caller = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .try_snapshot_price(&f.market_id, &caller)
+            .is_err());
+        assert_eq!(f.resolver.snapshot(&f.market_id), None);
     }
 }
 

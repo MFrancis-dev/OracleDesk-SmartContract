@@ -15,6 +15,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 NETWORK=testnet
 DEPLOYER_KEY=oracledesk-deployer
 AGENT_KEY=oracledesk-agent
+# Least-privilege per-role agents registered in the treasury's agent
+# registry: the maker creates/seeds and settles, the trader trades and
+# settles. The constructor agent above keeps every role until removed.
+MAKER_KEY=oracledesk-maker
+TRADER_KEY=oracledesk-trader
 OUT=deployments/testnet.json
 WASM_DIR=target/wasm32v1-none/release
 
@@ -24,6 +29,21 @@ WASM_DIR=target/wasm32v1-none/release
 MAX_TRADE=${MAX_TRADE:-2000000000}   # 200 USDC
 MAX_MARKET=${MAX_MARKET:-5000000000} # 500 USDC
 MAX_DAILY=${MAX_DAILY:-10000000000}  # 1,000 USDC
+# Cap on capital deployed in open positions across all markets at once
+# (must be >= MAX_TRADE).
+MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
+# Timelock (seconds, >= 86400) on every loosening treasury change: raising a
+# cap, adding or widening an agent, switching market-core or collateral.
+CONFIG_DELAY=${CONFIG_DELAY:-86400}
+# Per-agent sub-budgets, within the global caps above. The maker's max_trade
+# must clear market-core's 100 USDC MIN_SEED.
+MAKER_MAX_TRADE=${MAKER_MAX_TRADE:-$MAX_TRADE}
+MAKER_MAX_DAILY=${MAKER_MAX_DAILY:-5000000000}   # 500 USDC
+TRADER_MAX_TRADE=${TRADER_MAX_TRADE:-$MAX_TRADE}
+TRADER_MAX_DAILY=${TRADER_MAX_DAILY:-5000000000} # 500 USDC
+ROLE_CREATE=1
+ROLE_TRADE=2
+ROLE_SETTLE=4
 DEFAULT_FEE_BPS=${DEFAULT_FEE_BPS:-100} # 1%
 # Portion of each fee kept by the protocol treasury (bps). The remainder
 # accrues to the market creator, claimable before resolution. 10000 = the
@@ -75,14 +95,21 @@ done
 # rebuilding them. See docs/adr/0002-cross-contract-calls.md.
 cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
 cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
+cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
 stellar contract build
 
 # --- identities -------------------------------------------------------------
 ensure_identity "$DEPLOYER_KEY"
 ensure_identity "$AGENT_KEY"
+ensure_identity "$MAKER_KEY"
+ensure_identity "$TRADER_KEY"
 DEPLOYER=$(stellar keys address "$DEPLOYER_KEY")
 AGENT=$(stellar keys address "$AGENT_KEY")
-json_set --arg d "$DEPLOYER" --arg a "$AGENT" '.deployer = $d | .agent = $a'
+MAKER=$(stellar keys address "$MAKER_KEY")
+TRADER=$(stellar keys address "$TRADER_KEY")
+# `.agent` stays for tools that predate the registry.
+json_set --arg d "$DEPLOYER" --arg a "$AGENT" --arg m "$MAKER" --arg t "$TRADER" \
+  '.deployer = $d | .agent = $a | .agents = {maker: $m, trader: $t}'
 
 # --- USDC test asset ---------------------------------------------------------
 # Self-issued testnet "USDC": a real SEP-41 token (7 decimals, matching the
@@ -152,7 +179,9 @@ if [ -z "$TREASURY" ]; then
     --market_core "$MARKET_CORE" \
     --max_trade "$MAX_TRADE" \
     --max_market "$MAX_MARKET" \
-    --max_daily "$MAX_DAILY")
+    --max_daily "$MAX_DAILY" \
+    --max_net_exposure "$MAX_NET_EXPOSURE" \
+    --config_delay "$CONFIG_DELAY")
   json_set --arg id "$TREASURY" '.contracts.treasury = $id'
   json_set '.needs_treasury_wiring = true'
 else
@@ -186,7 +215,7 @@ else
   log "market-core already wired to resolver/treasury"
 fi
 
-# --- register the agent with reasoning-registry ------------------------------
+# --- register the agents with reasoning-registry -----------------------------
 if [ "$(json_get .agent_registered)" != "true" ]; then
   log "registering agent with reasoning-registry"
   stellar contract invoke --id "$REGISTRY" --source-account "$DEPLOYER_KEY" \
@@ -195,14 +224,61 @@ if [ "$(json_get .agent_registered)" != "true" ]; then
 else
   log "agent already registered"
 fi
+if [ "$(json_get .role_agents_registered)" != "true" ]; then
+  log "registering maker and trader with reasoning-registry"
+  for a in "$MAKER" "$TRADER"; do
+    stellar contract invoke --id "$REGISTRY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- register_agent --agent "$a"
+  done
+  json_set '.role_agents_registered = true'
+else
+  log "maker and trader already registered with reasoning-registry"
+fi
+
+# --- maker / trader policies in the treasury's agent registry ---------------
+# New agents are a loosening, so set_agent only queues them; they go live
+# once execute_agent runs after CONFIG_DELAY. Re-run this script after the
+# delay to execute (until then the constructor agent keeps every role).
+agent_policy() {
+  jq -nc --argjson roles "$1" --arg t "$2" --arg d "$3" \
+    '{roles: $roles, max_trade: $t, max_daily: $d, active: true}'
+}
+propose_agent() {
+  local name=$1 addr=$2 roles=$3 max_trade=$4 max_daily=$5
+  if [ "$(json_get ".agent_policies.$name")" = "" ]; then
+    log "treasury.set_agent($name) — live after ${CONFIG_DELAY}s"
+    stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- set_agent --agent "$addr" \
+      --policy "$(agent_policy "$roles" "$max_trade" "$max_daily")"
+    json_set --arg n "$name" '.agent_policies[$n] = "proposed"'
+  fi
+  if [ "$(json_get ".agent_policies.$name")" = "proposed" ]; then
+    if stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- execute_agent --agent "$addr" >/dev/null 2>&1; then
+      log "treasury.execute_agent($name): live"
+      json_set --arg n "$name" '.agent_policies[$n] = "active"'
+    else
+      log "treasury.execute_agent($name): still timelocked, re-run after the delay"
+    fi
+  else
+    log "$name agent already active in the treasury"
+  fi
+}
+propose_agent maker "$MAKER" $((ROLE_CREATE | ROLE_SETTLE)) "$MAKER_MAX_TRADE" "$MAKER_MAX_DAILY"
+propose_agent trader "$TRADER" $((ROLE_TRADE | ROLE_SETTLE)) "$TRADER_MAX_TRADE" "$TRADER_MAX_DAILY"
 
 # --- fund the treasury with test USDC ---------------------------------------
+# The treasury is a share vault: collateral sent to it directly would be a
+# donation to existing shareholders, so the deployer mints to itself and
+# deposits, receiving shares (docs/adr/0005-treasury-vault.md).
 TREASURY_FUNDED=$(json_get .treasury_funded_amount)
 FUND_AMOUNT=${TREASURY_FUND_AMOUNT:-10000000000000} # 1,000,000 USDC
 if [ "$TREASURY_FUNDED" != "$FUND_AMOUNT" ]; then
-  log "minting $FUND_AMOUNT stroops of test USDC to treasury"
+  log "minting $FUND_AMOUNT stroops of test USDC and depositing it into the treasury"
   stellar contract invoke --id "$USDC" --source-account "$DEPLOYER_KEY" \
-    --network "$NETWORK" -- mint --to "$TREASURY" --amount "$FUND_AMOUNT"
+    --network "$NETWORK" -- mint --to "$DEPLOYER" --amount "$FUND_AMOUNT"
+  stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- deposit --from "$DEPLOYER" --amount "$FUND_AMOUNT"
   json_set --arg a "$FUND_AMOUNT" '.treasury_funded_amount = $a'
 else
   log "treasury already funded with $FUND_AMOUNT stroops"

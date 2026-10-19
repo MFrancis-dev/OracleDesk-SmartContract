@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { StellarAdapter, type Deployments } from "./adapter.js";
+import { agentCredentials, StellarAdapter, type Deployments } from "./adapter.js";
 
 const deployments: Deployments = {
   deployer: "GDEPLOYER",
@@ -65,6 +65,51 @@ test("dry-run agentBuy describes the call without touching the network", async (
     assert.equal(result.contractId, "CTREASURY");
     assert.equal(result.method, "agent_buy");
   }
+});
+
+test("dry-run agentBuy includes agent address", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    agentAddress: "GTRADER",
+    deployments,
+  });
+  const result = await adapter.agentBuy({
+    market_id: 0n,
+    outcome: { tag: "Yes", values: undefined },
+    collateral_in: 10_000_000n,
+    min_shares_out: 1n,
+  });
+  assert.equal(result.dryRun, true);
+  if (result.dryRun) {
+    assert.equal((result.args as { agent: string }).agent, "GTRADER");
+  }
+  // Without a configured address, the constructor agent acts.
+  const fallback = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  assert.equal(fallback.agent, "GAGENT");
+});
+
+test("market-maker uses maker key when configured", () => {
+  const withAgents: Deployments = { ...deployments, agents: { maker: "GMAKER", trader: "GTRADER" } };
+  assert.deepEqual(
+    agentCredentials("maker", { MAKER_SECRET_KEY: "SMAKER", AGENT_SECRET_KEY: "SSHARED" }, withAgents),
+    { agentSecret: "SMAKER", agentAddress: "GMAKER" },
+  );
+  assert.deepEqual(
+    agentCredentials("trader", { MAKER_SECRET_KEY: "SMAKER", AGENT_SECRET_KEY: "SSHARED" }, withAgents),
+    { agentSecret: "SSHARED", agentAddress: "GTRADER" },
+  );
+  // Pre-registry deployments fall back to the single shared agent.
+  assert.deepEqual(agentCredentials("maker", { AGENT_SECRET_KEY: "SSHARED" }, deployments), {
+    agentSecret: "SSHARED",
+    agentAddress: "GAGENT",
+  });
 });
 
 test("dry-run agentBuyV2 describes the bounded call without touching the network", async () => {

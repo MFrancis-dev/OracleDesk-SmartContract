@@ -10,15 +10,16 @@
  * backstop, plus a `deadline` — so a stale or sandwiched transaction
  * reverts on-chain instead of executing at an arbitrary price.
  *
- * Defaults to dry-run. Set AGENT_MODE=live and AGENT_SECRET_KEY to submit
- * real testnet transactions — see .env.example.
+ * Defaults to dry-run. Set AGENT_MODE=live and TRADER_SECRET_KEY (or the
+ * shared AGENT_SECRET_KEY) to submit real testnet transactions — see
+ * .env.example.
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
 import { buildTrace, LocalTraceStore } from "../core/trace.js";
 import { BPS, priceYesBps } from "../core/fpmm.js";
 import { decideTrade, type MarketState } from "../core/strategy.js";
-import { loadDeployments, StellarAdapter } from "../stellar/adapter.js";
+import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 
 /**
  * Reads the market to trade and the fair value to compare it against.
@@ -129,7 +130,7 @@ export async function main(
 
   if (!result.dryRun) {
     const traceResult = await adapter.publishTrace({
-      agent: loadDeployments().agent,
+      agent: adapter.agent,
       market_id: BigInt(market.marketId),
       action: "buy",
       trace_hash: Buffer.from(built.hash, "hex"),
@@ -148,7 +149,7 @@ if (isMain) {
     mode,
     networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
     rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    agentSecret: process.env.AGENT_SECRET_KEY,
+    ...agentCredentials("trader", process.env, deployments),
     deployments,
   });
   main(adapter).catch((err) => {

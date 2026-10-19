@@ -41,6 +41,13 @@ contract's Rust enums:
 type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
 ```
 
+The resolver's `attest` / `attest_with_evidence` take its own
+`AttestedOutcome` instead, which adds `{ tag: "Invalid"; values: void }`
+(finalizing an `Invalid` proposal voids the market). `finalize_signers`
+returns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
+`ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome`-typed
+`ResolutionProposed` / `ResolutionFinalized` are no longer emitted.
+
 ```ts
 const tx = await contract.buy({
   trader: userAddress,

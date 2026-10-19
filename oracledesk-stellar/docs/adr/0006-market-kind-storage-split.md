@@ -1,4 +1,4 @@
-# ADR 0005: Market kinds as side storage, append-only XDR variants
+# ADR 0006: Market kinds as side storage, append-only XDR variants
 
 ## Status
 

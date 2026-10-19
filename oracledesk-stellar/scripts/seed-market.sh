@@ -87,6 +87,7 @@ CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))
 echo "==> creating market (seed=$SEED_AMOUNT, close_time=$CLOSE_TIME)" >&2
 MARKET_ID=$(stellar contract invoke --id "$TREASURY" --source-account "$AGENT_KEY" --network "$NETWORK" -- \
   agent_create_market \
+  --agent "$AGENT" \
   --question_hash "$QUESTION_HASH" \
   --resolution_hash "$RESOLUTION_HASH" \
   --meta_uri "\"ipfs://$(echo -n "$QUESTION_TEXT" | tr ' ' '-')\"" \

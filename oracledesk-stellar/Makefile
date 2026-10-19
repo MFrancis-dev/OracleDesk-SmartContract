@@ -22,6 +22,7 @@ build:
 	stellar contract build
 	cp target/wasm32v1-none/release/market_core.wasm contracts/resolver/market_core.wasm
 	cp target/wasm32v1-none/release/market_core.wasm contracts/treasury/market_core.wasm
+	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/resolver/reasoning_registry.wasm
 	stellar contract build
 
 test: build

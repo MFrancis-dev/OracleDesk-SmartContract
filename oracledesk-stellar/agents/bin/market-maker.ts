@@ -4,14 +4,15 @@
  * confident enough to seed a market, builds and records a reasoning trace,
  * and (in "live" mode) creates the market through the treasury.
  *
- * Defaults to dry-run. Set AGENT_MODE=live and AGENT_SECRET_KEY to submit
- * real testnet transactions — see .env.example.
+ * Defaults to dry-run. Set AGENT_MODE=live and MAKER_SECRET_KEY (or the
+ * shared AGENT_SECRET_KEY) to submit real testnet transactions — see
+ * .env.example.
  */
 import "dotenv/config";
 import { createHash } from "node:crypto";
 import { buildTrace, LocalTraceStore } from "../core/trace.js";
 import { decideMarketProposal, type MarketSignal, type SignalSource } from "../core/strategy.js";
-import { loadDeployments, StellarAdapter } from "../stellar/adapter.js";
+import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 
 /** Placeholder signal source until a real one (news, an oracle feed, a
  * comparable market) is wired in — see docs/wave-issues for that as an
@@ -38,7 +39,7 @@ async function main() {
     mode,
     networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
     rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    agentSecret: process.env.AGENT_SECRET_KEY,
+    ...agentCredentials("maker", process.env, deployments),
     deployments,
   });
   const traceStore = new LocalTraceStore(process.env.TRACE_STORE_DIR ?? "./.traces");
@@ -84,7 +85,7 @@ async function main() {
 
     if (!result.dryRun) {
       const traceResult = await adapter.publishTrace({
-        agent: deployments.agent,
+        agent: adapter.agent,
         market_id: result.value,
         action: "create_market",
         trace_hash: Buffer.from(built.hash, "hex"),

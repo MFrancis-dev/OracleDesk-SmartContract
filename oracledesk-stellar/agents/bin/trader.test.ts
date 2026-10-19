@@ -14,6 +14,7 @@ const QUOTE_SHARES = 123_456n;
 function fakeAdapter(quoteShares: bigint, calls: Record<string, unknown>[]): StellarAdapter {
   return {
     mode: "dry-run" as const,
+    agent: "GTRADER",
     quoteBuy: async () => quoteShares,
     agentBuyV2: async (args: Record<string, unknown>) => {
       calls.push(args);

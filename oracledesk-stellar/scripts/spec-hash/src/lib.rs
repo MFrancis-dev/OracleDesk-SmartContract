@@ -6,9 +6,9 @@
 //! `spec_v2_hash`, so the tool cannot drift from the contract.
 
 use resolver::{
-    legacy_spec_hash, spec_v2_hash, CatSignerConfig, DisputableSignerConfig, Escalation,
-    OracleAsset, PriceConfig, PriceDirection, ResolutionSpec, ResolutionSpecV2, ScalarPriceConfig,
-    SignerConfig, WeightedKey, WeightedKeyConfig,
+    legacy_spec_hash, spec_v2_hash, CatSignerConfig, CommitteeRef, DisputableSignerConfig, Escalation,
+    HybridConfig, OracleAsset, PriceConfig, PriceDirection, ResolutionSpec, ResolutionSpecV2,
+    ScalarPriceConfig, SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec as SorobanVec};
 
@@ -27,7 +27,9 @@ usage:
   spec-hash [V2 FLAGS] scalar <reflector_C_address> <asset> <lower> <upper> <max_staleness_secs>
     <asset> is `stellar:<G_or_C_address>` or `other:<symbol>`
     LONG pays `(price - lower) / (upper - lower)` in bps, clamped into the range
-  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable|cat-signers|scalar> <args>...
+  spec-hash [V2 FLAGS] committee <committee_id> <min_epoch> <max_rotation_delta> <dispute_window_secs>
+  spec-hash [V2 FLAGS] hybrid <fallback_after_secs> <reflector> <asset> <threshold> <direction> <max_staleness> -- <threshold> <dispute_window_secs> <signer>...
+  spec-hash [V2 FLAGS] verify <expected_hash_hex> <signers|price|weighted-keys|signers-disputable|cat-signers|scalar|committee|hybrid> <args>...
   spec-hash gen-salt
 
 V2 FLAGS (all four are required together; without them the legacy hash is printed):
@@ -285,6 +287,51 @@ pub fn parse_cat_signers(env: &Env, args: &[String]) -> Result<ResolutionSpec, S
     }))
 }
 
+pub fn parse_committee(args: &[String]) -> Result<ResolutionSpec, String> {
+    let [committee_id, min_epoch, max_rotation_delta, dispute_window] = args else {
+        return Err("committee needs <committee_id> <min_epoch> <max_rotation_delta> <dispute_window_secs>".into());
+    };
+    Ok(ResolutionSpec::Committee(CommitteeRef {
+        committee_id: committee_id
+            .parse()
+            .map_err(|_| "committee_id must be a u64".to_string())?,
+        min_epoch: min_epoch
+            .parse()
+            .map_err(|_| "min_epoch must be a u32".to_string())?,
+        max_rotation_delta: max_rotation_delta
+            .parse()
+            .map_err(|_| "max_rotation_delta must be a u32".to_string())?,
+        dispute_window: dispute_window
+            .parse()
+            .map_err(|_| "dispute_window must be a u64".to_string())?,
+    }))
+}
+
+pub fn parse_hybrid(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
+    let Some(sep_idx) = args.iter().position(|a| a == "--") else {
+        return Err("hybrid needs <fallback_after_secs> <price args...> -- <signer args...>".into());
+    };
+    let price_part = &args[..sep_idx];
+    let signer_part = &args[sep_idx + 1..];
+    let [fallback_after, price_args @ ..] = price_part else {
+        return Err("hybrid needs <fallback_after_secs> followed by price args".into());
+    };
+    let fallback_after: u64 = fallback_after
+        .parse()
+        .map_err(|_| "fallback_after must be a u64".to_string())?;
+    let ResolutionSpec::Price(price_cfg) = parse_price(env, price_args)? else {
+        unreachable!()
+    };
+    let ResolutionSpec::Signers(signer_cfg) = parse_signers(env, signer_part)? else {
+        unreachable!()
+    };
+    Ok(ResolutionSpec::Hybrid(HybridConfig {
+        price: price_cfg,
+        fallback: signer_cfg,
+        fallback_after,
+    }))
+}
+
 fn parse_rule(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
     match args {
         [kind, rest @ ..] if kind == "signers" => parse_signers(env, rest),
@@ -293,9 +340,10 @@ fn parse_rule(env: &Env, args: &[String]) -> Result<ResolutionSpec, String> {
         [kind, rest @ ..] if kind == "signers-disputable" => parse_signers_disputable(env, rest),
         [kind, rest @ ..] if kind == "cat-signers" => parse_cat_signers(env, rest),
         [kind, rest @ ..] if kind == "scalar" => parse_scalar(env, rest),
+        [kind, rest @ ..] if kind == "committee" => parse_committee(rest),
+        [kind, rest @ ..] if kind == "hybrid" => parse_hybrid(env, rest),
         _ => Err(
-            "expected `signers`, `price`, `weighted-keys`, `signers-disputable`, `cat-signers` or `scalar`"
-                .into(),
+            "expected `signers`, `price`, `weighted-keys`, `signers-disputable`, `cat-signers`, `scalar`, `committee` or `hybrid`".into(),
         ),
     }
 }

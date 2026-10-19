@@ -37,23 +37,16 @@ echo
 
 echo "### 2/6 trade (treasury.agent_buy) — price should move off 50/50"
 echo "price before: $(read_only "$MARKET_CORE" get_price --market_id "$MARKET_ID" --outcome Yes)"
-TRADE_TX=$(invoke "$TREASURY" "$AGENT_KEY" agent_buy --market_id "$MARKET_ID" --outcome Yes --collateral_in 100000000 --min_shares_out 0)
+TRADE_TX=$(invoke "$TREASURY" "$AGENT_KEY" agent_buy --agent "$AGENT" --market_id "$MARKET_ID" --outcome Yes --collateral_in 100000000 --min_shares_out 0)
 echo "shares received: $TRADE_TX"
 echo "price after:  $(read_only "$MARKET_CORE" get_price --market_id "$MARKET_ID" --outcome Yes)"
 echo
 
-echo "### 3/6 wait for close_time + dispute window, then resolve"
+echo "### 3/6 wait for close_time, record reasoning trace, then attest with evidence"
 NOW=$(date +%s)
 WAIT=$(( CLOSE_TIME - NOW + 1 ))
 [ "$WAIT" -gt 0 ] && { echo "waiting ${WAIT}s for the market to close..."; sleep "$WAIT"; }
-invoke "$RESOLVER" "$AGENT_KEY" attest --market_id "$MARKET_ID" --signer "$AGENT" --outcome Yes
-echo "waiting ${DISPUTE_WINDOW}s dispute window..."
-sleep "$(( DISPUTE_WINDOW + 1 ))"
-OUTCOME=$(invoke "$RESOLVER" "$AGENT_KEY" finalize_signers --market_id "$MARKET_ID")
-echo "resolved outcome: $OUTCOME"
-echo
 
-echo "### 4/6 record a reasoning trace"
 TRACE_JSON=$(mktemp)
 cat >"$TRACE_JSON" <<EOF
 {"agent":"market-maker","market_id":$MARKET_ID,"action":"create_market","reasoning":"OracleDesk testnet demo run via scripts/demo.sh.","timestamp":$(date +%s)}
@@ -66,10 +59,16 @@ TRACE_ID=$(invoke "$REGISTRY" "$AGENT_KEY" publish_trace \
 echo "trace id: $TRACE_ID"
 echo
 
-echo "### 5/6 verify the trace hash against the registry"
 VERIFIED=$(read_only "$REGISTRY" verify_trace --trace_id "$TRACE_ID" --received_hash "$TRACE_HASH")
 echo "verify_trace(correct hash) = $VERIFIED"
 [ "$VERIFIED" = "true" ] || { echo "FAILED: trace hash did not verify" >&2; exit 1; }
+echo
+
+invoke "$RESOLVER" "$AGENT_KEY" attest_with_evidence --market_id "$MARKET_ID" --signer "$AGENT" --outcome Yes --trace_id "$TRACE_ID"
+echo "waiting ${DISPUTE_WINDOW}s dispute window..."
+sleep "$(( DISPUTE_WINDOW + 1 ))"
+OUTCOME=$(invoke "$RESOLVER" "$AGENT_KEY" finalize_signers --market_id "$MARKET_ID")
+echo "resolved outcome: $OUTCOME"
 echo
 
 echo "### 6/6 summary"

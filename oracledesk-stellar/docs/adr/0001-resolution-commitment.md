@@ -62,7 +62,7 @@ price spec that resolves to a payout in basis points rather than an
 outcome). Appending preserves the disjointness argument above: existing
 variants keep their tags, so every already-committed hash is unchanged, and
 each new rule lives in its own hash space. See
-[ADR 0005](0005-market-kind-storage-split.md).
+[ADR 0006](0006-market-kind-storage-split.md).
 
 ## Liveness fallback
 
@@ -146,3 +146,41 @@ Rules the contract enforces:
 
 A `G...` account's raw key is `StrKey.decodeEd25519PublicKey(address)`;
 `C...` contract addresses have no Ed25519 key and cannot be committee members.
+
+## Committee commitments and rotation bounds
+
+Markets can run for weeks or months. If a fixed signer loses their key or suffers a compromise, an attested market could otherwise freeze or become unresolvable. To address operational rotation needs without breaking the commit-reveal invariant, `ResolutionSpec::Committee(CommitteeRef)` commits to a named committee registry entry rather than raw addresses:
+
+- `CommitteeRef { committee_id: u64, min_epoch: u32, max_rotation_delta: u32, dispute_window: u64 }`
+- Appended as a new `ResolutionSpec` variant so existing `Price` / `Signers` hashes remain byte-identical.
+- The committee admin proposes rotations subject to a time lock (`rotation_delay >= MIN_ROTATION_DELAY = 86_400`). Anyone can execute the rotation once the delay elapses.
+- `attest` and `finalize_signers` enforce rotation bounds: `epoch >= min_epoch` and `epoch - min_epoch <= max_rotation_delta`. A creator setting `max_rotation_delta = 0` gets exact fixed-membership semantics.
+- In `finalize_signers`, votes are recounted against the current epoch's active members (`MemberAt(committee_id, epoch)`), preventing rotated-out keys from deciding outcomes.
+
+## Hybrid resolution mode: Price feed with attested fallback
+
+High-frequency Reflector oracle feeds can experience unexpected upstream outages, sequencer downtime, or missing asset feeds. `ResolutionSpec::Hybrid(HybridConfig)` couples a primary price threshold check with a time-locked signer fallback:
+
+- Commit structure: `HybridConfig { price: PriceConfig, fallback_signers: Vec<Address>, fallback_threshold: u32, dispute_window: u64, fallback_delay: u64 }`.
+- Prior to `close_time + fallback_delay`, the resolver strictly requires `resolve_price`.
+- After `close_time + fallback_delay`, anyone can call `open_fallback(market_id)` to transition `ResolutionState::HybridPricePending` to `ResolutionState::HybridFallbackOpen`, enabling signers to attest.
+- Dual-path safety: if a usable price report arrives while an attested proposal is still pending in its dispute window, `resolve_price` immediately supersedes the proposal and finalizes the market directly from the oracle feed.
+
+## Reasoning evidence commitments
+
+To guarantee verifiable accountability for off-chain agent attestations, the resolver links attestation votes to cryptographic evidence traces published in `reasoning-registry`:
+
+- `set_evidence_config(min_policy, registry)` configures system-wide trace verification standards.
+- `attest_with_evidence(market_id, outcome, signer, trace_hash, reasoning_hash)` verifies with `reasoning-registry` that the trace exists and satisfies the required `EvidencePolicy`.
+- Replay prevention: each `trace_hash` can be cited only once per market.
+- Observability: the resolver retains an immutable append-only evidence trail accessible via `evidence_count` and `evidence_at`.
+
+## Constrained guardian powers and audit trail
+
+To eliminate unbounded administrative discretion and guarantee credible decentralization:
+
+- Time-window constraints:
+  - `cancel_proposal` is permitted only during the active dispute window (`DisputeWindowClosed` returned otherwise).
+  - `guardian_void_market` can only be invoked after grace periods have expired: `close_time + REVEAL_GRACE_SECS` (3 days) for unrevealed specs, `close_time + ORACLE_GRACE_SECS` (1 day) for failing price feeds, and `close_time + SIGNER_GRACE_SECS` (7 days) for unresponsive signer sets.
+- Cancellation rate limiting: `cancel_proposal` is strictly capped at `MAX_CANCELS_PER_MARKET = 2` cancellations per market to prevent indefinite griefing.
+- Audit trail: both `cancel_proposal` and `guardian_void_market` require a typed `GuardianReason` enum (`StaleOracleFeed = 1`, `CompromisedSigner = 2`, `AmbiguousSpec = 3`, `LivenessFailure = 4`, `Other = 5`), emitting structured `GuardianAction` events with execution metadata.
