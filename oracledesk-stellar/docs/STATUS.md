@@ -44,13 +44,13 @@ also gained categorical signer resolution (`register_cat_signer_spec` /
 forwarder. Design and invariants: `docs/architecture.md`; storage and
 append-only-XDR decision: [ADR 0006](adr/0006-market-kind-storage-split.md).
 
-Verified in the contributor session: `cargo fmt --check`, `cargo clippy
---workspace --all-targets -- -D warnings`, `cargo test --workspace` (now
-**208** tests: market-core 97, resolver 82, treasury 23, reasoning-registry
-6 — superseding the 87-test count above), the `scripts/spec-hash` crate (11
-tests), `python3 model/fpmm_model.py`, agents (52 tests) and x402 (5
-tests), plus `make build` (vendored wasm regenerated) and `make bindings`
-with only the intended diffs. The new math is mirrored in all three
+Verified in the contributor session, re-measured after merging `develop`:
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (now **305** tests: market-core 97, resolver 107,
+treasury 95, reasoning-registry 6 — superseding the 87-test count above), the
+`scripts/spec-hash` crate (11 tests), `python3 model/fpmm_model.py`, agents (54
+tests) and x402 (5 tests), plus `make build` (vendored wasm regenerated) and
+`make bindings` with only the intended diffs. The new math is mirrored in all three
 languages against one shared fixture file (`model/fee_fixtures.json`) that
 Python, Rust and TypeScript all read. Worst-case categorical cost was
 measured, not estimated: `buy_cat` at `n = 8` takes 444,604 instructions /
