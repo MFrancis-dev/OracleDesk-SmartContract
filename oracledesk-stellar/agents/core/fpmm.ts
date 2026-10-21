@@ -17,12 +17,12 @@ export const MAX_PROB_BPS = 9_900n; // 99%
 
 export class MathError extends Error {}
 
-function mulDivFloor(a: bigint, b: bigint, c: bigint): bigint {
+export function mulDivFloor(a: bigint, b: bigint, c: bigint): bigint {
   if (a < 0n || b < 0n || c <= 0n) throw new MathError("invalid input");
   return (a * b) / c;
 }
 
-function mulDivCeil(a: bigint, b: bigint, c: bigint): bigint {
+export function mulDivCeil(a: bigint, b: bigint, c: bigint): bigint {
   if (a < 0n || b < 0n || c <= 0n) throw new MathError("invalid input");
   const p = a * b;
   const q = p / c;

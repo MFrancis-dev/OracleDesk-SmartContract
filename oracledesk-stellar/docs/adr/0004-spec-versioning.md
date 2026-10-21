@@ -70,7 +70,8 @@ over random specs.
   differently, which is the property that mattered.
 * **The resolver address.** Binding it would strand every committed market
   whenever the resolver is redeployed and market-core is repointed with
-  `set_resolver`. Only the resolver market-core points to can resolve a
+  `propose_resolver` + `accept_resolver` (this ADR predates the handshake;
+  see ADR 0006). Only the resolver market-core points to can resolve a
   market, so replay across resolvers gains nothing.
 
 ### Salt custody

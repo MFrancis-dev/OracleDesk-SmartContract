@@ -9,7 +9,14 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+oracledesk-types = { path = "../oracledesk-types" }
 soroban-sdk = "27.0.6"
 
 [dev-dependencies]
+ed25519-dalek = "2"
 soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+
+# `cfg(kani)` is only set by `cargo kani`; declaring it here keeps
+# `cargo clippy -D warnings` quiet about the proof module.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

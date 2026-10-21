@@ -1,0 +1,20 @@
+[package]
+name = "oracledesk-types"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately *not* a cdylib and deliberately free of #[contract] /
+# #[contractimpl]: this crate only re-exports #[contracttype] definitions, so
+# it emits no wasm entrypoints and cannot trigger the `__constructor`
+# collision that forced `contractimport!` in the first place (ADR 0002). It is
+# the single source of truth for every type that crosses a contract boundary.
+[lib]
+crate-type = ["rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "27.0.6"
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }

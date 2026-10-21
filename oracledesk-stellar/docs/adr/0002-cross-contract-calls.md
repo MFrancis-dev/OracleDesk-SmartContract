@@ -34,10 +34,10 @@ impl` (not just the types/client we wanted) into `resolver`'s and
 
 ## Decision
 
-`resolver` and `treasury` do not depend on the `market-core` crate at all.
+`resolver`, `treasury`, and `reasoning-registry` do not depend on the `market-core` crate at all.
 Instead, each vendors a copy of the *compiled* `contracts/market-core/target/.../market_core.wasm`
 into its own directory (`contracts/resolver/market_core.wasm`,
-`contracts/treasury/market_core.wasm`) and generates bindings from it:
+`contracts/treasury/market_core.wasm`, `contracts/reasoning-registry/market_core.wasm`) and generates bindings from it:
 
 ```rust
 mod market_core {
@@ -74,23 +74,29 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
 ## Consequences
 
 - **Trade-off accepted**: `market_core.wasm` is a checked-in binary build
-  artifact in two places. Changing `market-core`'s source requires rebuilding
-  it and re-copying the `.wasm` into `contracts/resolver/` and
-  `contracts/treasury/` *before* rebuilding those crates — `contractimport!`
-  reads the file at `resolver`'s/`treasury`'s own compile time, so a stale
-  copy silently keeps the old interface. `make build` runs the steps in the
-  right order (market-core first, copy, then the rest); a contributor running
-  `cargo build` a la carte on just `resolver` after touching `market-core`
-  needs to rebuild market-core and re-copy the wasm by hand first — noted in
-  `CONTRIBUTING.md`.
-- `resolver`'s and `treasury`'s own copies of `Outcome`/`Category` are
-  nominally distinct Rust types from `market-core`'s originals (structurally
-  identical, same XDR shape, different type identity). This is invisible at
-  the ABI level — cross-contract calls serialize through `Val`/XDR, not Rust
-  type identity — but it means, e.g., `resolver::Outcome` and
-  `treasury::Outcome` are two more distinct (structurally-identical) Rust
-  enums. Not worth a shared "types-only" crate for three enums; revisit if
-  the shared surface grows.
+  artifact in two places (`contracts/resolver/` and `contracts/treasury/`), and
+  `reasoning_registry.wasm` in `contracts/resolver/`. `contractimport!` reads
+  the file at the dependent crate's own compile time, so a stale copy would
+  otherwise silently keep the old interface.
+- **A stale copy is now a compile error (#58).** Each dependent crate has a
+  `build.rs` that hashes the vendored wasm and compares it to a committed
+  `<name>.wasm.sha256`; a mismatch aborts the build with a contributor-facing
+  message. `scripts/sync-vendored-wasm.sh` is the one supported way to refresh
+  a copy (it writes the wasm *and* its pin together), and `make build` calls it
+  in the right order. CI additionally runs `scripts/check-wasm-determinism.sh`,
+  which builds the workspace twice in separate target directories and proves
+  the output is bit-for-bit reproducible before trusting the drift check, plus
+  `scripts/ci/assert-stale-wasm-fails.sh`, which proves a tampered copy fails
+  to compile. The toolchain and Stellar CLI are pinned (`rust-toolchain.toml`,
+  `stellar-cli.version`) because a floating compiler makes reproducibility
+  meaningless.
+- The shared `Outcome`/`Category`/`MarketStatus` and the resolution-spec types
+  now live in the `oracledesk-types` crate (#59) rather than being duplicated
+  per contract; the `contractimport!`-generated duplicates are bridged at the
+  client-call boundary. See
+  [ADR 0007](0007-shared-types-crate.md). The `experimental_spec_shaking_v2`
+  feature is still what re-exports those types into the dependent contracts'
+  specs.
 - Every contract test now registers `market-core` from its compiled wasm
   (`env.register(market_core::WASM, (admin, ...))`) instead of the native
   struct — this is closer to how the real deployed system behaves (resolver

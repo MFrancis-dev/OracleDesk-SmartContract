@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { agentCredentials, StellarAdapter, type Deployments } from "./adapter.js";
+import {
+  agentCredentials,
+  loadDeployments,
+  StellarAdapter,
+  type Deployments,
+} from "./adapter.js";
 
 const deployments: Deployments = {
   deployer: "GDEPLOYER",
@@ -153,5 +161,20 @@ test("dry-run agentSellV2 describes the bounded call without touching the networ
   if (result.dryRun) {
     assert.equal(result.contractId, "CTREASURY");
     assert.equal(result.method, "agent_sell_v2");
+  }
+});
+
+test("loadDeployments honours DEPLOYMENTS_PATH", () => {
+  const dir = mkdtempSync(join(tmpdir(), "oracledesk-deployments-"));
+  const path = join(dir, "local.json");
+  writeFileSync(path, JSON.stringify({ ...deployments, contracts: { ...deployments.contracts, usdc: "CLOCAL" } }));
+  const previous = process.env.DEPLOYMENTS_PATH;
+  process.env.DEPLOYMENTS_PATH = path;
+  try {
+    assert.equal(loadDeployments().contracts.usdc, "CLOCAL");
+  } finally {
+    if (previous === undefined) delete process.env.DEPLOYMENTS_PATH;
+    else process.env.DEPLOYMENTS_PATH = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -15,7 +15,7 @@
 #      0..market_count, moving each market's position and (if still held)
 #      LP ownership to the new treasury.
 #
-# It does NOT rewire market-core (`set_treasury`) — that is a separate,
+# It does NOT rewire market-core (`propose_treasury`) — that is a separate,
 # deliberate cutover step, because it changes the fee recipient for future
 # markets. The recorded successor id lands in
 # deployments/testnet.json under `.contracts.treasury_successor`.
@@ -142,5 +142,7 @@ json_set --arg n "$MARKET_COUNT" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 
 log "done. Successor: $NEW_TREASURY"
 log "next steps (deliberate, operator-owned):"
-log "  1. market-core.set_treasury($NEW_TREASURY) to cut fees over for future markets"
+log "  1. rewire market-core's fee recipient to the new treasury (#61, ADR 0006):"
+log "     market-core.propose_treasury($NEW_TREASURY); then the new treasury calls"
+log "     accept_market_core_role() to authenticate the wiring"
 log "  2. update .contracts.treasury in $OUT and restart the agents against it"

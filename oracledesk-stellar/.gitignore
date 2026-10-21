@@ -31,11 +31,28 @@ yarn-error.log*
 # V2 resolution specs written by scripts/seed-market.sh. The salt inside each
 # file is a secret until its market's spec is revealed, so never commit them.
 deployments/specs/
+deployments/specs-local/
+deployments/local*.json
+deployments/traces-*/
+!deployments/*.example.json
 
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
+
+# Agent runtime state and single-instance lock (agents/runtime, docs/agent-runtime.md)
+.agent-state/
+# Market-maker resolution specs (agents/core/spec-store.ts). Losing one makes
+# its market unresolvable: keep AGENT_SPEC_DIR on backed-up storage, never in git.
+.specs/
+# Simulator output (agents/sim/cli.ts)
+agents/sim/results/
 
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
+
+# Payment ledger, WAL and shared-memory files contain purchase records.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

@@ -22,7 +22,19 @@ use soroban_sdk::{
 mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
-use market_core::{Client as MarketCoreClient, MarketKind, Outcome};
+use market_core::Client as MarketCoreClient;
+use market_core::MarketKind;
+
+// The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
+// sha256(spec.to_xdr())`), so its definitions now live in the shared
+// `oracledesk-types` crate rather than being duplicated per contract. Re-export
+// them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
+// keep working.
+pub use oracledesk_types::{
+    CatSignerConfig, CommitteeRef, DisputableSignerConfig, Escalation, HybridConfig, OracleAsset,
+    Outcome, PriceConfig, PriceData, PriceDirection, ResolutionSpec, ResolutionSpecV2,
+    ScalarPriceConfig, SignerConfig, WeightedKey, WeightedKeyConfig,
+};
 
 #[allow(clippy::too_many_arguments)]
 mod reasoning_registry {
@@ -32,6 +44,10 @@ use reasoning_registry::Client as RegistryClient;
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+
+/// How long a pending admin proposal stays acceptable. Kept short so a
+/// mistyped or abandoned handover cannot linger as a live takeover path.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
 /// Most keys a weighted committee may hold. Bounds registration (O(n^2)
 /// duplicate check) and the per-call signature scan.
@@ -71,29 +87,6 @@ pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
 pub const MAX_CANCELS_PER_MARKET: u32 = 2;
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceData {
-    pub price: i128,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PriceDirection {
-    Above,
-    AtOrAbove,
-    Below,
-    AtOrBelow,
-}
-
-#[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionState {
     Unconfigured,
@@ -123,24 +116,6 @@ pub enum ExpiryMode {
     Signers,
     /// Scalar counterpart of `Price` (appended).
     Scalar,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceConfig {
-    pub reflector: Address,
-    pub asset: OracleAsset,
-    pub threshold: i128,
-    pub direction: PriceDirection,
-    pub max_staleness: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignerConfig {
-    pub signers: Vec<Address>,
-    pub threshold: u32,
-    pub dispute_window: u64,
 }
 
 /// Legacy proposal shape, stored under [`DataKey::Proposal`]. Only read (as a
@@ -204,33 +179,6 @@ pub struct PriceSnapshot {
     pub taken_by: Address,
 }
 
-/// Who rules on a dispute.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Escalation {
-    /// The resolver admin, through `settle_dispute`.
-    Guardian,
-    /// `k` of these members, through `escalation_attest`. Must be disjoint
-    /// from the proposing signers.
-    Committee(Vec<Address>, u32),
-}
-
-/// Attested resolution whose proposal can be challenged with a bond during
-/// the dispute window. Hashed as `ResolutionSpec::SignersDisputable`, a
-/// separate variant, so existing `Signers` commitments are unaffected.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisputableSignerConfig {
-    pub signers: Vec<Address>,
-    pub threshold: u32,
-    pub dispute_window: u64,
-    /// Collateral escrowed by `dispute`; must be positive.
-    pub dispute_bond: i128,
-    pub escalation: Escalation,
-    /// Seconds after a dispute opens before anyone may void it unresolved.
-    pub escalation_timeout: u64,
-}
-
 /// The escalation authority's ruling. `Invalid` voids the market.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,63 +204,14 @@ pub struct Dispute {
     pub payee: Option<Address>,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WeightedKey {
-    /// Raw Ed25519 public key. For a `G...` account address this is
-    /// `StrKey.decodeEd25519PublicKey(address)`; `C...` addresses have none.
-    pub pubkey: BytesN<32>,
-    pub weight: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WeightedKeyConfig {
-    pub signers: Vec<WeightedKey>,
-    /// Total weight that must sign one outcome. Choose it above half the total
-    /// weight so two outcomes can never both reach it.
-    pub weight_threshold: u32,
-    pub dispute_window: u64,
-}
-
-/// Categorical signer committee: like [`SignerConfig`], but signers attest one
-/// outcome *index* of a categorical market instead of Yes/No. `outcome_count`
-/// binds the market's outcome set to the commitment (2..=[`MAX_CAT_OUTCOMES`],
-/// mirroring market-core's cap), so a reveal cannot silently change how many
-/// outcomes signers are voting on.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatSignerConfig {
-    pub signers: Vec<Address>,
-    pub threshold: u32,
-    pub dispute_window: u64,
-    pub outcome_count: u32,
-}
-
 /// A categorical winner once `threshold` signers have attested the index.
+/// Resolver-local storage only (never hashed), so it stays here while the
+/// committed `CatSignerConfig` lives in `oracledesk-types`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatProposal {
     pub outcome_index: u32,
     pub proposed_at: u64,
-}
-
-/// Scalar (range) counterpart of [`PriceConfig`]. The market settles on the
-/// fractional position of `price` inside `[lower, upper]`:
-/// `payout_long_bps = (clamped_price - lower) / (upper - lower)`, and the
-/// SHORT side pays the complement. A reading below the range clamps to
-/// `lower` (LONG pays 0), above to `upper` (LONG pays 1.0); a non-positive
-/// reading is an invalid price, never a clamp.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScalarPriceConfig {
-    pub reflector: Address,
-    pub asset: OracleAsset,
-    /// Bottom of the staked range. Validated `0 <= lower < upper`, with
-    /// `upper` capped so `upper * BPS` cannot overflow.
-    pub lower: i128,
-    pub upper: i128,
-    pub max_staleness: u64,
 }
 
 /// Reusable committee managed by an admin under time-locked rotation rules.
@@ -333,25 +232,6 @@ pub struct PendingRotation {
     pub members: Vec<Address>,
     pub threshold: u32,
     pub executable_at: u64,
-}
-
-/// Binds a market to a reusable committee registry subject to rotation bounds.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommitteeRef {
-    pub committee_id: u64,
-    pub min_epoch: u32,
-    pub max_rotation_delta: u32,
-    pub dispute_window: u64,
-}
-
-/// Dual-path resolution mode: price feed first, falling back to signers.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HybridConfig {
-    pub price: PriceConfig,
-    pub fallback: SignerConfig,
-    pub fallback_after: u64,
 }
 
 /// Evidence policy governing whether attestation evidence is required.
@@ -398,49 +278,12 @@ pub enum GuardianActionKind {
     CancelProposal,
 }
 
-/// The full resolution rule a market's `resolution_hash` commits to. Hashing
-/// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
-/// modes in disjoint hash spaces even if their field encodings could
-/// otherwise collide. See `docs/adr/0001-resolution-commitment.md`.
-///
-/// Variants are append-only: the XDR tag is the variant position, so a new
-/// mode goes at the end and existing commitments never move.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResolutionSpec {
-    Price(PriceConfig),
-    Signers(SignerConfig),
-    WeightedKeys(WeightedKeyConfig),
-    SignersDisputable(DisputableSignerConfig),
-    /// Categorical counterpart of `Signers` (appended, tag 4).
-    CategoricalSigners(CatSignerConfig),
-    /// Scalar counterpart of `Price` (appended, tag 5): the binary pool
-    /// settles at a fractional LONG payout instead of a side.
-    Scalar(ScalarPriceConfig),
-    Committee(CommitteeRef),
-    Hybrid(HybridConfig),
-}
-
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
 /// preimage is the XDR of an `ScVal` and so starts with the bytes `00 00 00 10`
 /// (`ScValType::Vec`), never with ASCII, which keeps the two hash spaces
 /// disjoint. See `docs/adr/0004-spec-versioning.md`.
 pub const SPEC_DOMAIN: &str = "oracledesk:resolution-spec";
 const SPEC_V2_VERSION: u32 = 2;
-
-/// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
-/// network and the market-core instance, and carries a creator-chosen `salt`
-/// that makes a pre-reveal brute-force of the (low-entropy) rule infeasible.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolutionSpecV2 {
-    pub version: u32,
-    /// `sha256(network passphrase)`, i.e. `env.ledger().network_id()`.
-    pub network_id: BytesN<32>,
-    pub market_core: Address,
-    pub salt: BytesN<32>,
-    pub rule: ResolutionSpec,
-}
 
 /// Hash a legacy commitment is checked against: `sha256(XDR(rule))`.
 pub fn legacy_spec_hash(env: &Env, rule: &ResolutionSpec) -> BytesN<32> {
@@ -452,6 +295,14 @@ pub fn spec_v2_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
     let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN.as_bytes());
     preimage.append(&spec.clone().to_xdr(env));
     env.crypto().sha256(&preimage).into()
+}
+
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
 }
 
 #[contracterror]
@@ -499,14 +350,19 @@ pub enum Error {
     GuardianNotAllowed = 39,
     TooManyCancels = 40,
     SnapshotExists = 41,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 42,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 43,
 
     /// `attest_cat` outcome index not below the committed `outcome_count`.
-    InvalidOutcomeIndex = 42,
+    InvalidOutcomeIndex = 44,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     MarketCore,
     Price(u64),
     Signers(u64),
@@ -815,6 +671,23 @@ pub struct GuardianAction {
     pub at: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {}
+
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
@@ -823,6 +696,11 @@ pub trait ReflectorPrice {
 #[contract]
 pub struct Resolver;
 
+#[soroban_sdk::contractclient(name = "MarketCoreWiringClient")]
+pub trait MarketCoreWiring {
+    fn accept_resolver(env: Env) -> Result<(), soroban_sdk::Error>;
+}
+
 #[contractimpl]
 impl Resolver {
     pub fn __constructor(env: Env, admin: Address, market_core: Address) {
@@ -830,6 +708,73 @@ impl Resolver {
         env.storage()
             .instance()
             .set(&DataKey::MarketCore, &market_core);
+    }
+
+    pub fn market_core(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::MarketCore).unwrap()
+    }
+
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        Self::instance_get(&env, DataKey::Admin)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
+    }
+
+    pub fn accept_market_core_role(env: Env) {
+        let core = Self::market_core(env.clone());
+        MarketCoreWiringClient::new(&env, &core).accept_resolver();
+    }
+
+    // ----- admin ----------------------------------------------------------
+
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        let old: Address = Self::instance_get(&env, DataKey::Admin)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
     }
 
     /// Reveals the resolution rule committed to at market creation. Anyone
@@ -1073,7 +1018,9 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         let now = env.ledger().timestamp();
         let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
         if now < fallback_deadline {
@@ -1089,7 +1036,7 @@ impl Resolver {
                     &outcome,
                     &data,
                     from_snapshot,
-                );
+                )?;
                 Ok(())
             }
             Err(err) => {
@@ -1162,7 +1109,11 @@ impl Resolver {
         let Ok(market_core) = Self::instance_get::<Address>(&env, DataKey::MarketCore) else {
             return reasons;
         };
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let Ok(market) =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))
+        else {
+            return reasons;
+        };
         let now = env.ledger().timestamp();
         let storage = env.storage().persistent();
 
@@ -1289,7 +1240,7 @@ impl Resolver {
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let core = MarketCoreClient::new(&env, &market_core);
-        let market = core.get_market(&market_id);
+        let market = core_call(core.try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
 
         if reason != GuardianReason::DisputeUpheld && now < market.close_time {
@@ -1352,7 +1303,7 @@ impl Resolver {
             }
         }
 
-        core.void_market(&market_id);
+        core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
         GuardianAction {
@@ -1376,7 +1327,9 @@ impl Resolver {
             return Err(Error::WrongMode);
         };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1404,7 +1357,7 @@ impl Resolver {
             &outcome,
             &data,
             from_snapshot,
-        );
+        )?;
         Ok(outcome)
     }
 
@@ -1425,7 +1378,9 @@ impl Resolver {
         caller.require_auth();
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         let now = env.ledger().timestamp();
         if now < market.close_time {
             return Err(Error::MarketNotClosed);
@@ -1476,7 +1431,9 @@ impl Resolver {
     pub fn resolve_scalar_price(env: Env, market_id: u64) -> Result<u32, Error> {
         let config: ScalarPriceConfig = Self::load(&env, DataKey::Scalar(market_id))?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1492,7 +1449,11 @@ impl Resolver {
     /// [`RESOLUTION_GRACE_SECS`]. Needs only market-core's `close_time`, so it
     /// is known before (and without) a spec reveal, for either market kind.
     pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
-        Self::market_deadline(&env, market_id)
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
+        Ok(Self::deadline(&market))
     }
 
     /// Permissionless liveness fallback: once `resolution_deadline` has passed,
@@ -1509,8 +1470,10 @@ impl Resolver {
         if Self::resolution_state(&env, market_id).is_terminal() {
             return Err(Error::AlreadyFinalized);
         }
-        let close_time = Self::market_close_time(&env, market_id)?;
-        let deadline = close_time.saturating_add(RESOLUTION_GRACE_SECS);
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let core = MarketCoreClient::new(&env, &market_core);
+        let market = core_call(core.try_get_market(&market_id))?;
+        let deadline = Self::deadline(&market);
         if env.ledger().timestamp() < deadline {
             return Err(Error::DeadlineNotReached);
         }
@@ -1519,9 +1482,8 @@ impl Resolver {
         match mode {
             ExpiryMode::Price => {
                 let config: PriceConfig = Self::load(&env, DataKey::Price(market_id))?;
-                match Self::price_outcome(&env, market_id, &config, close_time) {
+                match Self::price_outcome(&env, market_id, &config, market.close_time) {
                     Ok((outcome, data, from_snapshot)) => {
-                        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
                         Self::settle_price(
                             &env,
                             &market_core,
@@ -1529,7 +1491,7 @@ impl Resolver {
                             &outcome,
                             &data,
                             from_snapshot,
-                        );
+                        )?;
                         return Ok(());
                     }
                     // Only an unusable feed lets the market expire; any other
@@ -1538,17 +1500,10 @@ impl Resolver {
                     Err(other) => return Err(other),
                 }
             }
-            ExpiryMode::Signers
-                if Self::has_valid_proposal(&env, market_id)?
-                    || Self::has_valid_cat_proposal(&env, market_id)? =>
-            {
-                return Err(Error::ResolutionAvailable);
-            }
             ExpiryMode::Scalar => {
                 let config: ScalarPriceConfig = Self::load(&env, DataKey::Scalar(market_id))?;
-                match Self::try_scalar_payout(&env, &config, close_time) {
+                match Self::try_scalar_payout(&env, &config, market.close_time) {
                     Ok((payout, data)) => {
-                        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
                         Self::settle_scalar(&env, &market_core, market_id, payout, &data);
                         return Ok(());
                     }
@@ -1558,15 +1513,20 @@ impl Resolver {
                     Err(other) => return Err(other),
                 }
             }
+            ExpiryMode::Signers
+                if Self::has_valid_proposal(&env, market_id)?
+                    || Self::has_valid_cat_proposal(&env, market_id)? =>
+            {
+                return Err(Error::ResolutionAvailable);
+            }
             ExpiryMode::Signers | ExpiryMode::Unrevealed => {}
         }
 
-        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        MarketCoreClient::new(&env, &market_core).void_market(&market_id);
+        core_call(core.try_void_market(&market_id))?;
         Self::set_state(&env, market_id, ResolutionState::Expired);
         MarketExpired {
             market_id,
-            close_time,
+            close_time: market.close_time,
             deadline,
             mode,
         }
@@ -1636,7 +1596,9 @@ impl Resolver {
             return Err(Error::StaleRound);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1701,9 +1663,9 @@ impl Resolver {
         let core = MarketCoreClient::new(&env, &market_core);
         let now = env.ledger().timestamp();
         match proposal.outcome.to_market() {
-            Some(outcome) => core.resolve(&market_id, &outcome),
+            Some(outcome) => core_call(core.try_resolve(&market_id, &to_core_outcome(&outcome)))?,
             None => {
-                core.void_market(&market_id);
+                core_call(core.try_void_market(&market_id))?;
                 CommitteeVoided {
                     market_id,
                     finalized_at: now,
@@ -1849,9 +1811,7 @@ impl Resolver {
         }
 
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let token = MarketCoreClient::new(&env, &market_core)
-            .get_config()
-            .collateral;
+        let token = core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
         token::Client::new(&env, &token).transfer(
             &disputer,
             env.current_contract_address(),
@@ -1930,7 +1890,7 @@ impl Resolver {
             return Err(Error::DeadlineNotReached);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        MarketCoreClient::new(&env, &market_core).void_market(&market_id);
+        core_call(MarketCoreClient::new(&env, &market_core).try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
         DisputeSettled {
@@ -1982,6 +1942,10 @@ impl Resolver {
         let admin: Address = Self::instance_get(env, DataKey::Admin)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     fn load<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
@@ -2107,12 +2071,12 @@ impl Resolver {
                 Verdict::Invalid => AttestedOutcome::Invalid,
             };
         match verdict {
-            Verdict::Yes => core.resolve(&market_id, &Outcome::Yes),
-            Verdict::No => core.resolve(&market_id, &Outcome::No),
-            Verdict::Invalid => core.void_market(&market_id),
+            Verdict::Yes => core_call(core.try_resolve(&market_id, &market_core::Outcome::Yes))?,
+            Verdict::No => core_call(core.try_resolve(&market_id, &market_core::Outcome::No))?,
+            Verdict::Invalid => core_call(core.try_void_market(&market_id))?,
         }
         dispute.payee = Some(if upheld {
-            core.get_config().treasury
+            core_call(core.try_get_config())?.treasury
         } else {
             dispute.disputer.clone()
         });
@@ -2498,8 +2462,11 @@ impl Resolver {
         outcome: &Outcome,
         data: &PriceData,
         from_snapshot: bool,
-    ) {
-        MarketCoreClient::new(env, market_core).resolve(&market_id, outcome);
+    ) -> Result<(), Error> {
+        core_call(
+            MarketCoreClient::new(env, market_core)
+                .try_resolve(&market_id, &to_core_outcome(outcome)),
+        )?;
         Self::set_state(env, market_id, ResolutionState::Finalized);
         PriceResolution {
             market_id,
@@ -2516,6 +2483,7 @@ impl Resolver {
             from_snapshot,
         }
         .publish(env);
+        Ok(())
     }
 
     /// Scalar counterpart of `try_price_outcome`: same feed read and
@@ -2783,7 +2751,9 @@ impl Resolver {
             .unwrap_or(EvidencePolicy::Disabled);
 
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
+        )?;
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
@@ -2801,8 +2771,14 @@ impl Resolver {
             if storage.has(&DataKey::EvidenceUsed(trace_id)) {
                 return Err(Error::EvidenceAlreadyUsed);
             }
-            let Ok(Ok(trace)) = RegistryClient::new(env, &registry).try_get_trace(&trace_id) else {
-                return Err(Error::EvidenceNotFound);
+            let trace = match registry_call(
+                RegistryClient::new(env, &registry).try_get_trace(&trace_id),
+            ) {
+                Ok(trace) => trace,
+                // A missing trace (or a registry that cannot be read) is the
+                // same caller-facing condition: the cited evidence is not
+                // available. The registry's own numeric code is never leaked.
+                Err(_) => return Err(Error::EvidenceNotFound),
             };
             if trace.agent != signer {
                 return Err(Error::EvidenceAuthorMismatch);
@@ -2889,7 +2865,11 @@ impl Resolver {
         market_id: u64,
         commitment: &BytesN<32>,
     ) -> Result<(), Error> {
-        if *commitment != Self::market_resolution_hash(env, market_id)? {
+        let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
+        let market = core_call(
+            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
+        )?;
+        if *commitment != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
         Ok(())
@@ -2907,6 +2887,82 @@ mod test {
         BytesN, IntoVal,
     };
     use std::format;
+
+    // ---- dual registration of market-core (coverage, issue #75) ---------------
+    //
+    // The wasm copy is what ships and what ADR 0002 requires the contract to be
+    // *built* against, but code running inside the wasm VM is invisible to
+    // `cargo llvm-cov`. A native `market-core` registration (a dev-dependency:
+    // the duplicate `__constructor` export that forbids this in the wasm build
+    // does not exist in a native test binary) runs the same scenarios as host
+    // code. `MARKET_CORE_IMPL=native cargo test` flips the whole suite;
+    // `both_modes!` pins individual scenarios to both.
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum McImpl {
+        Wasm,
+        Native,
+    }
+
+    std::thread_local! {
+        static MC_OVERRIDE: core::cell::Cell<Option<McImpl>> = const { core::cell::Cell::new(None) };
+    }
+
+    fn mc_impl() -> McImpl {
+        MC_OVERRIDE.with(|c| c.get()).unwrap_or_else(|| {
+            match std::env::var("MARKET_CORE_IMPL").as_deref() {
+                Ok("native") => McImpl::Native,
+                _ => McImpl::Wasm,
+            }
+        })
+    }
+
+    /// Runs `f` with market-core registered as `how`, restoring the previous
+    /// choice even if `f` panics.
+    fn with_market_core<R>(how: McImpl, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<McImpl>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MC_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(MC_OVERRIDE.with(|c| c.replace(Some(how))));
+        f()
+    }
+
+    /// `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
+    fn register_market_core(
+        env: &Env,
+        args: (Address, Address, Address, Address, u32, u32),
+    ) -> Address {
+        match mc_impl() {
+            McImpl::Wasm => env.register(market_core::WASM, args),
+            McImpl::Native => env.register(
+                ::market_core_native::MarketCore,
+                ::market_core_native::MarketCoreArgs::__constructor(
+                    &args.0, &args.1, &args.2, &args.3, &args.4, &args.5,
+                ),
+            ),
+        }
+    }
+
+    /// Re-runs existing scenario tests (`#[test]` functions are plain functions
+    /// too) once per market-core registration, as `<name>::wasm` and
+    /// `<name>::native`.
+    macro_rules! both_modes {
+        ($($name:ident),+ $(,)?) => {$(
+            mod $name {
+                #[test]
+                fn wasm() {
+                    super::with_market_core(super::McImpl::Wasm, super::$name);
+                }
+                #[test]
+                fn native() {
+                    super::with_market_core(super::McImpl::Native, super::$name);
+                }
+            }
+        )+};
+    }
 
     #[contract]
     struct MockReflector;
@@ -2976,8 +3032,8 @@ mod test {
         token.mint(&creator, &(1_000 * 10_000_000_i128));
 
         let spec = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
-        let market_core_id = env.register(
-            market_core::WASM,
+        let market_core_id = register_market_core(
+            &env,
             (
                 admin.clone(),
                 collateral.address(),
@@ -5652,6 +5708,468 @@ mod test {
             .is_err());
         assert_eq!(f.resolver.snapshot(&f.market_id), None);
     }
+    #[test]
+    fn two_step_admin_transfer() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        assert_eq!(f.resolver.admin(), f.admin);
+        assert_eq!(f.resolver.pending_admin(), None);
+
+        f.resolver.propose_admin(&new_admin);
+        assert_eq!(
+            f.resolver.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
+        );
+        f.resolver.accept_admin();
+        assert_eq!(f.resolver.admin(), new_admin);
+        assert_eq!(f.resolver.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_transfer_can_be_cancelled() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        f.resolver.cancel_admin_transfer();
+        assert_eq!(f.resolver.pending_admin(), None);
+        assert_eq!(
+            f.resolver.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+    }
+
+    #[test]
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
+        assert_eq!(
+            f.resolver.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
+        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(f
+            .resolver
+            .pending_admin()
+            .map(|p| p.expires_at < f.env.ledger().timestamp())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_accept_admin() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        // `accept_admin` must be called by the *proposed* admin; a bystander
+        // cannot usher it in.
+        let bystander = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &bystander,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+        assert_eq!(f.resolver.admin(), f.admin);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &f.signer_a,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &f.signer_a,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
+    }
+
+    // ---- model_trace_*: conformance replays of docs/formal/resolver.tla ----
+    //
+    // Each test replays a trace produced by TLC (see docs/formal/README.md
+    // for the config that yields it) against the real contracts. The fixture
+    // has 2 signers, threshold 2, dispute window 100, close_time 2_000.
+
+    fn market_status(f: &Fixture) -> MarketStatus {
+        f.market_core.get_market(&f.market_id).status
+    }
+
+    /// resolver.cfg happy path: RegisterSigners, Tick, Attest, Attest,
+    /// Tick x W, Finalize.
+    #[test]
+    fn model_trace_signers_happy_path_yes() {
+        let f = signer_fixture();
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        assert_eq!(market_status(&f), MarketStatus::Open);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+        // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::No),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+        assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+    }
+
+    /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
+    /// Price mode never enters `SignersPending`.
+    #[test]
+    fn model_trace_price_happy_path_yes() {
+        let f = price_fixture(2_500, 1_999);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::Unconfigured
+        );
+        f.env.ledger().set_timestamp(1_500);
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::MarketNotClosed))
+        );
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+        assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            f.resolver.try_resolve_price(&f.market_id),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+    }
+
+    /// resolver_cancel.cfg (NoStrandedQuorum): RegisterSigners, Tick,
+    /// Attest(s1,Yes), Attest(s2,Yes), Cancel. Both signers already backed
+    /// Yes, so the Yes quorum can never re-propose and `finalize_signers`
+    /// reports NoProposal although quorum exists. The cancelled proposal is
+    /// never finalized; the market stays open until a guardian void
+    /// (SignersStalled) or expiry.
+    #[test]
+    fn model_trace_cancel_strands_quorum_until_stalled_void() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        f.resolver
+            .cancel_proposal(&f.market_id, &GuardianReason::DisputeUpheld);
+        assert_eq!(stored_proposal(&f), None);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+
+        // Stranded: quorum for Yes, yet nothing can re-propose it.
+        f.env.ledger().set_timestamp(2_500);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::NoProposal))
+        );
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Yes),
+            Err(Ok(Error::AlreadyAttested))
+        );
+        assert_eq!(market_status(&f), MarketStatus::Open);
+
+        // The recourse is the guardian's SignersStalled void, after the grace.
+        assert_eq!(
+            f.resolver
+                .try_guardian_void_market(&f.market_id, &GuardianReason::SignersStalled),
+            Err(Ok(Error::GuardianNotAllowed))
+        );
+        f.env.ledger().set_timestamp(2_000 + SIGNER_GRACE_SECS);
+        f.resolver
+            .guardian_void_market(&f.market_id, &GuardianReason::SignersStalled);
+        assert_eq!(market_status(&f), MarketStatus::Void);
+        assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+    }
+
+    /// resolver_invalid.cfg (NoInvalidDisplacement), intended behaviour:
+    /// an Invalid quorum displaces a pending Yes proposal and restarts the
+    /// dispute window.
+    #[test]
+    fn model_trace_invalid_quorum_displaces_yes_and_restarts_window() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        assert_eq!(stored_proposal(&f).unwrap().outcome, AttestedOutcome::Yes);
+
+        f.env.ledger().set_timestamp(2_050);
+        attest_both(&f, AttestedOutcome::Invalid);
+        let p = stored_proposal(&f).unwrap();
+        assert_eq!(
+            (p.outcome, p.proposed_at),
+            (AttestedOutcome::Invalid, 2_050)
+        );
+
+        // The Yes window would have closed at 2_100; the restarted one has not.
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.try_finalize_signers(&f.market_id),
+            Err(Ok(Error::DisputeWindowOpen))
+        );
+        f.env.ledger().set_timestamp(2_150);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Invalid
+        );
+        assert_eq!(market_status(&f), MarketStatus::Void);
+    }
+
+    /// resolver_both_outcomes.cfg (ProposalTimestampStable) refutes the
+    /// suspected griefing: signers attesting the other outcome after a
+    /// proposal exists neither move it nor reset `proposed_at`.
+    #[test]
+    fn model_trace_other_outcome_quorum_does_not_reset_window() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        f.env.ledger().set_timestamp(2_050);
+        attest_both(&f, AttestedOutcome::No);
+        let p = stored_proposal(&f).unwrap();
+        assert_eq!((p.outcome, p.proposed_at), (AttestedOutcome::Yes, 2_000));
+        f.env.ledger().set_timestamp(2_100);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::Yes
+        );
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+    }
+
+    /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
+    /// close_time for any reason, and no attestation can exist yet.
+    #[test]
+    fn model_trace_no_void_or_attestation_before_close() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(1_500);
+        for reason in [
+            GuardianReason::UnrevealedSpec,
+            GuardianReason::OracleUnavailable,
+            GuardianReason::SignersStalled,
+            GuardianReason::DisputeUpheld,
+        ] {
+            assert_eq!(
+                f.resolver.try_guardian_void_market(&f.market_id, &reason),
+                Err(Ok(Error::GuardianNotAllowed))
+            );
+        }
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::Invalid),
+            Err(Ok(Error::MarketNotClosed))
+        );
+        assert_eq!(market_status(&f), MarketStatus::Open);
+    }
+
+    /// resolver.cfg: a guardian void is terminal for the resolver. Later
+    /// attestations fail on `AlreadyFinalized`, and `finalize_signers` on a
+    /// proposal that predates the void fails inside market-core.
+    #[test]
+    fn model_trace_guardian_void_blocks_later_attest_and_finalize() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        f.resolver
+            .guardian_void_market(&f.market_id, &GuardianReason::DisputeUpheld);
+        assert_eq!(market_status(&f), MarketStatus::Void);
+        assert_eq!(
+            f.resolver
+                .try_attest(&f.market_id, &f.signer_a, &AttestedOutcome::No),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+        f.env.ledger().set_timestamp(2_100);
+        assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
+        assert_eq!(market_status(&f), MarketStatus::Void);
+    }
+
+    /// resolver.cfg (Expire): expiry refuses while a quorum-backed proposal
+    /// exists and voids once it is cancelled.
+    #[test]
+    fn model_trace_expire_blocked_by_valid_proposal() {
+        let f = signer_fixture();
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::Yes);
+        f.env.ledger().set_timestamp(DEADLINE);
+        assert_eq!(
+            f.resolver.try_expire_market(&f.market_id),
+            Err(Ok(Error::ResolutionAvailable))
+        );
+        assert_eq!(market_status(&f), MarketStatus::Open);
+    }
+
+    /// Stand-in for "some other resolver": all market-core's wiring
+    /// handshake needs from the peer is `market_core()`.
+    #[contract]
+    struct WiringPeer;
+
+    #[contractimpl]
+    impl WiringPeer {
+        pub fn __constructor(env: Env, core: Address) {
+            env.storage().instance().set(&0u32, &core);
+        }
+
+        pub fn market_core(env: Env) -> Address {
+            env.storage().instance().get(&0u32).unwrap()
+        }
+    }
+
+    /// resolver_bypass.cfg (ResolvedOutcomeHadThreshold fails by design):
+    /// the market-core admin hands the resolver role to another contract,
+    /// which resolves without this resolver's signers ever reaching quorum.
+    /// A documented trust assumption (ADR 0001, 0006, 0007), not a contract
+    /// bug in the resolver.
+    #[test]
+    fn model_trace_admin_bypass_resolves_without_threshold() {
+        let f = signer_fixture();
+        let peer = f.env.register(WiringPeer, (f.market_core.address.clone(),));
+        f.market_core.propose_resolver(&peer);
+        f.market_core.accept_resolver();
+
+        f.env.ledger().set_timestamp(2_000);
+        f.market_core.resolve(&f.market_id, &Outcome::No);
+
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        // This resolver saw none of it: no votes, still "pending", and it
+        // can no longer move the market (market-core rejects it as resolver).
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+        f.env.as_contract(&f.resolver_id, || {
+            assert_eq!(
+                Resolver::attestation_count(&f.env, f.market_id, AttestedOutcome::No),
+                0
+            );
+        });
+        attest_both(&f, AttestedOutcome::Yes);
+        f.env.ledger().set_timestamp(2_100);
+        assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
+        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+    }
+
+    /// Everything observable about market-core through a resolver scenario,
+    /// as text: trading maths, final status, payouts, balances.
+    fn market_core_trace() -> std::vec::Vec<std::string::String> {
+        use std::format;
+        let f = signer_fixture();
+        let id = f.market_id;
+        let creator = f.market_core.get_market(&id).creator;
+        let one = 10_000_000_i128;
+        let mut t = std::vec::Vec::new();
+        t.push(format!(
+            "price {}",
+            f.market_core.get_price(&id, &Outcome::Yes)
+        ));
+        t.push(format!(
+            "quote {}",
+            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+        ));
+        t.push(format!(
+            "buy {}",
+            f.market_core
+                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+        ));
+        t.push(format!(
+            "price {}",
+            f.market_core.get_price(&id, &Outcome::Yes)
+        ));
+        t.push(format!(
+            "sell {}",
+            f.market_core
+                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+        ));
+        t.push(format!(
+            "pos {:?}",
+            f.market_core.get_position(&id, &creator)
+        ));
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::No);
+        t.push(format!("early {:?}", f.resolver.try_finalize_signers(&id)));
+        f.env.ledger().set_timestamp(2_100);
+        t.push(format!("finalize {:?}", f.resolver.finalize_signers(&id)));
+        t.push(format!("status {:?}", f.market_core.get_market(&id).status));
+        t.push(format!("again {:?}", f.resolver.try_finalize_signers(&id)));
+        t.push(format!("redeem {}", f.market_core.redeem(&creator, &id)));
+        t.push(format!("claim {}", f.market_core.claim_pool_remainder(&id)));
+        t.push(format!("sweep {}", f.market_core.sweep_fees(&id)));
+        t
+    }
+
+    /// The native registration (which coverage can see) must be a faithful
+    /// stand-in for the wasm that ships, and for the vendored copy drifting
+    /// from the source: identical observable behaviour, step by step.
+    #[test]
+    fn native_and_wasm_market_core_agree() {
+        let wasm = with_market_core(McImpl::Wasm, market_core_trace);
+        let native = with_market_core(McImpl::Native, market_core_trace);
+        assert_eq!(wasm, native);
+        assert!(wasm.len() > 10, "{wasm:?}");
+    }
+
+    both_modes!(
+        price_mode_resolves_from_historical_reflector_price,
+        signer_mode_requires_threshold_and_waits_for_dispute_window,
+        invalid_attestations_void_market_after_dispute_window,
+        guardian_cancel_of_invalid_proposal_then_yes_finalizes,
+        expire_voids_signer_market_once_proposal_is_cancelled,
+        attest_rejected_after_expiry,
+        guardian_void_rejected_after_expiry,
+        cancel_proposal_blocked_while_disputed,
+        guardian_void_while_disputed_refunds_bond,
+        model_trace_signers_happy_path_yes,
+        model_trace_price_happy_path_yes,
+        model_trace_cancel_strands_quorum_until_stalled_void,
+        model_trace_invalid_quorum_displaces_yes_and_restarts_window,
+        model_trace_other_outcome_quorum_does_not_reset_window,
+        model_trace_no_void_or_attestation_before_close,
+        model_trace_guardian_void_blocks_later_attest_and_finalize,
+        model_trace_expire_blocked_by_valid_proposal,
+        model_trace_admin_bypass_resolves_without_threshold,
+    );
 }
 
 #[cfg(test)]
@@ -5659,6 +6177,51 @@ fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
     let mut out = std::vec![0u8; bytes.len() as usize];
     bytes.copy_into_slice(&mut out);
     out
+}
+
+/// Proves the shared `oracledesk-types` definitions encode byte-for-byte the
+/// same as the types `contractimport!` generates from the vendored
+/// `market_core.wasm` spec. If a field or variant is ever renamed on one side
+/// only, this fails instead of silently changing the cross-contract ABI.
+#[cfg(test)]
+mod shared_types {
+    use super::*;
+    use soroban_sdk::xdr::ToXdr;
+
+    #[test]
+    fn shared_types_are_byte_identical_to_imported_wasm_types() {
+        let env = Env::default();
+        for (shared, imported) in [
+            (Outcome::Yes, market_core::Outcome::Yes),
+            (Outcome::No, market_core::Outcome::No),
+        ] {
+            assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
+        }
+        for (shared, imported) in [
+            (oracledesk_types::Category::Crypto, market_core::Category::Crypto),
+            (oracledesk_types::Category::Macro, market_core::Category::Macro),
+            (
+                oracledesk_types::Category::Geopolitics,
+                market_core::Category::Geopolitics,
+            ),
+            (oracledesk_types::Category::Sports, market_core::Category::Sports),
+            (
+                oracledesk_types::Category::Culture,
+                market_core::Category::Culture,
+            ),
+            (oracledesk_types::Category::Other, market_core::Category::Other),
+        ] {
+            assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
+        }
+        assert_eq!(
+            oracledesk_types::MarketStatus::Resolved(Outcome::Yes).to_xdr(&env),
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes).to_xdr(&env)
+        );
+        assert_eq!(
+            oracledesk_types::MarketStatus::Void.to_xdr(&env),
+            market_core::MarketStatus::Void.to_xdr(&env)
+        );
+    }
 }
 
 /// Pins the exact bytes behind every legacy `resolution_hash`. A change to
@@ -5816,6 +6379,22 @@ mod golden {
             hex_of(&env, &cat_signers(&env, &[G1], 2, 1, 5)),
             hex_of(&env, &signers(&env, &[G1], 1, 5)),
         );
+    }
+
+    /// `Vec` order is part of the XDR, so the same signer set in another
+    /// order is a different commitment. Off-chain tooling (the market-maker's
+    /// `agents/core/spec.ts`, `scripts/seed-market.sh`) must hash and reveal
+    /// one canonical order: lexicographic strkey.
+    #[test]
+    fn signer_spec_hash_depends_on_signer_order() {
+        let env = Env::default();
+        let declared = hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600));
+        let canonical = hex_of(&env, &signers(&env, &[G3, G1, G2], 2, 3_600));
+        assert_eq!(
+            declared,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
+        assert_ne!(declared, canonical);
     }
 
     #[test]

@@ -68,7 +68,7 @@ test("live mode reads the market and its effective fee from the chain", async ()
       method: "agent_buy_v2",
       args,
     }),
-    getMarket: async (args: { market_id: bigint }) => {
+    getMarketView: async (args: { market_id: bigint }) => {
       reads.push(["get_market", args.market_id]);
       return {
         close_time: 2_000_000n,

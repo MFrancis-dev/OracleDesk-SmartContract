@@ -1,0 +1,63 @@
+[workspace]
+
+[package]
+name = "oracledesk-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "fpmm_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+market-core = { path = "../contracts/market-core" }
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+
+[[bin]]
+name = "fuzz_calc_buy"
+path = "fuzz_targets/fuzz_calc_buy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_calc_sell"
+path = "fuzz_targets/fuzz_calc_sell.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_seed_reserves"
+path = "fuzz_targets/fuzz_seed_reserves.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_mul_div"
+path = "fuzz_targets/fuzz_mul_div.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sell_inverse"
+path = "fuzz_targets/fuzz_sell_inverse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_market_core_sequence"
+path = "fuzz_targets/fuzz_market_core_sequence.rs"
+test = false
+doc = false
+
+# Helper that regenerates the committed seed corpus. Not a fuzz target.
+[[bin]]
+name = "gen_corpus"
+path = "gen_corpus.rs"
+test = false
+doc = false

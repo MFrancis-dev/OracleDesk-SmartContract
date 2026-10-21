@@ -5,6 +5,8 @@ extern crate std;
 
 mod math;
 mod math_categorical;
+#[cfg(kani)]
+mod math_proofs;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
@@ -29,46 +31,19 @@ const MIN_SEED: i128 = 100 * 10_000_000;
 /// Outcome-count cap for categorical markets (mirrors the math module).
 const MAX_N: usize = math_categorical::MAX_MARKET_OUTCOMES as usize;
 
+/// A proposed admin handover must be accepted (or cancelled) within this many
+/// seconds, so a proposal forgotten by the outgoing admin cannot be used to
+/// seize control months later. 7 days.
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
-// Generate TypeScript bindings straight from the compiled contract
-// (`stellar contract bindings typescript`) so enums like `Category` cannot
-// drift between the contract, the API and the UI.
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Outcome {
-    Yes,
-    No,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Category {
-    Crypto,
-    Macro,
-    Geopolitics,
-    Sports,
-    Culture,
-    Other,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MarketStatus {
-    /// Trading allowed until `close_time`, then waiting for the resolver.
-    Open,
-    /// Final. Winning shares redeem 1:1.
-    Resolved(Outcome),
-    /// Invalid market. Every share redeems at 0.5.
-    Void,
-    /// Scalar (range) market, final: LONG shares pay `payout_long_bps /
-    /// 10_000` and SHORT shares the complement. Appended last so stored
-    /// `Resolved`/`Void` values keep their encoding; readers compiled
-    /// against older bindings fail to decode this one (see the release note).
-    ResolvedScalar(u32),
-}
+// The canonical definitions live in `oracledesk-types` and are re-exported
+// here so every consumer (contracts, generated bindings, off-chain tooling)
+// sees one Rust type. `#[contracttype]` still exports them into this
+// contract's spec, so generated TypeScript bindings are unchanged.
+pub use oracledesk_types::{Category, MarketStatus, Outcome};
 
 /// Display metadata of a scalar market: the `[lower, upper]` range of the
 /// committed resolution spec, in the feed's raw units. Stored under
@@ -257,6 +232,14 @@ pub struct Config {
     pub paused: bool,
 }
 
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -265,9 +248,12 @@ pub struct Config {
 pub enum DataKey {
     // instance storage (one entry, shared TTL): global config
     Admin,
+    PendingAdmin,
     Collateral,
     Treasury,
     Resolver,
+    PendingResolver,
+    PendingTreasury,
     DefaultFeeBps,
     ProtocolFeeShareBps,
     DefaultBreaker,
@@ -334,8 +320,14 @@ pub enum Error {
     PriceImpactTooHigh = 21,
     /// Cumulative same-ledger movement would exceed `band_bps`.
     PriceBandExceeded = 22,
-    // 23..=27 reserved for an in-flight contributor PR (deadline/limit v2
-    // work on `develop`); new codes here start at 28.
+    NoPendingWiring = 23,
+    InvalidWiring = 24,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 25,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 26,
+    // 27 is reserved for an in-flight contributor PR (batch redemption);
+    // new codes here start at 28.
     /// `outcome_index` is not a valid outcome of this categorical market.
     InvalidOutcomeIndex = 28,
 }
@@ -508,6 +500,37 @@ pub struct TreasuryChanged {
 }
 
 #[contractevent]
+pub struct ResolverProposed {
+    pub resolver: Address,
+}
+#[contractevent]
+pub struct ResolverChanged {
+    pub old: Address,
+    pub new: Address,
+}
+#[contractevent]
+pub struct TreasuryProposed {
+    pub treasury: Address,
+}
+
+#[contractevent]
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
+}
+#[contractevent]
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
+}
+#[contractevent]
+pub struct AdminTransferCancelled {}
+
+#[soroban_sdk::contractclient(name = "WiringPeerClient")]
+pub trait WiringPeer {
+    fn market_core(env: Env) -> Address;
+}
+
+#[contractevent]
 pub struct ProtocolFeeShareChanged {
     pub old: u32,
     pub new: u32,
@@ -575,6 +598,50 @@ impl MarketCore {
 
     // ----- admin ----------------------------------------------------------
 
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        let old: Address = Self::instance_get(&env, &DataKey::Admin)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
+    }
+
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &paused);
@@ -607,19 +674,57 @@ impl MarketCore {
         Ok(())
     }
 
-    pub fn set_resolver(env: Env, resolver: Address) -> Result<(), Error> {
+    pub fn propose_resolver(env: Env, resolver: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Resolver, &resolver);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingResolver, &resolver);
+        ResolverProposed { resolver }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_resolver(env: Env) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingResolver)
+            .ok_or(Error::NoPendingWiring)?;
+        pending.require_auth();
+        if WiringPeerClient::new(&env, &pending).market_core() != env.current_contract_address() {
+            return Err(Error::InvalidWiring);
+        }
+        let old: Address = Self::instance_get(&env, &DataKey::Resolver)?;
+        env.storage().instance().set(&DataKey::Resolver, &pending);
+        env.storage().instance().remove(&DataKey::PendingResolver);
+        ResolverChanged { old, new: pending }.publish(&env);
         Ok(())
     }
 
     /// Affects markets created after the call and the legacy fallback in
     /// `sweep_fees`. Markets with a snapshotted `FeeTerms` keep paying their
     /// original recipient.
-    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), Error> {
+    pub fn propose_treasury(env: Env, treasury: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTreasury, &treasury);
+        TreasuryProposed { treasury }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_treasury(env: Env) -> Result<(), Error> {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTreasury)
+            .ok_or(Error::NoPendingWiring)?;
+        treasury.require_auth();
+        if WiringPeerClient::new(&env, &treasury).market_core() != env.current_contract_address() {
+            return Err(Error::InvalidWiring);
+        }
         let old: Address = Self::instance_get(&env, &DataKey::Treasury)?;
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().remove(&DataKey::PendingTreasury);
         TreasuryChanged { old, new: treasury }.publish(&env);
         Ok(())
     }
@@ -1834,6 +1939,15 @@ impl MarketCore {
         })
     }
 
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        Self::instance_get(&env, &DataKey::Admin)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
+    }
+
     pub fn market_count(env: Env) -> u64 {
         env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
@@ -2087,6 +2201,10 @@ impl MarketCore {
         let admin: Address = Self::instance_get(env, &DataKey::Admin)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     fn require_resolver(env: &Env) -> Result<(), Error> {
@@ -2517,6 +2635,32 @@ mod test {
         token::StellarAssetClient,
         IntoVal,
     };
+
+    /// Minimal contract used to exercise the resolver/treasury wiring
+    /// handshake: it reports a `market_core` address exactly like the real
+    /// resolver and treasury do.
+    #[contract]
+    pub struct MockWiringPeer;
+
+    #[contractimpl]
+    impl MockWiringPeer {
+        pub fn __constructor(env: Env, core: Address) {
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("core"), &core);
+        }
+
+        pub fn market_core(env: Env) -> Address {
+            env.storage()
+                .instance()
+                .get(&soroban_sdk::symbol_short!("core"))
+                .unwrap()
+        }
+    }
+
+    fn register_wiring_peer(env: &Env, client: &MarketCoreClient) -> Address {
+        env.register(MockWiringPeer, (client.address.clone(),))
+    }
 
     fn setup_market() -> (
         Env,
@@ -2955,8 +3099,9 @@ mod test {
 
         // Changing the contract-wide treasury must not redirect fees the
         // market already committed to the treasury of creation time.
-        let replacement = Address::generate(&env);
-        client.set_treasury(&replacement);
+        let replacement = register_wiring_peer(&env, &client);
+        client.propose_treasury(&replacement);
+        client.accept_treasury();
 
         let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
         let before = token.balance(&original_treasury);
@@ -3058,8 +3203,9 @@ mod test {
         // No terms: the whole fee stays on the protocol side.
         assert_eq!(lp_fees_stored(&env, &client, market_id), 0);
 
-        let replacement = Address::generate(&env);
-        client.set_treasury(&replacement);
+        let replacement = register_wiring_peer(&env, &client);
+        client.propose_treasury(&replacement);
+        client.accept_treasury();
         let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
         let before = token.balance(&replacement);
         assert_eq!(client.sweep_fees(&market_id), accrued);
@@ -3114,11 +3260,11 @@ mod test {
     }
 
     #[test]
-    fn set_treasury_and_split_change_emit_events() {
+    fn wiring_and_split_change_emit_events() {
         let (env, client, _, _, _, _) = setup_market();
         // `env.events().all()` reports the last invocation's events only, so
         // each setter must publish exactly one event in its own invocation.
-        client.set_treasury(&Address::generate(&env));
+        client.propose_treasury(&register_wiring_peer(&env, &client));
         assert_eq!(env.events().all().events().len(), 1);
         client.set_protocol_fee_share_bps(&2500u32);
         assert_eq!(env.events().all().events().len(), 1);
@@ -3127,6 +3273,74 @@ mod test {
             client.try_set_protocol_fee_share_bps(&10_001u32),
             Err(Ok(Error::InvalidFee))
         );
+    }
+
+    // ----- #61: resolver/treasury wiring handshake --------------------------
+
+    #[test]
+    fn resolver_wiring_handshake_updates_config() {
+        let (env, client, _, _, _, _) = setup_market();
+        let peer = register_wiring_peer(&env, &client);
+        client.propose_resolver(&peer);
+        client.accept_resolver();
+        assert_eq!(client.get_config().resolver, peer);
+    }
+
+    #[test]
+    fn treasury_wiring_handshake_updates_config() {
+        let (env, client, _, _, _, _) = setup_market();
+        let peer = register_wiring_peer(&env, &client);
+        client.propose_treasury(&peer);
+        client.accept_treasury();
+        assert_eq!(client.get_config().treasury, peer);
+    }
+
+    #[test]
+    fn accept_resolver_requires_a_pending_proposal() {
+        let (_env, client, _, _, _, _) = setup_market();
+        assert_eq!(
+            client.try_accept_resolver(),
+            Err(Ok(Error::NoPendingWiring))
+        );
+    }
+
+    #[test]
+    fn accept_resolver_rejects_peer_for_another_core() {
+        let (env, client, _, _, _, _) = setup_market();
+        // A contract that serves a *different* market-core must not be able
+        // to wire itself in.
+        let other_core = Address::generate(&env);
+        let peer = env.register(MockWiringPeer, (other_core,));
+        client.propose_resolver(&peer);
+        assert_eq!(client.try_accept_resolver(), Err(Ok(Error::InvalidWiring)));
+    }
+
+    #[test]
+    fn accept_treasury_rejects_peer_for_another_core() {
+        let (env, client, _, _, _, _) = setup_market();
+        let other_core = Address::generate(&env);
+        let peer = env.register(MockWiringPeer, (other_core,));
+        client.propose_treasury(&peer);
+        assert_eq!(client.try_accept_treasury(), Err(Ok(Error::InvalidWiring)));
+    }
+
+    #[test]
+    fn propose_resolver_requires_admin() {
+        let (env, client, _, trader, _, _) = setup_market();
+        let peer = register_wiring_peer(&env, &client);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "propose_resolver",
+                    args: (peer.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_resolver(&peer)
+            .is_err());
     }
 
     // ----- #10: price-impact and per-ledger price-band breakers -------------
@@ -3779,6 +3993,388 @@ mod test {
         client.transfer_lp(&market_id, &Address::generate(&env));
     }
 
+    // ----- #62: two-step admin transfer -------------------------------------
+
+    #[test]
+    fn two_step_admin_transfer() {
+        let (env, client, _, _, _, _) = setup_market();
+        let new_admin = Address::generate(&env);
+        assert_eq!(client.pending_admin(), None);
+
+        client.propose_admin(&new_admin);
+        assert_eq!(
+            client.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
+        );
+
+        client.accept_admin();
+        assert_eq!(client.admin(), new_admin);
+        assert_eq!(client.get_config().admin, new_admin);
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_transfer_can_be_cancelled() {
+        let (env, client, _, _, _, _) = setup_market();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        client.cancel_admin_transfer();
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(client.try_accept_admin(), Err(Ok(Error::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let (env, client, _, _, _, _) = setup_market();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
+        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(client
+            .pending_admin()
+            .map(|p| p.expires_at < env.ledger().timestamp())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_accept_admin() {
+        let (env, client, _, trader, _, _) = setup_market();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let (env, client, _, trader, _, _) = setup_market();
+        let new_admin = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_treasury_or_cancel_wiring() {
+        let (env, client, _, trader, _, _) = setup_market();
+        let peer = register_wiring_peer(&env, &client);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "propose_treasury",
+                    args: (peer.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_treasury(&peer)
+            .is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only custom account: a weighted ed25519 multisig. It exists to prove
+// that `require_admin` really works when the admin is a contract account (the
+// `__check_auth` path), not just an `Address::generate` account that
+// `mock_all_auths` approves unconditionally.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod multisig_account {
+    extern crate std;
+
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use soroban_sdk::{
+        auth::{Context, CustomAccountInterface},
+        crypto::Hash,
+        testutils::Address as _,
+        xdr::{
+            Hash as XdrHash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
+            InvokeContractArgs, Limits, ScAddress, ScVal, SorobanAddressCredentials,
+            SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            SorobanCredentials, StringM, VecM, WriteXdr,
+        },
+        Bytes, IntoVal, TryFromVal, Vec,
+    };
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum AccountError {
+        BelowThreshold = 1,
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct WeightedSig {
+        pub key: BytesN<32>,
+        pub signature: BytesN<64>,
+    }
+
+    #[contracttype]
+    enum AccountKey {
+        Signers,
+        Threshold,
+    }
+
+    #[contract]
+    pub struct MultisigAccount;
+
+    #[contractimpl]
+    impl MultisigAccount {
+        pub fn __constructor(env: Env, signers: Vec<(BytesN<32>, u32)>, threshold: u32) {
+            env.storage().instance().set(&AccountKey::Signers, &signers);
+            env.storage()
+                .instance()
+                .set(&AccountKey::Threshold, &threshold);
+        }
+    }
+
+    #[contractimpl]
+    impl CustomAccountInterface for MultisigAccount {
+        type Signature = Vec<WeightedSig>;
+        type Error = AccountError;
+
+        fn __check_auth(
+            env: Env,
+            signature_payload: Hash<32>,
+            signatures: Vec<WeightedSig>,
+            _auth_contexts: Vec<Context>,
+        ) -> Result<(), AccountError> {
+            let signers: Vec<(BytesN<32>, u32)> =
+                env.storage().instance().get(&AccountKey::Signers).unwrap();
+            let threshold: u32 = env
+                .storage()
+                .instance()
+                .get(&AccountKey::Threshold)
+                .unwrap();
+            let message = Bytes::from_array(&env, &signature_payload.to_array());
+            let mut weight = 0u32;
+            // Each configured signer contributes at most once, so replaying
+            // the same signature cannot reach the threshold on its own.
+            for (key, key_weight) in signers.iter() {
+                for sig in signatures.iter() {
+                    if sig.key == key {
+                        env.crypto().ed25519_verify(&key, &message, &sig.signature);
+                        weight += key_weight;
+                        break;
+                    }
+                }
+            }
+            if weight < threshold {
+                return Err(AccountError::BelowThreshold);
+            }
+            Ok(())
+        }
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn account_with(
+        env: &Env,
+        weights: &[(u8, u32)],
+        threshold: u32,
+    ) -> (Address, std::vec::Vec<SigningKey>) {
+        let mut keys = std::vec::Vec::new();
+        let mut signers = Vec::new(env);
+        for (seed, weight) in weights {
+            let sk = signing_key(*seed);
+            signers.push_back((
+                BytesN::from_array(env, &sk.verifying_key().to_bytes()),
+                *weight,
+            ));
+            keys.push(sk);
+        }
+        let account = env.register(MultisigAccount, (signers, threshold));
+        (account, keys)
+    }
+
+    /// Builds the address-credential auth entry a wallet would produce for
+    /// `market_core.set_paused(true)`, signing the host's payload with the
+    /// supplied keys.
+    fn auth_entry(
+        env: &Env,
+        account: &Address,
+        core: &Address,
+        nonce: i64,
+        keys: &[SigningKey],
+    ) -> SorobanAuthorizationEntry {
+        let expiration = 1_000u32;
+        let invocation = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::from(core.clone()),
+                function_name: StringM::try_from("set_paused").unwrap().into(),
+                args: std::vec![ScVal::Bool(true)].try_into().unwrap(),
+            }),
+            sub_invocations: VecM::default(),
+        };
+        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: XdrHash(env.ledger().network_id().to_array()),
+            invocation: invocation.clone(),
+            nonce,
+            signature_expiration_ledger: expiration,
+        });
+        let payload = env
+            .crypto()
+            .sha256(&Bytes::from_slice(
+                env,
+                &preimage.to_xdr(Limits::none()).unwrap(),
+            ))
+            .to_array();
+
+        let mut signatures = Vec::new(env);
+        for sk in keys {
+            signatures.push_back(WeightedSig {
+                key: BytesN::from_array(env, &sk.verifying_key().to_bytes()),
+                signature: BytesN::from_array(env, &sk.sign(&payload).to_bytes()),
+            });
+        }
+        let signature_val: soroban_sdk::Val = signatures.into_val(env);
+        let signature = ScVal::try_from_val(env, &signature_val).unwrap();
+
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::from(account.clone()),
+                nonce,
+                signature_expiration_ledger: expiration,
+                signature,
+            }),
+            root_invocation: invocation,
+        }
+    }
+
+    fn core_with_admin(
+        env: &Env,
+        admin: &Address,
+    ) -> (MarketCoreClient<'static>, Address, Address) {
+        let collateral = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let treasury = Address::generate(env);
+        let resolver = Address::generate(env);
+        let core = env.register(
+            MarketCore,
+            MarketCoreArgs::__constructor(
+                admin,
+                &collateral.address(),
+                &treasury,
+                &resolver,
+                &100u32,
+                &10_000u32,
+            ),
+        );
+        let client = MarketCoreClient::new(env, &core);
+        (client, core, collateral.address())
+    }
+
+    #[test]
+    fn require_admin_accepts_weighted_multisig() {
+        let env = Env::default();
+        // Weight 1 + weight 2, threshold 2: the weight-2 key alone suffices.
+        let (account, keys) = account_with(&env, &[(1, 1), (2, 2)], 2);
+        let (client, core, _) = core_with_admin(&env, &account);
+
+        // Only the weight-1 key: below threshold, rejected through the real
+        // __check_auth path (no mock_all_auths, no mocked auth entries).
+        env.set_auths(&[auth_entry(
+            &env,
+            &account,
+            &core,
+            1,
+            &[keys.first().unwrap().clone()],
+        )]);
+        assert!(client.try_set_paused(&true).is_err());
+
+        // The weight-2 key alone reaches threshold.
+        env.set_auths(&[auth_entry(
+            &env,
+            &account,
+            &core,
+            2,
+            &[keys.get(1).unwrap().clone()],
+        )]);
+        client.set_paused(&true);
+        assert!(client.get_config().paused);
+    }
+
+    #[test]
+    fn require_admin_accepts_both_multisig_keys() {
+        let env = Env::default();
+        let (account, keys) = account_with(&env, &[(3, 1), (4, 1)], 2);
+        let (client, core, _) = core_with_admin(&env, &account);
+
+        env.set_auths(&[auth_entry(
+            &env,
+            &account,
+            &core,
+            7,
+            &[keys.first().unwrap().clone(), keys.get(1).unwrap().clone()],
+        )]);
+        client.set_paused(&true);
+        assert!(client.get_config().paused);
+    }
+
+    #[test]
+    fn require_admin_rejects_bad_multisig_signature() {
+        let env = Env::default();
+        let (account, keys) = account_with(&env, &[(5, 2)], 2);
+        let (client, core, _) = core_with_admin(&env, &account);
+
+        let mut entry = auth_entry(&env, &account, &core, 9, &[keys.first().unwrap().clone()]);
+        // Corrupt the signature bytes: the ed25519 check inside __check_auth
+        // must reject it.
+        let bad_sig = WeightedSig {
+            key: BytesN::from_array(&env, &keys.first().unwrap().verifying_key().to_bytes()),
+            signature: BytesN::from_array(&env, &[0u8; 64]),
+        };
+        let bad = Vec::from_array(&env, [bad_sig]);
+        if let SorobanCredentials::Address(creds) = &mut entry.credentials {
+            let bad_val: soroban_sdk::Val = bad.into_val(&env);
+            creds.signature = ScVal::try_from_val(&env, &bad_val).unwrap();
+        }
+        env.set_auths(&[entry]);
+        assert!(client.try_set_paused(&true).is_err());
+    }
     // ----- #6: categorical (N-outcome) markets -----------------------------
 
     /// One 100 USDC categorical market opening at `probs` (bps per outcome).

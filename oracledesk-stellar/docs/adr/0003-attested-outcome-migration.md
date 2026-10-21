@@ -47,11 +47,14 @@ the `AttestationEvidence.outcome` struct field and the `Attested` /
 `FallbackSuperseded` event fields. Old `Yes`/`No` values decode unchanged,
 and only `Invalid` is new to consumers.
 
-### Option A (recommended): fresh deployment, sequenced `set_resolver`
+### Option A (recommended): fresh deployment, sequenced resolver handover
 
 The resolver has no upgrade entrypoint, so in practice the new code is a new
-contract. market-core's `set_resolver` is **global**: every market resolves
+contract. market-core's resolver is **global**: every market resolves
 through whichever resolver it currently names. This makes sequencing matter:
+
+*(The `set_resolver` call in step 4 was replaced by `propose_resolver` +
+`accept_resolver` in ADR 0006; the sequencing below is unchanged.)*
 
 1. Deploy the new resolver (`__constructor(admin, market_core)`).
 2. Stop revealing specs on the old resolver. New markets keep being created
@@ -63,7 +66,8 @@ through whichever resolver it currently names. This makes sequencing matter:
    on the new resolver once it is active; the commitment check makes that
    permissionless and safe). Claim any settled dispute bonds
    (`claim_dispute_bond`). Bonds escrowed by the old contract stay there.
-4. Call market-core `set_resolver(new_resolver)`. From then on the old
+4. Call market-core `propose_resolver(new_resolver)` (then the new resolver's
+   `accept_resolver`). From then on the old
    resolver's `resolve`/`void_market` calls fail market-core's
    `require_resolver` auth check (it requires the *new* resolver's auth), so
    any market still in flight there is stuck until it is handed over. That is why step 3 comes first.

@@ -1,0 +1,79 @@
+name: Local E2E
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "oracledesk-stellar/**"
+      - ".github/workflows/e2e.yml"
+  pull_request:
+    paths:
+      - "oracledesk-stellar/**"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local:
+    name: quickstart end-to-end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: oracledesk-stellar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oracledesk-stellar
+
+      - uses: stellar/stellar-cli@v27.1.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            oracledesk-stellar/package-lock.json
+            oracledesk-stellar/agents/package-lock.json
+            oracledesk-stellar/x402/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Build contracts and bindings
+        run: |
+          make setup
+          make build
+
+      - name: Run hermetic E2E harness
+        env:
+          # Pin the quickstart image in CI. `testing` tracks the current
+          # protocol; record the digest from the job log when bumping it.
+          QUICKSTART_IMAGE: stellar/quickstart:testing
+        run: ./scripts/e2e-local.sh
+
+      - name: Upload deployment + trace artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-e2e-artifacts
+          path: |
+            oracledesk-stellar/deployments/local.json
+            oracledesk-stellar/deployments/traces-local/
+          if-no-files-found: ignore

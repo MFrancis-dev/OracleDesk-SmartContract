@@ -64,7 +64,7 @@ Design decisions with real trade-offs are written up in `docs/adr/`:
 - Rust (stable) with the `wasm32v1-none` target — `rust-toolchain.toml`
   pins this for you if you use `rustup`.
 - The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+.
-- Node.js 20+ and npm.
+- Node.js 22+ and npm.
 - Python 3.10+ (for `model/fpmm_model.py`'s property tests).
 - `jq` (used by the deploy/seed scripts).
 
@@ -80,12 +80,35 @@ make deploy-testnet   # idempotent: generates/funds testnet identities,
                       # wires them together, writes deployments/testnet.json
 make demo            # create -> trade -> resolve -> record trace -> verify hash,
                       # entirely on testnet, with real transaction output
+make e2e-local       # hermetic quickstart run: deploy, both resolution modes,
+                      # live trader, x402 trace fetch (Docker required)
+make model-test      # Python stateful model selftest + proptest-vs-wasm harness
 ```
 
 `make deploy-testnet` and `make demo` submit real Stellar testnet
 transactions using two throwaway identities (`oracledesk-deployer`,
 `oracledesk-agent`) that `scripts/deploy-testnet.sh` generates and funds via
 `stellar keys generate --fund`. Nothing here ever touches mainnet.
+
+### Local end-to-end harness
+
+`NETWORK=local` is a first-class target for the deploy, seed and demo scripts.
+`scripts/e2e-local.sh` starts the Stellar quickstart container, registers the
+`local` network, deploys the contracts plus the local-only
+`contracts/test-oracle`, and then verifies:
+
+1. signer-mode resolution through the resolver;
+2. price-mode resolution through the deployed test oracle;
+3. a live TypeScript trader opening a position through the treasury;
+4. an x402 registry lookup whose trace hash is verified on-chain.
+
+It is hermetic and never talks to testnet or mainnet. Deployment records are
+kept per network (`deployments/testnet.json`, `deployments/local.json`), so a
+local run cannot clobber testnet addresses. The local agent environment can be
+selected with `DEPLOYMENTS_PATH=deployments/local.json`.
+
+The fake oracle is deliberately absent from the testnet deploy path; do not
+pass it to a production deployment.
 
 ## Treasury migration
 
@@ -106,22 +129,25 @@ it as the old treasury's successor (`set_successor`, admin), then calls
 admin-gated — the agent cannot invoke them — and the destination is fixed
 to the recorded successor, so migration cannot send value anywhere else.
 Re-running is safe. It deliberately does **not** rewire market-core
-(`set_treasury`); that cutover changes the fee recipient for future markets
-and stays a separate operator step (the script prints the exact command).
+(`propose_treasury` + the treasury's `accept_market_core_role`); that cutover
+changes the fee recipient for future markets
+and stays a separate operator step (the script prints the exact commands).
 See `docs/architecture.md` for the full auth model.
 
 ## Repository layout
 
 ```
-contracts/            market-core, resolver, treasury, reasoning-registry
+contracts/            market-core, resolver, treasury, reasoning-registry,
+                      test-oracle (local E2E only), integration-tests
 model/fpmm_model.py   Python mirror of the FPMM math, property-tested
+model/system_model.py stateful four-contract model, replayed against wasm
 x402/                 the paid trace API (Express + @x402/*)
 agents/               core/ (chain-agnostic strategy + trace building),
                       stellar/ (signing/submission adapter), bin/ (CLIs)
 packages/bindings/    generated TypeScript contract clients
-scripts/              deploy-testnet.sh, migrate-treasury.sh,
-                      seed-market.sh, demo.sh, gen-bindings.sh,
-                      spec-hash/ (a small dev-tool crate)
+scripts/              deploy-testnet.sh (NETWORK=testnet|local),
+                      migrate-treasury.sh, seed-market.sh, demo.sh,
+                      e2e-local.sh, gen-bindings.sh, spec-hash/
 deployments/          testnet.json — the current live testnet addresses
 docs/                 architecture, ADRs, frontend-integration, STATUS
 ```

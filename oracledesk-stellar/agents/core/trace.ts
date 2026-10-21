@@ -9,14 +9,88 @@
  * way regardless of how it was constructed or serialized upstream.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 export type AgentRole = "market-maker" | "trader";
+
+export const NO_MARKET = 18446744073709551615n; // u64::MAX (#55)
+
+export type TraceActionType =
+  | { tag: "CreateMarket"; values?: void }
+  | { tag: "ProposeMarket"; values?: void }
+  | { tag: "Buy"; values?: void }
+  | { tag: "Sell"; values?: void }
+  | { tag: "Skip"; values?: void }
+  | { tag: "Redeem"; values?: void }
+  | { tag: "ClaimRemainder"; values?: void }
+  | { tag: "Resolve"; values?: void }
+  | { tag: "Other"; values: readonly [string] };
+
+export type TraceActionString =
+  | "create_market"
+  | "propose_market"
+  | "buy"
+  | "sell"
+  | "skip"
+  | "redeem"
+  | "claim_remainder"
+  | "resolve"
+  | `other:${string}`
+  | (string & {});
+
+export function toTraceAction(action: string): TraceActionType {
+  switch (action) {
+    case "create_market":
+      return { tag: "CreateMarket" };
+    case "propose_market":
+      return { tag: "ProposeMarket" };
+    case "buy":
+      return { tag: "Buy" };
+    case "sell":
+      return { tag: "Sell" };
+    case "skip":
+      return { tag: "Skip" };
+    case "redeem":
+      return { tag: "Redeem" };
+    case "claim_remainder":
+      return { tag: "ClaimRemainder" };
+    case "resolve":
+      return { tag: "Resolve" };
+    default:
+      if (action.startsWith("other:")) {
+        return { tag: "Other", values: [action.slice(6)] };
+      }
+      return { tag: "Other", values: [action] };
+  }
+}
+
+export function fromTraceAction(action: TraceActionType): TraceActionString {
+  switch (action.tag) {
+    case "CreateMarket":
+      return "create_market";
+    case "ProposeMarket":
+      return "propose_market";
+    case "Buy":
+      return "buy";
+    case "Sell":
+      return "sell";
+    case "Skip":
+      return "skip";
+    case "Redeem":
+      return "redeem";
+    case "ClaimRemainder":
+      return "claim_remainder";
+    case "Resolve":
+      return "resolve";
+    case "Other":
+      return `other:${action.values[0]}` as TraceActionString;
+  }
+}
 
 export interface ReasoningTrace {
   agent: AgentRole;
   marketId: number | null; // null for a not-yet-created market (agent proposals)
-  action: string;
+  action: TraceActionString;
   reasoning: string;
   /** Whatever signals/estimates informed the decision — kept as plain
    * JSON-serializable data so it survives the canonicalization below. */
@@ -89,4 +163,43 @@ export class LocalTraceStore implements TraceStore {
     // production TraceStore (pinning to IPFS) returns a real CID here.
     return { cid: `local://${path}` };
   }
+}
+
+// ─── Commit-reveal (#51) ─────────────────────────────────────────────────────
+
+/**
+ * Domain tag for trace commitments. Must match `COMMIT_DOMAIN_TAG` in
+ * contracts/reasoning-registry/src/lib.rs byte-for-byte; the shared golden
+ * vector in trace.test.ts and the Rust tests keeps the two from drifting.
+ */
+export const COMMIT_DOMAIN_TAG = "oracledesk.trace.commit.v1";
+
+function hex32(value: string, name: string): Buffer {
+  const normalized = value.toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error(`${name} must be 32 bytes of hex`);
+  }
+  return Buffer.from(normalized, "hex");
+}
+
+/**
+ * Commitment the agent records before acting:
+ * `sha256(COMMIT_DOMAIN_TAG || trace_hash || salt)`, as lowercase hex. It
+ * fixes the trace content without revealing it until `reveal_trace`.
+ */
+export function commitmentFor(hashHex: string, saltHex: string): string {
+  return createHash("sha256")
+    .update(Buffer.from(COMMIT_DOMAIN_TAG, "utf8"))
+    .update(hex32(hashHex, "trace hash"))
+    .update(hex32(saltHex, "salt"))
+    .digest("hex");
+}
+
+/**
+ * A fresh 32-byte random salt (hex). It must be random and full-length: a
+ * short or predictable salt lets anyone brute-force the trace hash from
+ * known trace templates. Keep it — losing it makes the reveal impossible.
+ */
+export function newSalt(): string {
+  return randomBytes(32).toString("hex");
 }

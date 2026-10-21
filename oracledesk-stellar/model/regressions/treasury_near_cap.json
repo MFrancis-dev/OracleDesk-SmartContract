@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "steps": [
+    {
+      "op": "create",
+      "time": 1000,
+      "close_time": 2000,
+      "yes_bps": 501
+    },
+    {
+      "op": "treasury_buy",
+      "time": 1000,
+      "outcome": "no",
+      "amount": 10000000
+    }
+  ],
+  "snapshots": [
+    {
+      "balances": {
+        "core": 3000000000,
+        "creator": 7000000000,
+        "trader": 10000000000,
+        "treasury": 10000000000
+      },
+      "market": {
+        "fees_accrued": 0,
+        "lp_claimed": false,
+        "reserve_no": 52742393,
+        "reserve_yes": 1000000000,
+        "sets_minted": 1000000000,
+        "status": "open"
+      },
+      "market_trace_count": 0,
+      "positions": {
+        "creator": {
+          "no": 947257607,
+          "yes": 0
+        },
+        "trader": {
+          "no": 0,
+          "yes": 0
+        },
+        "treasury": {
+          "no": 0,
+          "yes": 0
+        }
+      },
+      "resolver_state": "SignersPending",
+      "trace_count": 0
+    },
+    {
+      "balances": {
+        "core": 3010000000,
+        "creator": 7000000000,
+        "trader": 10000000000,
+        "treasury": 9990000000
+      },
+      "market": {
+        "fees_accrued": 100000,
+        "lp_claimed": false,
+        "reserve_no": 52225362,
+        "reserve_yes": 1009900000,
+        "sets_minted": 1009900000,
+        "status": "open"
+      },
+      "market_trace_count": 0,
+      "positions": {
+        "creator": {
+          "no": 947257607,
+          "yes": 0
+        },
+        "trader": {
+          "no": 0,
+          "yes": 0
+        },
+        "treasury": {
+          "no": 10417031,
+          "yes": 0
+        }
+      },
+      "resolver_state": "SignersPending",
+      "trace_count": 0
+    }
+  ]
+}

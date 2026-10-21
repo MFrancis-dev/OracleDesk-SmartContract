@@ -1,0 +1,14 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Cross-contract and bounded-exhaustive tests; ships no contract."
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_shaking_v2"] }
+treasury = { path = "../treasury" }
+market-core = { path = "../market-core" }

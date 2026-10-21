@@ -22,6 +22,7 @@ import json
 import os
 from math import isqrt
 import random
+from pathlib import Path
 
 BPS = 10_000
 MAX_SETS = 1_000_000_000_000_000  # 1e15 = 100M USDC (7 dp)
@@ -123,6 +124,16 @@ def calc_sell(r_sold: int, r_other: int, collateral_out: int, fee_bps: int) -> S
     if shares_in <= 0:
         raise MathError("invalid input")
     return SellQuote(shares_in, fee, gross, new_sold, new_other)
+
+
+def split_fee(fee: int, protocol_share_bps: int) -> tuple[int, int]:
+    """Split a trade fee into (protocol, lp) portions. Mirrors
+    math.rs::split_fee: the protocol share is rounded up so the pool can
+    never be left with a negative LP side."""
+    if fee < 0 or protocol_share_bps > BPS:
+        raise MathError("invalid input")
+    protocol = mul_div_ceil(fee, protocol_share_bps, BPS)
+    return protocol, fee - protocol
 
 
 def settle_value(kind: str, yes: int, no: int) -> int:
@@ -439,6 +450,10 @@ def _check_known_values():
         900,
     ), q
 
+    assert split_fee(100, 0) == (0, 100)
+    assert split_fee(100, BPS) == (100, 0)
+    assert split_fee(101, 5_000) == (51, 50)
+
 
 def _check_seed_opens_at_requested_probability():
     for p in (100, 2500, 5000, 7300, 9900):
@@ -736,8 +751,47 @@ def _check_effective_fee_known_values():
         assert fee == row[8], (row, fee)
 
 
+def _check_shared_vectors():
+    """Replays the committed cross-language vectors.
+
+    The same file is asserted by math.rs::shared_vectors_match and
+    agents/core/fpmm.test.ts, so a porting mistake is caught even when the
+    differential harness (scripts/fpmm-diff/diff.py) is not running.
+    """
+    path = Path(__file__).resolve().parents[1] / "scripts/fpmm-diff/vectors.jsonl"
+    for line_no, line in enumerate(path.read_text().splitlines(), 1):
+        case = json.loads(line)
+        fn = case["fn"]
+        args = case["args"]
+        parsers = {
+            "calc_buy": lambda a: calc_buy(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
+            "calc_sell": lambda a: calc_sell(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
+            "seed_reserves": lambda a: seed_reserves(int(a[0]), int(a[1])),
+            "mul_div_floor": lambda a: {"value": mul_div_floor(int(a[0]), int(a[1]), int(a[2]))},
+            "mul_div_ceil": lambda a: {"value": mul_div_ceil(int(a[0]), int(a[1]), int(a[2]))},
+            "price_yes_bps": lambda a: {"value": price_yes_bps(int(a[0]), int(a[1]))},
+            "settle_value": lambda a: {"value": settle_value(a[0], int(a[1]), int(a[2]))},
+            "gross_for_shares": lambda a: {"gross": gross_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))},
+            "collateral_out_for_shares": lambda a: {
+                "collateral_out": collateral_out_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+            },
+        }
+        try:
+            out = parsers[fn](args)
+        except MathError as exc:
+            assert "err" in case, f"vector line {line_no}: unexpected error {exc}"
+            continue
+        if hasattr(out, "__dict__"):
+            out = dict(out.__dict__)
+        assert "ok" in case, f"vector line {line_no}: expected an error"
+        assert {k: str(v) for k, v in out.items()} == case["ok"], (
+            f"vector line {line_no} ({fn}) mismatch: {out} != {case['ok']}"
+        )
+
+
 def run_all():
     _check_known_values()
+    _check_shared_vectors()
     _check_seed_opens_at_requested_probability()
     _check_k_never_decreases_and_round_trip_never_profits()
     _check_gross_for_shares_inverts_calc_sell()

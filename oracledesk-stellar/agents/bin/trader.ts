@@ -41,7 +41,7 @@ async function fetchMarketAndFairValue(
 ): Promise<{ market: MarketState; fairValueBps: number }> {
   if (adapter.mode === "live") {
     const marketId = BigInt(env.MARKET_ID ?? "0");
-    const m = await adapter.getMarket({ market_id: marketId });
+    const m = await adapter.getMarketView({ market_id: marketId });
     const feeBps = await adapter.currentFeeBps({ market_id: marketId });
     return {
       market: {

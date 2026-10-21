@@ -1,0 +1,168 @@
+{
+  "meta": {
+    "soroban_sdk": "27.0.6",
+    "rustc": "1.99.1",
+    "stellar_cli": "stellar",
+    "wasm_bytes": {
+      "market_core.wasm": 41905,
+      "reasoning_registry.wasm": 14701,
+      "resolver.wasm": 67516,
+      "treasury.wasm": 86484
+    }
+  },
+  "tolerance": {
+    "cpu_insns": 0.02,
+    "mem_bytes": 0.02,
+    "read_entries": 0.0,
+    "write_entries": 0.0,
+    "read_bytes": 0.01,
+    "write_bytes": 0.01,
+    "events_bytes": 0.0
+  },
+  "scenarios": {
+    "market_core.buy.existing_position": {
+      "cpu_insns": 1236706,
+      "mem_bytes": 1295473,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
+    "market_core.buy.first_position": {
+      "cpu_insns": 1217159,
+      "mem_bytes": 1298148,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
+    "market_core.claim_pool_remainder": {
+      "cpu_insns": 1009545,
+      "mem_bytes": 1289402,
+      "read_entries": 9,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1180,
+      "events_bytes": 420
+    },
+    "market_core.create_market.min_uri": {
+      "cpu_insns": 1118488,
+      "mem_bytes": 1296448,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 92,
+      "write_bytes": 1928,
+      "events_bytes": 540
+    },
+    "market_core.create_market.uri_1k": {
+      "cpu_insns": 1118742,
+      "mem_bytes": 1297464,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 92,
+      "write_bytes": 2944,
+      "events_bytes": 540
+    },
+    "market_core.redeem.void": {
+      "cpu_insns": 924252,
+      "mem_bytes": 1279012,
+      "read_entries": 9,
+      "write_entries": 4,
+      "read_bytes": 0,
+      "write_bytes": 520,
+      "events_bytes": 404
+    },
+    "market_core.sell.full_position_removal": {
+      "cpu_insns": 1234911,
+      "mem_bytes": 1294888,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
+    "market_core.sell.partial": {
+      "cpu_insns": 1234911,
+      "mem_bytes": 1294888,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
+    "market_core.sweep_fees": {
+      "cpu_insns": 995266,
+      "mem_bytes": 1283578,
+      "read_entries": 8,
+      "write_entries": 3,
+      "read_bytes": 92,
+      "write_bytes": 1108,
+      "events_bytes": 564
+    },
+    "market_core.view.get_market": {
+      "cpu_insns": 601558,
+      "mem_bytes": 1243877,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "market_core.view.quote_buy": {
+      "cpu_insns": 587952,
+      "mem_bytes": 1242177,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "market_core.view.quote_sell": {
+      "cpu_insns": 590012,
+      "mem_bytes": 1242449,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "registry.publish_trace.action_1k": {
+      "cpu_insns": 792280,
+      "mem_bytes": 1246820,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 0,
+      "write_bytes": 2008,
+      "events_bytes": 1328
+    },
+    "registry.publish_trace.cid_1k": {
+      "cpu_insns": 792278,
+      "mem_bytes": 1246817,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 0,
+      "write_bytes": 2004,
+      "events_bytes": 1324
+    },
+    "registry.publish_trace.small": {
+      "cpu_insns": 792024,
+      "mem_bytes": 1245805,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 0,
+      "write_bytes": 992,
+      "events_bytes": 312
+    },
+    "registry.view.get_trace": {
+      "cpu_insns": 469343,
+      "mem_bytes": 1219862,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    }
+  }
+}

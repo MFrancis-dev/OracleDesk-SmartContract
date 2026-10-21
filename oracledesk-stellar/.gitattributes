@@ -1,0 +1,5 @@
+# Cross-contract wasm is vendored into resolver/treasury and hash-pinned
+# (issue #58). Mark it binary so line-ending normalisation can never change
+# its bytes and invalidate the `.wasm.sha256` pins on checkout.
+*.wasm binary
+*.wasm.sha256 text eol=lf

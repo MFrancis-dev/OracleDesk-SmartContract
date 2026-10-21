@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   BPS,
@@ -13,10 +14,13 @@ import {
   catSettleValue,
   collateralOutForShares,
   effectiveFeeBps,
+  grossForShares,
   MathError,
   MAX_MARKET_OUTCOMES,
   MAX_RAMP_SECS,
   MAX_SKEW_MULT_BPS,
+  mulDivCeil,
+  mulDivFloor,
   priceAfter,
   priceAfterBuy,
   priceAfterSell,
@@ -143,6 +147,71 @@ test("priceAfterBuy matches the reference example shared with math.rs and the Py
   // Selling right back must land below the pre-trade price (two fees).
   const s = calcSell(q.newReserveBought, q.newReserveOther, 100_000_000n, 100n);
   assert.ok(priceAfterSell(true, s) < 5000n);
+});
+
+test("committed cross-language vectors match", () => {
+  const vectorsPath = fileURLToPath(new URL("../../scripts/fpmm-diff/vectors.jsonl", import.meta.url));
+  const lines = readFileSync(vectorsPath, "utf8").trim().split("\n");
+  for (const [i, line] of lines.entries()) {
+    const c = JSON.parse(line) as { fn: string; args: string[]; ok: Record<string, string> };
+    const a = c.args.map((x) => BigInt(x));
+    let actual: Record<string, string>;
+    switch (c.fn) {
+      case "calc_buy": {
+        const q = calcBuy(a[0], a[1], a[2], a[3]);
+        actual = {
+          shares_out: q.sharesOut.toString(),
+          fee: q.fee.toString(),
+          net: q.net.toString(),
+          new_reserve_bought: q.newReserveBought.toString(),
+          new_reserve_other: q.newReserveOther.toString(),
+        };
+        break;
+      }
+      case "calc_sell": {
+        const q = calcSell(a[0], a[1], a[2], a[3]);
+        actual = {
+          shares_in: q.sharesIn.toString(),
+          fee: q.fee.toString(),
+          gross: q.gross.toString(),
+          new_reserve_sold: q.newReserveSold.toString(),
+          new_reserve_other: q.newReserveOther.toString(),
+        };
+        break;
+      }
+      case "seed_reserves": {
+        const s = seedReserves(a[0], a[1]);
+        actual = {
+          reserve_yes: s.reserveYes.toString(),
+          reserve_no: s.reserveNo.toString(),
+          creator_yes: s.creatorYes.toString(),
+          creator_no: s.creatorNo.toString(),
+        };
+        break;
+      }
+      case "mul_div_floor":
+        actual = { value: mulDivFloor(a[0], a[1], a[2]).toString() };
+        break;
+      case "mul_div_ceil":
+        actual = { value: mulDivCeil(a[0], a[1], a[2]).toString() };
+        break;
+      case "price_yes_bps":
+        actual = { value: priceYesBps(a[0], a[1]).toString() };
+        break;
+      case "settle_value":
+        actual = { value: settleValue(c.args[0] as "yes" | "no" | "void", a[1], a[2]).toString() };
+        break;
+      case "gross_for_shares":
+        actual = { gross: grossForShares(a[0], a[1], a[2], a[3]).toString() };
+        break;
+      case "collateral_out_for_shares":
+        actual = { collateral_out: collateralOutForShares(a[0], a[1], a[2], a[3]).toString() };
+        break;
+      default:
+        throw new Error(`line ${i + 1}: unknown fn ${c.fn}`);
+    }
+    assert.deepEqual(actual, c.ok, `shared vector line ${i + 1} (${c.fn})`);
+  }
 });
 
 test("buyWithinLimit and sellWithinLimit mirror the on-chain boundaries", () => {

@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "fpmm-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev tool only. Links the pure `market_core::math` module into a host binary
+# so scripts/fpmm-diff/diff.py can compare it with the Python and TypeScript
+# mirrors over JSON lines. Not a workspace member: it is built explicitly by
+# `make fpmm-diff` / CI.
+[dependencies]
+market-core = { path = "../../../contracts/market-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

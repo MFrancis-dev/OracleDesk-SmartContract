@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracledesk.dev/schemas/system-model-trace-v1.json",
+  "title": "OracleDesk stateful system-model trace",
+  "description": "Versioned operation trace replayed by model/system_model.py and executed against the wasm contracts by contracts/integration-tests/tests/system_model.rs.",
+  "type": "object",
+  "required": ["schema_version", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "snapshots": {
+      "type": "array",
+      "description": "Optional committed snapshots; when present the model and the wasm harness must both reproduce them exactly.",
+      "items": { "$ref": "#/$defs/snapshot" }
+    }
+  },
+  "$defs": {
+    "actor": { "enum": ["creator", "trader"] },
+    "outcome": { "enum": ["yes", "no"] },
+    "time": { "type": "integer", "minimum": 0 },
+    "amount": { "type": "integer", "minimum": 1 },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "time", "close_time", "yes_bps"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "create" },
+            "time": { "$ref": "#/$defs/time" },
+            "close_time": { "$ref": "#/$defs/time" },
+            "yes_bps": { "type": "integer", "minimum": 100, "maximum": 9900 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time", "actor", "outcome", "amount"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "buy" },
+            "time": { "$ref": "#/$defs/time" },
+            "actor": { "$ref": "#/$defs/actor" },
+            "outcome": { "$ref": "#/$defs/outcome" },
+            "amount": { "$ref": "#/$defs/amount" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time", "actor", "outcome", "collateral_out"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "sell" },
+            "time": { "$ref": "#/$defs/time" },
+            "actor": { "$ref": "#/$defs/actor" },
+            "outcome": { "$ref": "#/$defs/outcome" },
+            "collateral_out": { "$ref": "#/$defs/amount" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time", "outcome", "amount"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "treasury_buy" },
+            "time": { "$ref": "#/$defs/time" },
+            "outcome": { "$ref": "#/$defs/outcome" },
+            "amount": { "$ref": "#/$defs/amount" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time", "outcome"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "resolve" },
+            "time": { "$ref": "#/$defs/time" },
+            "outcome": { "$ref": "#/$defs/outcome" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time", "actor"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "redeem" },
+            "time": { "$ref": "#/$defs/time" },
+            "actor": { "$ref": "#/$defs/actor" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "time"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "enum": ["claim_remainder", "sweep_fees", "publish_trace", "advance_time"] },
+            "time": { "$ref": "#/$defs/time" }
+          }
+        }
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["market", "positions", "balances", "resolver_state", "trace_count", "market_trace_count"],
+      "additionalProperties": false,
+      "properties": {
+        "market": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["reserve_yes", "reserve_no", "sets_minted", "fees_accrued", "lp_claimed", "status"],
+              "additionalProperties": false,
+              "properties": {
+                "reserve_yes": { "type": "integer" },
+                "reserve_no": { "type": "integer" },
+                "sets_minted": { "type": "integer" },
+                "fees_accrued": { "type": "integer" },
+                "lp_claimed": { "type": "boolean" },
+                "status": { "enum": ["open", "resolved_yes", "resolved_no", "void"] }
+              }
+            }
+          ]
+        },
+        "positions": {
+          "type": "object",
+          "required": ["creator", "trader", "treasury"],
+          "additionalProperties": false,
+          "properties": {
+            "creator": { "$ref": "#/$defs/position" },
+            "trader": { "$ref": "#/$defs/position" },
+            "treasury": { "$ref": "#/$defs/position" }
+          }
+        },
+        "balances": {
+          "type": "object",
+          "required": ["creator", "trader", "treasury", "core"],
+          "additionalProperties": false,
+          "properties": {
+            "creator": { "type": "integer" },
+            "trader": { "type": "integer" },
+            "treasury": { "type": "integer" },
+            "core": { "type": "integer" }
+          }
+        },
+        "resolver_state": {
+          "enum": ["Unconfigured", "SignersPending", "Finalized", "Expired", "Disputed", "Other"]
+        },
+        "trace_count": { "type": "integer", "minimum": 0 },
+        "market_trace_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "position": {
+      "type": "object",
+      "required": ["yes", "no"],
+      "additionalProperties": false,
+      "properties": {
+        "yes": { "type": "integer", "minimum": 0 },
+        "no": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

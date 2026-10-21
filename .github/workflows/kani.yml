@@ -1,0 +1,39 @@
+name: Kani proofs
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "oracledesk-stellar/contracts/market-core/**"
+      - "oracledesk-stellar/Cargo.toml"
+      - "oracledesk-stellar/Cargo.lock"
+      - ".github/workflows/kani.yml"
+  pull_request:
+    paths:
+      - "oracledesk-stellar/contracts/market-core/**"
+      - "oracledesk-stellar/Cargo.toml"
+      - "oracledesk-stellar/Cargo.lock"
+      - ".github/workflows/kani.yml"
+  schedule:
+    # Weekly, so a toolchain drift cannot hide behind path filters.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    name: market-core math proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: oracledesk-stellar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Kani
+        uses: model-checking/kani-github-action@v1
+        with:
+          args: -p market-core

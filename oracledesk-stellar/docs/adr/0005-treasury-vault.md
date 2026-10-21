@@ -158,7 +158,9 @@ redeploying:
 1. Deploy the new treasury.
 2. Admin `withdraw` from the old (pre-vault) treasury.
 3. `deposit` into the new treasury.
-4. Call `market_core.set_treasury`.
+4. Call `market_core.propose_treasury`, then the new treasury's
+   `accept_market_core_role` (the `set_treasury` API this ADR predates was
+   replaced by the authenticated handshake in ADR 0006).
 
 Positions moved with `migrate_market` are not in the successor's index and
 count as zero in its NAV until they are redeemed.
