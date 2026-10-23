@@ -1,6 +1,8 @@
 /**
- * Builds the real task dependencies, state store, lease and runtime options
- * from the environment. Shared by bin/agentd.ts and the one-shot CLIs so
+ * Builds the real task dependencies, state store, lease and runtime options.
+ * Trading and network settings come from the validated AgentConfig
+ * (core/config.ts); only runtime knobs (lease, state file, backoff) are still
+ * read from the environment. Shared by bin/agentd.ts and the one-shot CLIs so
  * all three behave the same.
  */
 import { dirname, join } from "node:path";
@@ -11,8 +13,9 @@ import { availableCapital, existingQuestionHashes, tradableMarkets } from "../co
 import { toMarketState } from "../core/state/types.js";
 import type { MarketSignal, SignalSource } from "../core/strategy.js";
 import { LocalTraceStore } from "../core/trace.js";
-import { agentCredentials, loadDeployments, StellarAdapter, type AgentRole, type Deployments } from "../stellar/adapter.js";
-import { intEnv, type AgentMode } from "./config.js";
+import type { AgentConfig, Tunables } from "../core/config.js";
+import { StellarAdapter, type Deployments } from "../stellar/adapter.js";
+import { assertNever, intEnv, type AgentMode } from "./config.js";
 import { FileLease, NoLease, type Lease } from "./lease.js";
 import type { RuntimeOptions } from "./runtime.js";
 import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
@@ -36,60 +39,90 @@ export const demoSignalSource: SignalSource = {
   },
 };
 
-export function rpcUrl(env: NodeJS.ProcessEnv): string {
-  return env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
+/** The adapter for a validated config. Only live mode is handed the secret. */
+export function buildAdapter(cfg: AgentConfig): StellarAdapter {
+  const common = {
+    networkPassphrase: cfg.networkPassphrase,
+    rpcUrl: cfg.rpcUrl,
+    agentAddress: cfg.agentAddress,
+    deployments: cfg.deployments,
+  };
+  switch (cfg.mode) {
+    case "live":
+      return new StellarAdapter({ ...common, mode: "live", agentSecret: cfg.agentSecret });
+    case "dry-run":
+      return new StellarAdapter({ ...common, mode: "dry-run" });
+    default:
+      return assertNever(cfg.mode, "mode");
+  }
 }
 
-export function buildAdapter(role: AgentRole, mode: AgentMode, env: NodeJS.ProcessEnv, deployments: Deployments): StellarAdapter {
-  return new StellarAdapter({
-    mode,
-    networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
-    rpcUrl: rpcUrl(env),
-    ...agentCredentials(role, env, deployments),
-    deployments,
-  });
-}
-
-function stateReader(env: NodeJS.ProcessEnv, deployments: Deployments) {
+function stateReader(rpcUrl: string, deployments: Deployments) {
   return new ChainStateReader({
     marketContractId: deployments.contracts.market_core,
     portfolioContractId: deployments.contracts.treasury,
-    server: new Server(rpcUrl(env)),
+    server: new Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") }),
   });
 }
 
-/** Chain-state market source: tradable markets the treasury can afford. */
-export function chainCandidates(env: NodeJS.ProcessEnv, deployments: Deployments): () => Promise<TraderCandidate[]> {
-  const reader = stateReader(env, deployments);
+/** Chain-state market source: tradable markets the treasury can afford.
+ * `effectiveFeeBps` (#9) replaces each market's fee before the strategy sees
+ * it; without it the flat snapshot from `get_market` is used. */
+export function chainCandidates(
+  t: Tunables,
+  deployments: Deployments,
+  effectiveFeeBps?: (marketId: bigint) => Promise<number>,
+): () => Promise<TraderCandidate[]> {
+  const reader = stateReader(t.rpcUrl, deployments);
   const cache = new SnapshotCache();
-  const tradeSize = BigInt(env.TRADE_SIZE_STROOPS ?? "100000000");
+  const tradeSize = t.trading.tradeSizeStroops;
   return async () => {
     const snapshot = await cache.get(() => reader.readSnapshot([]));
     if (availableCapital(snapshot) < tradeSize) return [];
-    return tradableMarkets(snapshot).map((m) => {
+    const candidates = tradableMarkets(snapshot).map((m) => {
       const market = toMarketState(m);
       return {
         market,
-        // No external oracle yet: env override or the market's own price (strategy.ts decides edge).
-        fairValueBps: Number(env.FAIR_VALUE_BPS ?? String(market.yesBps)),
+        // No external oracle yet: FAIR_VALUE_BPS or the market's own price (strategy.ts decides edge).
+        fairValueBps: t.trading.fairValueBps ?? market.yesBps,
         creator: m.creator,
         questionHash: m.questionHash,
         ledger: snapshot.ledgers.max,
       };
     });
+    return effectiveFeeBps ? applyEffectiveFees(candidates, effectiveFeeBps) : candidates;
   };
 }
 
-export function makerDeps(env: NodeJS.ProcessEnv, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
-  const reader = stateReader(env, deployments);
+/**
+ * A dynamic `FeeSchedule` (#9) is deliberately invisible in
+ * `Market.fee_bps`, so quoting off that snapshot understates the fee near
+ * close. Replace it with `current_fee_bps` — the fee the contract actually
+ * charges at the current ledger time — so every off-chain impact estimate
+ * matches on-chain reality.
+ */
+export async function applyEffectiveFees(
+  candidates: TraderCandidate[],
+  feeBps: (marketId: bigint) => Promise<number>,
+): Promise<TraderCandidate[]> {
+  return Promise.all(
+    candidates.map(async (c) => ({
+      ...c,
+      market: { ...c.market, feeBps: await feeBps(BigInt(c.market.marketId)) },
+    })),
+  );
+}
+
+export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
+  const reader = stateReader(t.rpcUrl, deployments);
   return {
     adapter,
-    traceStore: new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces"),
+    traceStore: new LocalTraceStore(t.traceStoreDir),
     signals: demoSignalSource,
     knownQuestionHashes: async () => existingQuestionHashes(await reader.readSnapshot([])),
-    confidenceThresholdBps: Number(env.CONFIDENCE_THRESHOLD_BPS ?? 1000),
-    defaultSeedStroops: BigInt(env.DEFAULT_SEED_STROOPS ?? "1500000000"),
-    closeInSecs: Number(env.MARKET_CLOSE_IN_SECS ?? 3600),
+    confidenceThresholdBps: t.maker.confidenceThresholdBps,
+    defaultSeedStroops: t.maker.defaultSeedStroops,
+    closeInSecs: t.maker.closeInSecs,
   };
 }
 
@@ -97,21 +130,35 @@ export function makerDeps(env: NodeJS.ProcessEnv, adapter: StellarAdapter, deplo
  * Trader deps. With deployments, markets come from chain state; without
  * (tests, an adapter not bound to a deployment) from the demo fixture.
  */
+/**
+ * `#9`: only a live adapter that implements the read can supply the
+ * effective fee. Dry-run and fake adapters keep the flat snapshot.
+ */
+function effectiveFeeReader(
+  adapter: TraderDeps["adapter"],
+): ((marketId: bigint) => Promise<number>) | undefined {
+  const read = adapter.currentFeeBps;
+  if (adapter.mode !== "live" || !read) return undefined;
+  return (marketId) => read.call(adapter, { market_id: marketId });
+}
+
 export function traderDeps(
-  env: NodeJS.ProcessEnv,
+  t: Tunables,
   adapter: TraderDeps["adapter"],
   deployments: Deployments | undefined,
   nowSecs: () => number,
 ): TraderDeps {
   return {
     adapter,
-    traceStore: new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces"),
-    candidates: deployments ? chainCandidates(env, deployments) : () => fixtureCandidates(nowSecs()),
+    traceStore: new LocalTraceStore(t.traceStoreDir),
+    candidates: deployments
+      ? chainCandidates(t, deployments, effectiveFeeReader(adapter))
+      : () => fixtureCandidates(nowSecs()),
     treasury: deployments?.contracts.treasury,
-    minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
-    tradeSizeStroops: BigInt(env.TRADE_SIZE_STROOPS ?? "100000000"),
-    slippageBps: BigInt(env.SLIPPAGE_BPS ?? 50),
-    deadlineSecs: Number(env.DEADLINE_SECS ?? 60),
+    minEdgeBps: t.trading.minEdgeBps,
+    tradeSizeStroops: t.trading.tradeSizeStroops,
+    slippageBps: BigInt(t.trading.slippageBps),
+    deadlineSecs: t.trading.deadlineSecs,
     nowSecs,
   };
 }
@@ -149,4 +196,3 @@ export function runtimeOptions(env: NodeJS.ProcessEnv): Omit<RuntimeOptions, "ta
   };
 }
 
-export { loadDeployments };

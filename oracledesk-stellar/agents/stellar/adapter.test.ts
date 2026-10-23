@@ -3,11 +3,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Keypair } from "@stellar/stellar-sdk";
 import {
   agentCredentials,
   loadDeployments,
   StellarAdapter,
   type Deployments,
+  type StellarAdapterOptions,
 } from "./adapter.js";
 
 const deployments: Deployments = {
@@ -53,6 +55,50 @@ test("adapter rejects unknown mode", () => {
       deployments,
     });
   }, /unknown mode/);
+});
+
+test("an unknown mode is rejected by the constructor without echoing the secret", () => {
+  const secret = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 7)).secret();
+  assert.throws(
+    () =>
+      new StellarAdapter({
+        mode: "Live",
+        agentSecret: secret,
+        networkPassphrase: "Test SDF Network ; September 2015",
+        rpcUrl: "https://soroban-testnet.stellar.org",
+        deployments,
+      } as unknown as StellarAdapterOptions),
+    (err: Error) => /unknown mode "Live"/.test(err.message) && !err.message.includes(secret),
+  );
+});
+
+test("an unknown mode that reaches run() throws before any network access", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  // Simulate the options being corrupted after construction.
+  (adapter as unknown as { opts: { mode: string } }).opts.mode = "yolo";
+  await assert.rejects(
+    adapter.agentBuy({ market_id: 0n, outcome: { tag: "Yes", values: undefined }, collateral_in: 1n, min_shares_out: 0n }),
+    /unknown mode "yolo"/,
+  );
+});
+
+test("dry-run refuses to be handed an agent secret", () => {
+  assert.throws(
+    () =>
+      new StellarAdapter({
+        mode: "dry-run",
+        agentSecret: Keypair.random().secret(),
+        networkPassphrase: "Test SDF Network ; September 2015",
+        rpcUrl: "https://soroban-testnet.stellar.org",
+        deployments,
+      } as unknown as StellarAdapterOptions),
+    /dry-run mode must not be given agentSecret/,
+  );
 });
 
 test("dry-run agentBuy describes the call without touching the network", async () => {

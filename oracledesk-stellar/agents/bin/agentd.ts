@@ -23,7 +23,8 @@ import { Runtime, type Task } from "../runtime/runtime.js";
 import type { StateStore } from "../runtime/state.js";
 import { makerTask } from "../runtime/tasks/maker.js";
 import { traderTask } from "../runtime/tasks/trader.js";
-import { buildAdapter, createLease, createStateStore, loadDeployments, makerDeps, runtimeOptions, traderDeps } from "../runtime/wiring.js";
+import { loadAgentConfig } from "../core/config.js";
+import { buildAdapter, createLease, createStateStore, makerDeps, runtimeOptions, traderDeps } from "../runtime/wiring.js";
 
 export interface AgentdArgs {
   once: boolean;
@@ -46,7 +47,7 @@ export function parseArgs(argv: string[]): AgentdArgs {
 
 export interface AgentdOverrides {
   /** Task factories by name (tests inject fakes; default: maker, trader). */
-  taskFactories?: Record<string, (env: NodeJS.ProcessEnv) => Task>;
+  taskFactories?: Record<string, TaskFactory>;
   state?: StateStore;
   lease?: Lease;
   log?: Logger;
@@ -54,20 +55,27 @@ export interface AgentdOverrides {
   handleSignals?: boolean;
 }
 
-function defaultFactories(): Record<string, (env: NodeJS.ProcessEnv) => Task> {
+type TaskFactory = (env: NodeJS.ProcessEnv) => Task | Promise<Task>;
+
+/** Each real task validates its own role's config (core/config.ts), including
+ * the network probes and mainnet interlock; `scope` records the treasury the
+ * state store is keyed by. */
+function defaultFactories(scope: { treasury?: string }): Record<string, TaskFactory> {
   return {
-    maker: (env) => {
-      const deployments = loadDeployments();
-      const adapter = buildAdapter("maker", parseAgentMode(env), env, deployments);
-      return makerTask(makerDeps(env, adapter, deployments), {
+    maker: async (env) => {
+      const cfg = await loadAgentConfig({ role: "maker", env, argv: [] });
+      scope.treasury = cfg.deployments.contracts.treasury;
+      const adapter = buildAdapter(cfg);
+      return makerTask(makerDeps(cfg, adapter, cfg.deployments), {
         intervalMs: intEnv(env, "MAKER_INTERVAL_MS", 5 * 60_000),
         jitterMs: intEnv(env, "MAKER_JITTER_MS", 15_000),
       });
     },
-    trader: (env) => {
-      const deployments = loadDeployments();
-      const adapter = buildAdapter("trader", parseAgentMode(env), env, deployments);
-      return traderTask(traderDeps(env, adapter, deployments, () => Math.floor(Date.now() / 1000)), {
+    trader: async (env) => {
+      const cfg = await loadAgentConfig({ role: "trader", env, argv: [] });
+      scope.treasury = cfg.deployments.contracts.treasury;
+      const adapter = buildAdapter(cfg);
+      return traderTask(traderDeps(cfg, adapter, cfg.deployments, () => Math.floor(Date.now() / 1000)), {
         intervalMs: intEnv(env, "TRADER_INTERVAL_MS", 60_000),
         jitterMs: intEnv(env, "TRADER_JITTER_MS", 5_000),
       });
@@ -85,13 +93,16 @@ export async function runAgentd(argv: string[], baseEnv: NodeJS.ProcessEnv, o: A
     const overrides = args.config ? (JSON.parse(readFileSync(args.config, "utf8")) as Record<string, unknown>) : {};
     const env: NodeJS.ProcessEnv = { ...baseEnv, ...Object.fromEntries(Object.entries(overrides).map(([k, v]) => [k, String(v)])) };
     const mode = parseAgentMode(env);
-    const factories = o.taskFactories ?? defaultFactories();
-    const tasks = args.tasks.map((name) => {
-      const make = factories[name];
-      if (!make) throw new ConfigError(`unknown task ${name} (known: ${Object.keys(factories).join(", ")})`);
-      return make(env);
-    });
-    const scope = o.taskFactories ? "agentd" : loadDeployments().contracts.treasury;
+    const real: { treasury?: string } = {};
+    const factories = o.taskFactories ?? defaultFactories(real);
+    const tasks = await Promise.all(
+      args.tasks.map((name) => {
+        const make = factories[name];
+        if (!make) throw new ConfigError(`unknown task ${name} (known: ${Object.keys(factories).join(", ")})`);
+        return make(env);
+      }),
+    );
+    const scope = o.taskFactories ? "agentd" : real.treasury ?? "agentd";
     runtime = new Runtime({
       tasks,
       state: o.state ?? (await createStateStore(mode, env, scope)),

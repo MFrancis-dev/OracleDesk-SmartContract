@@ -177,6 +177,54 @@ def collateral_out_for_shares(r_sold: int, r_other: int, shares_in: int, fee_bps
     return mul_div_floor(gross, BPS - fee_bps, BPS)
 
 
+COLLATERAL_SEARCH_STEPS = 256
+
+
+def collateral_for_shares(r_bought: int, r_other: int, shares_target: int, fee_bps: int) -> int:
+    """Minimum collateral_in for which calc_buy returns at least shares_target.
+
+    Closed-form estimate of the net amount, grossed up for the fee, then a
+    bounded binary search against calc_buy itself so integer rounding cannot
+    make it wrong. Mirrors agents/core/fpmm.ts::collateralForShares (#108).
+    """
+    if shares_target <= 0 or r_bought <= 0 or r_other <= 0 or not 0 <= fee_bps < BPS:
+        raise MathError("invalid input")
+
+    def shares_for(c: int) -> int:
+        if c <= 0:
+            return 0
+        try:
+            return calc_buy(r_bought, r_other, c, fee_bps).shares_out
+        except MathError:
+            return 0
+
+    b = r_bought + r_other - shares_target
+    net = (isqrt(b * b + 4 * shares_target * r_other) - b) // 2
+    estimate = mul_div_ceil(net if net > 0 else 1, BPS, BPS - fee_bps)
+    hi, steps = estimate, 0
+    while shares_for(hi) < shares_target:
+        hi = hi * 2 + 1
+        steps += 1
+        if steps > COLLATERAL_SEARCH_STEPS:
+            raise MathError("target not reachable")
+    lo = hi - 64 if hi > 64 else 0
+    while lo > 0 and shares_for(lo) >= shares_target:
+        lo //= 2
+        steps += 1
+        if steps > COLLATERAL_SEARCH_STEPS:
+            raise MathError("search did not converge")
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if shares_for(mid) >= shares_target:
+            hi = mid
+        else:
+            lo = mid
+        steps += 1
+        if steps > COLLATERAL_SEARCH_STEPS:
+            raise MathError("search did not converge")
+    return hi
+
+
 def price_after(outcome_is_yes: bool, r_after: int, r_other_after: int) -> int:
     """YES price in bps of the pool **after** applying an outcome-relative
     reserve update (the `new_reserve_*` pair of a BuyQuote/SellQuote).
@@ -789,6 +837,56 @@ def _check_shared_vectors():
         )
 
 
+COLLATERAL_FIXTURES = Path(__file__).resolve().parents[1] / "scripts/fpmm-diff/collateral_for_shares.jsonl"
+
+
+def _shares_or_zero(r_bought: int, r_other: int, c: int, fee_bps: int) -> int:
+    try:
+        return calc_buy(r_bought, r_other, c, fee_bps).shares_out if c > 0 else 0
+    except MathError:
+        return 0
+
+
+def _check_collateral_for_shares_is_minimal(trials: int = 2_000, seed: int = 13):
+    """collateral_for_shares buys the target, and one stroop less does not."""
+    rng = random.Random(seed)
+    for _ in range(trials):
+        r_bought = rng.randint(1, 10**13)
+        r_other = rng.randint(1, 10**13)
+        fee = rng.choice([0, 1, 30, 100, 250, 9_999])
+        target = rng.randint(1, r_bought * 3 + 10)
+        c = collateral_for_shares(r_bought, r_other, target, fee)
+        assert _shares_or_zero(r_bought, r_other, c, fee) >= target, (r_bought, r_other, target, fee, c)
+        assert _shares_or_zero(r_bought, r_other, c - 1, fee) < target, (r_bought, r_other, target, fee, c)
+
+
+def collateral_fixture_cases(seed: int = 108, count: int = 40):
+    rng = random.Random(seed)
+    cases = [(1_000, 1_000, 1, 0), (1_000, 1_000, 500, 100), (6_000_000_000, 4_000_000_000, 245_327_043, 100)]
+    while len(cases) < count:
+        r_bought, r_other = rng.randint(1, 10**12), rng.randint(1, 10**12)
+        cases.append((r_bought, r_other, rng.randint(1, r_bought * 2 + 1), rng.choice([0, 30, 100, 300])))
+    return cases
+
+
+def write_collateral_fixtures():
+    lines = []
+    for r_bought, r_other, target, fee in collateral_fixture_cases():
+        c = collateral_for_shares(r_bought, r_other, target, fee)
+        lines.append(json.dumps({"args": [str(r_bought), str(r_other), str(target), str(fee)], "collateral_in": str(c)}, sort_keys=True))
+    COLLATERAL_FIXTURES.write_text("\n".join(lines) + "\n")
+    print(f"wrote {len(lines)} fixtures to {COLLATERAL_FIXTURES}")
+
+
+def _check_collateral_fixtures():
+    """Replays the fixtures agents/core/fpmm.test.ts also asserts."""
+    for line_no, line in enumerate(COLLATERAL_FIXTURES.read_text().splitlines(), 1):
+        case = json.loads(line)
+        a = [int(x) for x in case["args"]]
+        got = collateral_for_shares(*a)
+        assert str(got) == case["collateral_in"], f"fixture line {line_no}: {got} != {case['collateral_in']}"
+
+
 def run_all():
     _check_known_values()
     _check_shared_vectors()
@@ -798,6 +896,8 @@ def run_all():
     _check_void_never_overpays()
     _check_price_after_maps_both_sides()
     _check_limits_boundary_and_symmetry()
+    _check_collateral_for_shares_is_minimal()
+    _check_collateral_fixtures()
     _check_cat_known_values()
     _check_cat_k_never_decreases_and_round_trip_never_profits()
     _check_cat_prices_sum_within_n_of_bps()
@@ -810,4 +910,9 @@ def run_all():
 
 
 if __name__ == "__main__":
-    run_all()
+    import sys
+
+    if "--write-collateral-fixtures" in sys.argv:
+        write_collateral_fixtures()
+    else:
+        run_all()

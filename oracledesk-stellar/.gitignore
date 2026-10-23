@@ -24,6 +24,11 @@ yarn-error.log*
 .env.*
 !.env.example
 
+# Agent event-trigger checkpoints and dead letters (EVENTS_STATE_DIR, #105)
+.events/
+# Arbitrage execution journal (ARB_JOURNAL_FILE, #108)
+.arb/
+
 # Stellar / Soroban CLI local state (funded testnet identities, RPC caches)
 .soroban/
 .stellar/

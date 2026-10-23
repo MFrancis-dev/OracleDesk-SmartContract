@@ -1,6 +1,6 @@
 #!/usr/bin/env -S npx tsx
 /**
- * Trader agent: reads a market's current implied price, compares it to a
+ * Trader agent, one shot: reads chain state, compares implied price to a
  * fair-value estimate, and trades the mispricing if the edge clears the
  * configured threshold. Every trade is preceded by a recorded trace.
  *
@@ -10,150 +10,104 @@
  * backstop, plus a `deadline` — so a stale or sandwiched transaction
  * reverts on-chain instead of executing at an arbitrary price.
  *
- * Defaults to dry-run. Set AGENT_MODE=live and TRADER_SECRET_KEY (or the
- * shared AGENT_SECRET_KEY) to submit real testnet transactions — see
- * .env.example.
+ * A thin wrapper over the runtime's trader task (runtime/tasks/trader.ts),
+ * run exactly once under the single-instance lease; `npm run agentd` runs
+ * the same task continuously. Defaults to dry-run. Set AGENT_MODE=live and
+ * TRADER_SECRET_KEY (or the shared AGENT_SECRET_KEY) to submit real testnet
+ * transactions — see .env.example. Configuration is validated by
+ * core/config.ts first; `--print-config` prints it (secret redacted) and
+ * exits, `--offline` skips the network probes in dry-run. `--follow` keeps
+ * running and reacts to contract events instead (see runtime/follow.ts).
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
-import { buildTrace, LocalTraceStore } from "../core/trace.js";
-import { BPS, priceYesBps } from "../core/fpmm.js";
-import { decideTrade, type MarketState } from "../core/strategy.js";
-import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
-
-/**
- * Reads the market to trade and the fair value to compare it against.
- *
- * In live mode the market is a real chain read (`get_market` plus
- * `current_fee_bps`) for `MARKET_ID`. The effective fee — not the flat
- * `Market.fee_bps` snapshot, which ignores dynamic fee schedules — is fed
- * into the strategy's market state so every off-chain quote and impact
- * estimate uses the number the contract will actually charge.
- *
- * The fair-value estimate stays a placeholder: wiring a real
- * ReferencePriceSource (and the question lookup it needs) is an open issue —
- * see docs/wave-issues.
- */
-async function fetchMarketAndFairValue(
-  adapter: StellarAdapter,
-  env: NodeJS.ProcessEnv,
-  now: () => number,
-): Promise<{ market: MarketState; fairValueBps: number }> {
-  if (adapter.mode === "live") {
-    const marketId = BigInt(env.MARKET_ID ?? "0");
-    const m = await adapter.getMarketView({ market_id: marketId });
-    const feeBps = await adapter.currentFeeBps({ market_id: marketId });
-    return {
-      market: {
-        marketId: Number(marketId),
-        question: "live market",
-        yesBps: Number(priceYesBps(m.reserve_yes, m.reserve_no)),
-        closeTime: Number(m.close_time),
-        reserveYesStroops: m.reserve_yes,
-        reserveNoStroops: m.reserve_no,
-        feeBps,
-      },
-      fairValueBps: 6000,
-    };
-  }
-  return {
-    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: now() + 3600 },
-    fairValueBps: 6000,
-  };
-}
+import { describeConfig, loadAgentConfig, type AgentConfig, type Tunables } from "../core/config.js";
+import { LocalTraceStore } from "../core/trace.js";
+import { followTask } from "../runtime/follow.js";
+import { arbitrageTask } from "../runtime/tasks/arbitrage.js";
+import { jsonLogger } from "../runtime/log.js";
+import { ConfigError, EXIT_CONFIG, EXIT_TEMPFAIL } from "../runtime/config.js";
+import { LeaseHeldError } from "../runtime/lease.js";
+import { Runtime } from "../runtime/runtime.js";
+import { traderTask } from "../runtime/tasks/trader.js";
+import { buildAdapter, createLease, createStateStore, runtimeOptions, traderDeps } from "../runtime/wiring.js";
+import type { StellarAdapter } from "../stellar/adapter.js";
 
 /**
  * Exported (and injectable) so tests can drive the whole trade flow with a
- * fake adapter and clock. `now` returns unix seconds.
+ * fake adapter and clock. `now` returns unix seconds. An adapter bound to a
+ * deployment reads markets from chain state; one without (a test fake)
+ * trades the demo fixture market. `run` is the validated config (or, in
+ * tests, `parseTunables(env)`).
  */
 export async function main(
   adapter: StellarAdapter,
-  env: NodeJS.ProcessEnv = process.env,
+  run: Tunables,
   now: () => number = () => Math.floor(Date.now() / 1000),
 ): Promise<void> {
-  const traceStore = new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces");
-
-  console.log(`[trader] mode=${adapter.mode}`);
-  const { market, fairValueBps } = await fetchMarketAndFairValue(adapter, env, now);
-  const decision = decideTrade(market, fairValueBps, {
-    minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
-    tradeSizeStroops: BigInt(env.TRADE_SIZE_STROOPS ?? "100000000"),
+  const deployments = (adapter as Partial<StellarAdapter>).deployments;
+  const runtime = new Runtime({
+    tasks: [traderTask(traderDeps(run, adapter, deployments, now), { intervalMs: 0 }), ...arbTasks(run, adapter, now, 0)],
+    state: await createStateStore(adapter.mode, run.env, deployments?.contracts.treasury ?? "unbound"),
+    lease: createLease(run.env),
+    ...runtimeOptions(run.env),
   });
-  console.log(`[trader] ${decision.action}: ${decision.reasoning}`);
-  if (decision.action === "skip") return;
+  await runtime.runOnce();
+}
 
-  const built = buildTrace({
-    agent: "trader",
-    marketId: market.marketId,
-    action: "buy",
-    reasoning: decision.reasoning,
-    inputs: { market, fairValueBps, decision },
+/** The arbitrage task when ARB_ENABLED (#108); see runtime/tasks/arbitrage.ts. */
+function arbTasks(run: Tunables, adapter: StellarAdapter, now: () => number, intervalMs: number) {
+  if (!run.arb.enabled) return [];
+  return [arbitrageTask({ adapter, cfg: run.arb, traceStore: new LocalTraceStore(run.traceStoreDir), nowSecs: now }, { intervalMs })];
+}
+
+/**
+ * `--follow`: runs until stopped (SIGINT/SIGTERM), re-evaluating only the
+ * markets that contract events point at (#105). Without the flag, behaviour
+ * is unchanged: one evaluation of every market, then exit.
+ */
+export async function follow(cfg: AgentConfig, adapter: StellarAdapter, now: () => number = () => Math.floor(Date.now() / 1000)): Promise<number> {
+  const log = jsonLogger();
+  const task = await followTask({
+    cfg,
+    adapter,
+    trader: traderDeps(cfg, adapter, cfg.deployments, now),
+    nowSecs: now,
+    log: (event, fields) => log.info(event, fields),
   });
-  const { cid } = await traceStore.put(built.hash, built.json);
-  console.log(`[trader] trace ${built.hash} -> ${cid}`);
-
-  const outcome = { tag: decision.outcome!, values: undefined } as {
-    tag: "Yes" | "No";
-    values: void;
-  };
-  const collateralInStroops = decision.collateralInStroops!;
-
-  // Fresh quote -> non-zero bounds. The quote is a read-only simulation,
-  // so this runs in dry-run mode too and the same code path is exercised
-  // before any real submission.
-  const quotedShares = await adapter.quoteBuy({
-    market_id: BigInt(market.marketId),
-    outcome,
-    collateral_in: collateralInStroops,
+  const runtime = new Runtime({
+    tasks: [task, ...arbTasks(cfg, adapter, now, cfg.events.pollIntervalMs)],
+    state: await createStateStore(cfg.mode, cfg.env, cfg.deployments.contracts.treasury),
+    lease: createLease(cfg.env),
+    log,
+    ...runtimeOptions(cfg.env),
   });
-  const slippageBps = BigInt(env.SLIPPAGE_BPS ?? 50);
-  const minSharesOut = (quotedShares * (BPS - slippageBps)) / BPS;
-  // Never pay more than fair for the outcome being bought: for a YES buy
-  // that is `fairValueBps`; for a NO buy it is the complement, since the
-  // contract compares the limit against the average price of the outcome
-  // being bought (the NO price).
-  const limitPriceBps = decision.outcome === "Yes" ? fairValueBps : Number(BPS) - fairValueBps;
-  const deadline = BigInt(now() + Number(env.DEADLINE_SECS ?? 60));
-  console.log(
-    `[trader] quote ${quotedShares} shares -> min_shares_out=${minSharesOut} limit_price_bps=${limitPriceBps} deadline=${deadline}`,
-  );
-
-  const result = await adapter.agentBuyV2({
-    market_id: BigInt(market.marketId),
-    outcome,
-    collateral_in: collateralInStroops,
-    min_shares_out: minSharesOut,
-    limit_price_bps: limitPriceBps,
-    deadline,
-  });
-  console.log("[trader] agent_buy_v2:", result);
-
-  if (!result.dryRun) {
-    const traceResult = await adapter.publishTrace({
-      agent: adapter.agent,
-      market_id: BigInt(market.marketId),
-      action: "buy",
-      trace_hash: Buffer.from(built.hash, "hex"),
-      ipfs_cid: cid,
-    });
-    console.log("[trader] publish_trace:", traceResult);
-  }
+  const stop = (signal: NodeJS.Signals) => void runtime.stop(signal);
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  await runtime.start();
+  return runtime.exitCode;
 }
 
 const isMain =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  const mode = (process.env.AGENT_MODE as "dry-run" | "live") ?? "dry-run";
-  const deployments = loadDeployments();
-  const adapter = new StellarAdapter({
-    mode,
-    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
-    rpcUrl: process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
-    ...agentCredentials("trader", process.env, deployments),
-    deployments,
-  });
-  main(adapter).catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  loadAgentConfig({ role: "trader" })
+    .then((cfg) => {
+      if (cfg.printConfig) {
+        console.log(JSON.stringify(describeConfig(cfg), null, 2));
+        return;
+      }
+      console.log(`[trader] mode=${cfg.mode} network=${cfg.network}${process.argv.includes("--follow") ? " follow" : ""}`);
+      if (process.argv.includes("--follow")) {
+        return follow(cfg, buildAdapter(cfg)).then((code) => {
+          process.exitCode = code;
+        });
+      }
+      return main(buildAdapter(cfg), cfg);
+    })
+    .catch((err) => {
+      console.error(err instanceof ConfigError ? err.message : err);
+      process.exit(err instanceof LeaseHeldError ? EXIT_TEMPFAIL : err instanceof ConfigError ? EXIT_CONFIG : 1);
+    });
 }

@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { toTraceAction, type TraceActionType } from "../core/trace.js";
+import { assertNever, type AgentMode } from "../runtime/config.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -73,20 +74,22 @@ export function agentCredentials(
   };
 }
 
-export interface StellarAdapterOptions {
-  /** "dry-run" (default): builds and logs what would be submitted, never
-   * signs or sends. "live": actually submits real testnet transactions. */
-  mode: "dry-run" | "live";
+interface CommonAdapterOptions {
   networkPassphrase: string;
   rpcUrl: string;
-  /** The agent's secret key (`S...`). Required for `mode: "live"`; ignored
-   * (and may be omitted) in dry-run. */
-  agentSecret?: string;
   /** The acting agent's address for dry-run descriptions (live mode always
    * uses the secret key's public key). Defaults to `deployments.agent`. */
   agentAddress?: string;
   deployments: Deployments;
 }
+
+/**
+ * "dry-run": builds and logs what would be submitted, never signs or sends,
+ * and must not be handed a secret at all. "live": submits real transactions
+ * signed with `agentSecret` (`S...`), which it requires.
+ */
+export type StellarAdapterOptions = CommonAdapterOptions &
+  ({ mode: "dry-run"; agentSecret?: undefined } | { mode: "live"; agentSecret?: string });
 
 export interface DryRunResult {
   dryRun: true;
@@ -123,18 +126,24 @@ export class StellarAdapter {
   private readonly publicKey?: string;
 
   constructor(private readonly opts: StellarAdapterOptions) {
-    if (opts.mode !== "dry-run" && opts.mode !== "live") {
-      throw new Error(`unknown mode ${JSON.stringify(opts.mode)}: expected "dry-run" or "live"`);
-    }
-    if (opts.mode === "live") {
-      if (!opts.agentSecret) throw new Error("live mode requires agentSecret");
-      const keypair = Keypair.fromSecret(opts.agentSecret);
-      this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
-      this.publicKey = keypair.publicKey();
+    switch (opts.mode) {
+      case "dry-run":
+        if (opts.agentSecret !== undefined) throw new Error("dry-run mode must not be given agentSecret");
+        break;
+      case "live": {
+        if (!opts.agentSecret) throw new Error("live mode requires agentSecret");
+        const keypair = Keypair.fromSecret(opts.agentSecret);
+        this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
+        this.publicKey = keypair.publicKey();
+        break;
+      }
+      default:
+        // Only the mode is printed: opts may carry a secret.
+        assertNever(opts, "mode", (opts as { mode?: unknown }).mode);
     }
   }
 
-  get mode(): "dry-run" | "live" {
+  get mode(): AgentMode {
     return this.opts.mode;
   }
 
@@ -161,6 +170,8 @@ export class StellarAdapter {
       contractId,
       networkPassphrase: this.opts.networkPassphrase,
       rpcUrl: this.opts.rpcUrl,
+      // A local network (http://localhost:8000/soroban/rpc) has no TLS.
+      allowHttp: this.opts.rpcUrl.startsWith("http://"),
       publicKey: this.publicKey,
       signTransaction: this.signer,
     });
@@ -179,8 +190,13 @@ export class StellarAdapter {
     call: (client: any) => Promise<{ signAndSend: () => Promise<{ result: T }> }>,
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
-    if (this.opts.mode === "dry-run") {
-      return { dryRun: true, contractId, method: methodName, args };
+    switch (this.opts.mode) {
+      case "dry-run":
+        return { dryRun: true, contractId, method: methodName, args };
+      case "live":
+        break;
+      default:
+        assertNever(this.opts, "mode", (this.opts as { mode?: unknown }).mode);
     }
     let assembled: Awaited<ReturnType<typeof call>>;
     try {
@@ -288,7 +304,8 @@ export class StellarAdapter {
   }): Promise<bigint> {
     const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.quote_buy(args);
-    return result as bigint;
+    // quote_buy returns Result<i128, Error>: unwrap it, and surface an Err.
+    return BigInt(unwrapContractResult("quote_buy", result) as bigint);
   }
 
   /**
@@ -348,9 +365,19 @@ export class StellarAdapter {
   }
 
   /** market-core `get_market` (read-only), or `undefined` if it does not exist. */
-  async getMarket(
-    marketId: bigint,
-  ): Promise<{ creator: string; questionHash: string; resolutionHash: string; closeTime: bigint } | undefined> {
+  async getMarket(marketId: bigint): Promise<
+    | {
+        creator: string;
+        questionHash: string;
+        resolutionHash: string;
+        closeTime: bigint;
+        status: "Open" | "Resolved" | "Void";
+        reserveYes: bigint;
+        reserveNo: bigint;
+        feeBps: bigint;
+      }
+    | undefined
+  > {
     const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.get_market({ market_id: marketId });
     if (result?.isErr?.()) return undefined;
@@ -360,7 +387,60 @@ export class StellarAdapter {
       questionHash: Buffer.from(m.question_hash).toString("hex"),
       resolutionHash: Buffer.from(m.resolution_hash).toString("hex"),
       closeTime: BigInt(m.close_time),
+      status: m.status.tag,
+      reserveYes: BigInt(m.reserve_yes),
+      reserveNo: BigInt(m.reserve_no),
+      feeBps: BigInt(m.fee_bps),
     };
+  }
+
+  /**
+   * The treasury caps that bound this agent: the stricter of the global
+   * config and the agent's own policy, plus what it has spent today.
+   */
+  async riskCaps(): Promise<{ maxTrade: bigint; maxMarket: bigint; maxDaily: bigint; dailyUsed: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const config = unwrapContractResult("get_config", (await client.get_config()).result) as { max_trade: bigint; max_market: bigint; max_daily: bigint };
+    const policy = (await client.get_agent({ agent: this.agent })).result as { max_trade: bigint; max_daily: bigint } | undefined;
+    const usage = unwrapContractResult("agent_daily_usage", (await client.agent_daily_usage({ agent: this.agent })).result) as { amount: bigint };
+    const min = (a: bigint, b?: bigint) => (b !== undefined && BigInt(b) < BigInt(a) ? BigInt(b) : BigInt(a));
+    return {
+      maxTrade: min(config.max_trade, policy?.max_trade),
+      maxMarket: BigInt(config.max_market),
+      maxDaily: min(config.max_daily, policy?.max_daily),
+      dailyUsed: BigInt(usage.amount),
+    };
+  }
+
+  /** What the treasury has committed to `marketId` (its cost basis). */
+  async marketSpent(marketId: bigint): Promise<bigint> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as { cost_basis: bigint };
+    return BigInt(v.cost_basis);
+  }
+
+  /** An RPC client for this adapter's network (event polling, ledger reads). */
+  rpcServer(): rpc.Server {
+    return new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") });
+  }
+
+  /** The deployment's contract ids. A copy: callers cannot rebind the adapter. */
+  contractIds(): Deployments["contracts"] {
+    return { ...this.opts.deployments.contracts };
+  }
+
+  /** The treasury's YES/NO shares in `marketId` (zero when it holds none). */
+  async treasuryPosition(marketId: bigint): Promise<{ yes: bigint; no: bigint }> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.get_position({ market_id: marketId, holder: this.opts.deployments.contracts.treasury });
+    return { yes: BigInt(result.yes), no: BigInt(result.no) };
+  }
+
+  /** The resolver's state tag for `marketId`, e.g. "SignersPending". */
+  async resolutionState(marketId: bigint): Promise<string> {
+    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const { result } = await client.state({ market_id: marketId });
+    return (result as { tag: string }).tag;
   }
 
   /**
@@ -379,7 +459,7 @@ export class StellarAdapter {
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
-    const { entries } = await new rpc.Server(this.opts.rpcUrl).getLedgerEntries(key);
+    const { entries } = await new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") }).getLedgerEntries(key);
     return entries.length > 0;
   }
 

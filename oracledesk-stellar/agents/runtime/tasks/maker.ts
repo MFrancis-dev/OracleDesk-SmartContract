@@ -11,7 +11,13 @@
  */
 import { createHash } from "node:crypto";
 import { buildTrace, type TraceStore } from "../../core/trace.js";
-import { decideMarketProposal, type SignalSource } from "../../core/strategy.js";
+import { decideMarketProposal, type MarketSignal, type SignalSource } from "../../core/strategy.js";
+import {
+  isDueDiligenceApproved,
+  rejectChangedState,
+  unavailableDueDiligence,
+  type DueDiligenceVerdict,
+} from "../../core/due-diligence.js";
 import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { Task, TaskContext } from "../runtime.js";
 import { publishPendingTraces, recordPendingTrace } from "./traces.js";
@@ -22,6 +28,8 @@ export interface MakerDeps {
   signals: SignalSource;
   /** Question hashes that already have a market on-chain. */
   knownQuestionHashes?: () => Promise<Set<string>>;
+  /** Verifies the proposed metadata, commitment, resolution path, and trust policy. */
+  validateProposal?: (signal: MarketSignal, question: string) => Promise<DueDiligenceVerdict>;
   /**
    * Reveals the market's resolution spec. Until one is wired in (see the
    * commit/reveal issue), created markets stay "created" and the trader
@@ -66,12 +74,28 @@ export async function makerTick(deps: MakerDeps, ctx: TaskContext): Promise<void
       continue;
     }
 
+    const verdict = deps.validateProposal
+      ? await deps.validateProposal(signal, decision.question!)
+      : unavailableDueDiligence(id);
+    if (!isDueDiligenceApproved(verdict, id, ctx.now())) {
+      const rejected = buildTrace({
+        agent: "market-maker",
+        marketId: null,
+        action: "skip",
+        reasoning: `market proposal rejected by due diligence: ${verdict.reasons.map((reason) => reason.code).join(", ")}`,
+        inputs: { signal, decision, dueDiligence: verdict },
+      });
+      await deps.traceStore.put(rejected.hash, rejected.json);
+      ctx.log.warn("MAKER_DUE_DILIGENCE_REJECTED", { signal: id, verdict, trace: rejected.hash });
+      continue;
+    }
+
     const built = buildTrace({
       agent: "market-maker",
       marketId: null,
       action: "propose_market",
       reasoning: decision.reasoning,
-      inputs: { signal, decision },
+      inputs: { signal, decision, dueDiligence: verdict },
     });
     const { cid } = await deps.traceStore.put(built.hash, built.json);
     ctx.log.info("MAKER_TRACE", { trace: built.hash, cid });
@@ -95,7 +119,34 @@ export async function makerTick(deps: MakerDeps, ctx: TaskContext): Promise<void
     }
     let result: Awaited<ReturnType<MakerDeps["adapter"]["agentCreateMarket"]>>;
     try {
-      result = await ctx.submit(() => deps.adapter.agentCreateMarket(args), `create:${questionHashHex}`);
+      const submission = await ctx.submit(async () => {
+        const observedVerdict = deps.validateProposal
+          ? await deps.validateProposal(signal, decision.question!)
+          : unavailableDueDiligence(id);
+        const finalVerdict = observedVerdict.stateFingerprint === verdict.stateFingerprint
+          ? observedVerdict
+          : rejectChangedState(observedVerdict);
+        if (!isDueDiligenceApproved(finalVerdict, id, ctx.now())) {
+          return { kind: "rejected" as const, verdict: finalVerdict };
+        }
+        return {
+          kind: "submitted" as const,
+          result: await deps.adapter.agentCreateMarket(args),
+        };
+      }, `create:${questionHashHex}`);
+      if (submission.kind === "rejected") {
+        const rejected = buildTrace({
+          agent: "market-maker",
+          marketId: null,
+          action: "skip",
+          reasoning: `market proposal rejected by final due-diligence recheck: ${submission.verdict.reasons.map((reason) => reason.code).join(", ")}`,
+          inputs: { signal, decision, dueDiligence: submission.verdict },
+        });
+        await deps.traceStore.put(rejected.hash, rejected.json);
+        ctx.log.warn("MAKER_DUE_DILIGENCE_REJECTED", { signal: id, verdict: submission.verdict, trace: rejected.hash });
+        continue;
+      }
+      result = submission.result;
     } catch (err) {
       // Left as "intent": the create may or may not have landed. It is never
       // retried blindly; an operator (or the tx journal) reconciles it.

@@ -149,3 +149,11 @@ jobs:
           npm install
           npm run build
           npm test
+
+      # Fake-RPC fault injection against the real live adapter (#106). Uses
+      # the wasm downloaded above when it fits the adapter, else the vendored
+      # copies; deterministic (seeded faults, fake ledger clock), no network.
+      - name: agents — chaos tests
+        run: |
+          cd agents
+          npm run test:chaos

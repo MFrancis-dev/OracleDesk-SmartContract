@@ -12,8 +12,10 @@ import {
   catPrices,
   catSeed,
   catSettleValue,
+  collateralForShares,
   collateralOutForShares,
   effectiveFeeBps,
+  type FeeSchedule,
   grossForShares,
   MathError,
   MAX_MARKET_OUTCOMES,
@@ -29,7 +31,6 @@ import {
   seedReserves,
   sellWithinLimit,
   settleValue,
-  type FeeSchedule,
 } from "./fpmm.js";
 
 // Same worked examples as math.rs's unit tests and model/fpmm_model.py's
@@ -154,7 +155,8 @@ test("committed cross-language vectors match", () => {
   const lines = readFileSync(vectorsPath, "utf8").trim().split("\n");
   for (const [i, line] of lines.entries()) {
     const c = JSON.parse(line) as { fn: string; args: string[]; ok: Record<string, string> };
-    const a = c.args.map((x) => BigInt(x));
+    // settle_value's first arg is an outcome name, not a number.
+    const a = c.args.map((x) => (/^-?\d+$/.test(x) ? BigInt(x) : 0n));
     let actual: Record<string, string>;
     switch (c.fn) {
       case "calc_buy": {
@@ -231,6 +233,59 @@ test("buyWithinLimit and sellWithinLimit mirror the on-chain boundaries", () => 
   assert.equal(buyWithinLimit(1n, 1n, 0n), false);
 });
 
+// ─── collateralForShares (#108) ──────────────────────────────────────────────
+
+function sharesOrZero(rB: bigint, rO: bigint, c: bigint, fee: bigint): bigint {
+  if (c <= 0n) return 0n;
+  try {
+    return calcBuy(rB, rO, c, fee).sharesOut;
+  } catch {
+    return 0n;
+  }
+}
+
+test("collateralForShares matches the fpmm_model.py fixtures", () => {
+  const path = fileURLToPath(new URL("../../scripts/fpmm-diff/collateral_for_shares.jsonl", import.meta.url));
+  const lines = readFileSync(path, "utf8").trim().split("\n");
+  assert.ok(lines.length >= 40);
+  for (const line of lines) {
+    const c = JSON.parse(line) as { args: string[]; collateral_in: string };
+    const [rB, rO, s, fee] = c.args.map(BigInt);
+    assert.equal(collateralForShares(rB, rO, s, fee).toString(), c.collateral_in, line);
+  }
+});
+
+test("collateralForShares is the minimum collateral that buys the target (exhaustive, small reserves)", () => {
+  for (const [rB, rO] of [[50n, 50n], [7n, 90n], [90n, 7n], [1n, 30n]]) {
+    for (const fee of [0n, 100n, 3_000n]) {
+      for (let s = 1n; s <= rB * 2n; s++) {
+        let brute = 1n;
+        while (sharesOrZero(rB, rO, brute, fee) < s) brute++;
+        assert.equal(collateralForShares(rB, rO, s, fee), brute, `rB=${rB} rO=${rO} fee=${fee} s=${s}`);
+      }
+    }
+  }
+});
+
+test("collateralForShares stays minimal on large random pools", () => {
+  let seed = 108n;
+  const next = () => (seed = (seed * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n));
+  for (let i = 0; i < 500; i++) {
+    const rB = (next() % 10n ** 13n) + 1n;
+    const rO = (next() % 10n ** 13n) + 1n;
+    const fee = [0n, 30n, 100n, 250n][Number(next() % 4n)];
+    const s = (next() % (rB * 3n)) + 1n;
+    const c = collateralForShares(rB, rO, s, fee);
+    assert.ok(sharesOrZero(rB, rO, c, fee) >= s);
+    assert.ok(sharesOrZero(rB, rO, c - 1n, fee) < s);
+  }
+});
+
+test("collateralForShares rejects invalid input", () => {
+  assert.throws(() => collateralForShares(0n, 1n, 1n, 0n), MathError);
+  assert.throws(() => collateralForShares(1n, 1n, 0n, 0n), MathError);
+  assert.throws(() => collateralForShares(1n, 1n, 1n, 10_000n), MathError);
+});
 // Same small LCG as math.rs / fpmm_model.py, so the three suites explore a
 // comparable input space without a property-testing dependency.
 function lcg(seed: bigint): () => bigint {

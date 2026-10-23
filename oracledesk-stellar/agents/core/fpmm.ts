@@ -181,6 +181,60 @@ export function collateralOutForShares(
   return mulDivFloor(gross, BPS - feeBps, BPS);
 }
 
+/** Search budget for collateralForShares; the bracket needs far fewer steps. */
+const COLLATERAL_SEARCH_STEPS = 256;
+
+/**
+ * Exact buy-side inverse of calcBuy (#108): the minimum `collateralIn` for
+ * which `calcBuy(rBought, rOther, collateralIn, feeBps).sharesOut` is at
+ * least `sharesTarget`.
+ *
+ * The constant-product solution for the net amount is
+ *   n = (sqrt(b^2 + 4·s·rOther) - b) / 2,  b = rBought + rOther - s,
+ * grossed up for the fee. calcBuy rounds the fee and the new reserve up, so
+ * that estimate can be off by a few units either way; a bracket around it
+ * is then binary-searched against calcBuy itself, which makes the result
+ * exact. sharesOut never decreases as collateralIn grows, so the search is
+ * valid. Mirrors model/fpmm_model.py::collateral_for_shares.
+ */
+export function collateralForShares(rBought: bigint, rOther: bigint, sharesTarget: bigint, feeBps: bigint): bigint {
+  if (sharesTarget <= 0n || rBought <= 0n || rOther <= 0n || feeBps < 0n || feeBps >= BPS) {
+    throw new MathError("invalid input");
+  }
+  const sharesFor = (c: bigint): bigint => {
+    if (c <= 0n) return 0n;
+    try {
+      return calcBuy(rBought, rOther, c, feeBps).sharesOut;
+    } catch (err) {
+      if (err instanceof MathError) return 0n; // too small to buy anything
+      throw err;
+    }
+  };
+  const b = rBought + rOther - sharesTarget;
+  const net = (isqrt(b * b + 4n * sharesTarget * rOther) - b) / 2n;
+  const estimate = mulDivCeil(net > 0n ? net : 1n, BPS, BPS - feeBps);
+
+  // hi: smallest probe known to reach the target; lo: largest known not to.
+  let hi = estimate;
+  let steps = 0;
+  while (sharesFor(hi) < sharesTarget) {
+    hi = hi * 2n + 1n;
+    if (++steps > COLLATERAL_SEARCH_STEPS) throw new MathError("target not reachable");
+  }
+  let lo = hi > 64n ? hi - 64n : 0n;
+  while (lo > 0n && sharesFor(lo) >= sharesTarget) {
+    lo /= 2n;
+    if (++steps > COLLATERAL_SEARCH_STEPS) throw new MathError("search did not converge");
+  }
+  while (hi - lo > 1n) {
+    const mid = (lo + hi) / 2n;
+    if (sharesFor(mid) >= sharesTarget) hi = mid;
+    else lo = mid;
+    if (++steps > COLLATERAL_SEARCH_STEPS) throw new MathError("search did not converge");
+  }
+  return hi;
+}
+
 /**
  * YES price in bps of the pool **after** applying an outcome-relative
  * reserve update (the `newReserve*` pair of a BuyQuote/SellQuote). Mirrors

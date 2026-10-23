@@ -70,16 +70,15 @@ export const Errors = {
    * Cumulative same-ledger movement would exceed `band_bps`.
    */
   22: {message:"PriceBandExceeded"},
-  23: {message:"NoPendingWiring"},
-  24: {message:"InvalidWiring"},
   /**
-   * `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+   * A transfer moved a different amount than requested (fee-on-transfer,
+   * rebasing, or a buggy collateral token).
    */
-  25: {message:"NoPendingAdmin"},
+  23: {message:"CollateralMismatch"},
   /**
-   * A proposed admin handover was not accepted within its `expires_at`.
+   * The contract's collateral balance is below its outstanding obligations.
    */
-  26: {message:"PendingAdminExpired"}
+  24: {message:"Insolvent"}
 }
 
 

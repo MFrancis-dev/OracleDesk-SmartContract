@@ -155,6 +155,16 @@ both legs floor, so total payouts stay within `sets_minted` and a scalar
 market cannot overpay. `get_scalar_meta` exposes the bounds; the meta is
 display-only and never affects payouts.
 
+**Runtime enforcement.** The invariant is no longer just a test
+property. Every collateral movement in market-core goes through a
+checked transfer helper that measures the actual balance delta, and a
+global locked-collateral counter is updated on every inflow and outflow.
+Every market shares one token balance held at the market-core address, so
+the contract no longer trusts that every `token.transfer` moved exactly
+the requested amount.
+
+#### Runtime solvency accounting
+
 **Economics.** LP worst-case loss, the rounding argument and the no-arbitrage
 theorem for this exact integer math are in [fpmm-economics.md](fpmm-economics.md)
 (executable checks: `model/fpmm_bounds.py`).
@@ -172,7 +182,17 @@ Lifecycle: `create_market` / `create_market_with_fees` /
 and LP ownership can change hands at any point via `transfer_position` /
 `transfer_lp`.
 
-### resolver
+The contract maintains a global counter and a per-market figure:
+
+-  `DataKey::TotalLocked` (instance, `i128`, initialised to `0` in the
+    constructor): the sum over all markets of collateral the contract
+    still owes (unredeemed claims plus unswept fees).
+-  `DataKey::Locked(market_id)` (persistent, `ii128`, same TT\ policy as
+    `Market`): the per-market share of that obligation. It is kept in a
+    separate entry so the `Market` XDR layout does not change.
+
+Every collateral movement goes through `transfer_in` / `transfer_out`,
+which measure the actual balance delta around the transfer:
 
 Independent resolution modes, all ultimately calling
 `market_core.resolve(market_id, outcome)`:
@@ -232,6 +252,15 @@ Independent resolution modes, all ultimately calling
   allow fallback signers to propose and attest. If a valid price report arrives before
   the fallback dispute window closes, `resolve_price` immediately supersedes the proposal
   and resolves the market.
+
+-  *Inbound* transfers must increase the contract balance by exactly the
+    requested amount. Any mismatch reverts with `Error::CollateralMismatch`.
+-  *Outbound* transfers must decrease it by exactly the amount (else
+    `CollateralMismatch`), and after the decrement of `TotalLocked` the
+    global guard checks `token.balance(contract) >= TotalLocked`.
+    Otherwise the call reverts with `Error::Insolvent`.
+
+The accounting rules are exactly:
 
 The resolution lifecycle (both modes, the guardian, expiry and market-core's
 status) is model-checked in TLA+; see [formal/README.md](formal/README.md) for
@@ -343,7 +372,16 @@ The resolver never depends on `market-core`'s Rust crate — see
 [ADR 0002](adr/0002-cross-contract-calls.md) for why, and what that trades
 off.
 
-### treasury
+| Site                     | Direction           | `Locked` / `TotalLocked` delta |
+|--------------------------|------------------|------------------------------|
+| `create_market`          | creator -> contract | `+= seed_amount`                |
+| `buy`                     | trader -> contract | `+= collateral_in` (net + fee)      |
+| `sell`                    | contract -> trader | `-= collateral_out`                |
+| `redeem`                  | contract -> holder | `-= payout`                        |
+| `claim_pool_remainder`    | contract -> creator| `-= payout`                       |
+| `sweep_fees`              | contract -> recipient| `-= amount`                        |
+
+Notes on the rules:
 
 Holds the agents' pooled USDC and is the *only* path that spends it: an
 agent calls `agent_create_market` / `agent_buy` / `agent_sell` /
@@ -521,6 +559,21 @@ implemented: it would record provenance only, and the events plus the
 successor's own exposure records are enough for an off-chain dashboard
 ([wave-issue 08](wave-issues/08-treasury-exposure-dashboard.md)).
 
+- `buy` locks `collateral_in = net + fee`, because `net` mints sets and
+  `fee` accrues to the protocol/LP shares. The fee remains inside
+  `locked` until `sweep_fees` / `claim_lp_fees` / `claim_pool_remainder`
+  subtract it — it is never double-counted.
+- `sell` burns gross sets and pays out `collateral_out`; the fee
+  `gross - out` stays in the market's fee accrual, and the locked delta is
+  only the cash actually leaving.
+- `claim_pool_remainder` zeroes the reserves and subtracts the payout
+  from `locked`. After this claim, `sets_minted`+`$fees_accrued` is no
+  longer the correct figure for what the market still owes; the
+  solvency report uses `locked` alone in that state.
+- `sweep_fees` subtracts the swept amount from `locked`.
+- Any negative result returns `Error::Overflow` (with a `debug_assert`
+  in debug builds).
+
 **Permissionless settlement & exposure release (#45).** Settle market capital
 without depending on hot agent keys: `settle_market(caller, market_id)` is
 permissionless and idempotent. It redeems the treasury's outcome-share position if
@@ -565,6 +618,12 @@ is documented at length in `contracts/treasury/src/lib.rs` (see
 `pitfall_agent_buy_requires_treasury_self_authorization_for_nested_transfer`
 in the same file's test module — a test that's been verified to fail
 without the fix and pass with it (see the commit history / docs/STATUS.md).
+
+The global guard is the only check that can be made against the shared
+ledger balance: a per-market figure cannot be verified on-chain because
+the balance is shared across markets. Donations (anyone sending tokens
+directly to the contract) make `balance > TotalLocked`, which is
+normal and must not revert.
 
 #### Treasury cap guarantees
 
@@ -677,13 +736,45 @@ is 9, the same as the treasury's `InsufficientBalance`).
 
 ### reasoning-registry
 
-An admin allow-list of agent addresses; a registered agent calls
-`publish_trace(agent, market_id, action, trace_hash, cid)` to record that a
-trace exists, returning a `trace_id`. `verify_trace(trace_id, candidate_hash)`
-is the check a paying subscriber (via `x402/`) or a frontend runs before
-trusting fetched trace content. Traces are also indexed per market
-(`market_trace_count` / `market_trace_at`) via a counter rather than an
-unbounded `Vec`, so the index never has an unbounded-growth storage cost.
+**Views.** `solvency_report(market_id)` returns a `SolvencyReport`
+with the market's locked collateral, fees accrued, sets minted, and
+ outstanding-claims upper bound (`sets_minted + fees_accrued` while
+open or unclaimed, derived from `locked` alone after the LP claim),
+plus `lp_claimed`. `global_solvency()` returns `(token.balance(contract),
+TotalLocked)`. The per-market figure is an audit aid, not an enforced
+check; the global guard is the enforced one.
+
+**Misbehaving collateral.** A fee-on-transfer or rebasing SEP-41 token, a
+Classic asset whose issuer has `AUTH_CLAWBACK_ENABLED` and claws back
+from the contract, or a buggy custom collateral each make the contract hold
+less than it owes. The balance-delta checks reject fee-on-transfer
+collateral at the first inflow (`CollateralMismatch`). If the issuer claws
+back between transactions, the next outbound transfer trips `Insolvent`.
+That freezes payouts globally — intentional fail-safe behaviour, so the
+shortfall is visible instead of silently draining other markets.
+
+The contract has no upgrade path today (see `scripts/deploy-testnet.sh`), so
+this is a new-deployment-only change: a redeployed market-core starts from
+`TotalLocked = 0`. There is deliberately no admin setter to backfill the
+counter for pre-existing markets, because that would be an obvious
+privileged backdoor.
+
+**Fee split and recipient snapshot.** `create_market` snapshots a
+`FeeTerms { recipient, protocol_share_bps }` side entry per market, so
+`set_treasury` / `set_protocol_fee_share_bps` only affect markets created
+after them. Each trade's fee is split once at accrual time
+(`math::split_fee`, protocol shares round up so `protocol + lp == fee`
+exactly): the protocol portion accumulates in `Market.fees_accrued` and is
+swept to the snapshotted recipient by the permissionless `sweep_fees`(old `FeesSwept` event kept for indexers, plus `FeesSweptTo`); the creator
+portion accumulates in a `LpFees(market_id)` side entry, claimable any time
+(before finality too) via `claim_lp_fees`, and also drained by
+`claim_pool_remainder`. Markets created before this change have no
+`FeeTerms` entry and fall back to the old behavior: recipient = whatever
+`DataKey::Treasury` Holds at sweep time, `protocol_share_bps = 10_000` —
+fully backward compatible, no migration transaction needed. The separate
+LP balance (rather than adding fees to the reserves) is deliberate: it does
+not move `k` or the price and maps directly onto the per-LP fee accumulator
+of the future multi-LP design ([wave-issue 02](wave-issues/02-multi-lp-liquidity.md)).
 
 #### Agent Lifecycle and Trace Annotations (#56)
 
@@ -804,6 +895,42 @@ no admin.
   trade under the market's price-impact breaker when one is configured.
 - **packages/bindings/**: generated TypeScript clients (`scripts/gen-bindings.sh`).
 
+**Trade bounds and circuit breakers.** Two layers of protection beyond the
+share-count slippage parameters:
+
+- *Deadline + limit price* (#12): `buy_v2` / `sell_v2` take a
+  `deadline` (ledger **timestamp**, unix seconds) checked before anything
+  else, and a `limit_price_bps` bounding the **average execution price**
+  (`collateral_in / shares_out` for buys, `collateral_out / shares_in` for
+  sells, fee included, compared by cross-multiplication). `0` means "no
+  limit" for buys; for sells it is trivially satisfied and buys no
+  protection. The original `buy` / `sell` remain as thin wrappers for
+  backward compatibility (same body, no bounds).
+- *Per-market breakers* (#10): `BreakerConfig { max_impact_bps, band_bps }`
+  is snapshotted per market from an admin default (`set_default_breaker`,
+  which rejects `band_bps < max_impact_bps` because that makes one trade
+  cover the whole band). `max_impact_bps` bounds a single trade's
+  |post − pre| YES-price move (`>` — a trade moving exactly the cap
+  passes); `band_bps` bounds |post − ledger-open price|, with the reference
+  stored in short-TTL **temporary** storage keyed by ledger sequence, so it
+  resets by itself every ledger. 0 disables either check; legacy markets
+  have no config and are unaffected. Breaker trips revert with
+  `PriceImpactTooHigh` / `PriceBandExceeded` and — because Soroban rolls
+  back an invocation's events on `Err` — emit **no** event (the error codes
+  and the `would_trip`` / `breaker_config` / `breaker_state` views are the
+  observability path; see the comment on `check_breakers`).
+
+  *Worst-case lock cost.* The band cannot be ratcheted: the reference is
+  the ledger-open price, so an attacker who pushes the price to the band
+  edge only blocks further trades for the rest of that ledger (~5 s) —
+  and pays the trading fee plus price impact to do it, which are both
+  retained by the pool.
+
+**Resolution and payouts.** `resolve(market_id, outcome)` sets the
+final outcome once. `redeem` pays `payout` for a winning position and
+burns it; `lp_claimed` gates `claim_pool_remainder`, which pays the
+creator the residual value of the reserves and zeroes them. Both payouts
+ are subject to the checked transfer and global solvency guard.
 
 ### IPFS trace storage
 
@@ -844,6 +971,102 @@ With `multiformats`:
 `Buffer.from(CID.parse(cid).multihash.digest).toString("hex") === trace_hash`.
 After fetching, `sha256(body) === trace_hash`, as `x402/trace-verification.ts`
 checks, proves the bytes are the ones the agent committed to.
+
+### Event triggers (agents) vs. the event indexer
+
+`agents/core/events/` (#105) lets agents react to contract events instead
+of waiting for their next scheduled run. It is a **trigger system, not an
+indexer**, and the two must not be confused:
+
+| | Event triggers (`agents/core/events`) | Event indexer (`docs/wave-issues/06-event-indexer.md`) |
+| --- | --- | --- |
+| Purpose | Wake an agent when something it cares about happens | Durable, queryable history for UIs and analytics |
+| Storage | One checkpoint per network and contract set: `{cursor, lastLedger}` plus recently processed event ids, in `EVENTS_STATE_DIR` | Every event, in Postgres |
+| History | None. Starts at the latest ledger; never replays | Replayable from any ledger it has stored |
+| Retention gap | Detected; triggers a full state resync from chain reads | Is the thing it exists to cover |
+| Source of truth | Chain state, re-read before every action | Its own tables |
+
+Flow: `EventSubscriber` polls `getEvents` (cursor pagination, filters
+checked against the RPC's limits, failed contract calls dropped) and hands
+each page to the `Dispatcher`. Events are decoded with the binding specs
+(`decode.ts`, via the SDK's `Spec.parseEvent`) into a typed
+`OracleDeskEvent`, with an `Unknown` variant for anything else.
+
+- **At-least-once delivery.** A page's checkpoint is written only after
+  every handler finished (or the event was dead-lettered). A crash in
+  between redelivers the page, so handlers are idempotent and an LRU of
+  processed ids, saved with the checkpoint, drops repeats.
+- **Ordering.** One market's events run in order; different markets run
+  concurrently up to `EVENTS_CONCURRENCY`.
+- **Failures.** A handler is retried with exponential backoff up to
+  `EVENTS_MAX_ATTEMPTS`, then the event goes to
+  `<EVENTS_STATE_DIR>/dead-letter.jsonl` and the page moves on.
+- **Idle polls** still advance `lastLedger`, so a quiet stretch is not
+  mistaken for a retention gap.
+
+Handlers (`handlers.ts`): `TradeReevaluate` queues a market for the trader
+after a trade of at least `EVENTS_TRADE_THRESHOLD` stroops (re-reading the
+market first); `ProposalWatch` alerts on a `ResolutionProposed` where the
+treasury holds a position and the resolver still reports the proposal as
+standing (cancellations emit no event), with the dispute deadline computed
+from the proposal's ledger timestamp; `FinalityTracker` marks markets final
+on `MarketResolved`, `ResolutionFinalized` or `PriceResolution`; and the
+resync handler re-evaluates every tradable market after a gap.
+
+`npm run trader -- --follow` runs this loop (`runtime/follow.ts`); without
+`--follow` the trader behaves exactly as before.
+
+### Cross-market arbitrage (agents, #108)
+
+Independent FPMM pools can price related markets inconsistently. With
+`ARB_ENABLED=1` the trader runs an `arbitrage` task
+(`runtime/tasks/arbitrage.ts`) over the relations in `ARB_RELATIONS_FILE`:
+
+```json
+{ "relations": [ { "id": "btc-100k-implies-90k", "type": "implies", "a": 12, "b": 7,
+    "resolution": { "a": { "mechanism": "price", "source": "reflector:BTC/USD" },
+                    "b": { "mechanism": "price", "source": "reflector:BTC/USD" } },
+    "voidCorrelation": "joint", "maxCloseSkewSecs": 0 } ] }
+```
+
+- **Relations** (`core/strategies/arbitrage.ts`): `implies` (P(A) <= P(B)),
+  `complement` (P(A) + P(B) = 1) and `exclusive` (P(A) + P(B) <= 1). A
+  relation is rejected unless both markets exist and are open, their close
+  times are within `maxCloseSkewSecs`, and both declare the *same*
+  resolution mechanism and source; a declared `resolutionHash` must equal
+  the market's on-chain commitment. The file's canonical sha256 (the graph
+  hash) is recorded in every trace.
+- **Planning**: for each pair of legs, a payoff table over every outcome the
+  relation allows, plus void scenarios (`joint`: both void together;
+  `independent`: either may void alone, paying half per share), gives the
+  worst-case payout, measured on top of existing treasury holdings. Costs
+  are exact integer FPMM collateral (`collateralForShares`: fees, price
+  impact and rounding). The share count is found by integer ternary search
+  and a +/-64 verification scan, inside `max_trade`, remaining `max_market`
+  headroom, the rolling `max_daily` and `ARB_MAX_NOTIONAL`, and must clear
+  `ARB_MIN_PROFIT_STROOPS` and `ARB_MIN_PROFIT_BPS`.
+- **Risk** (`core/risk.ts`, `checkArbPlan`): treasury caps and existing
+  exposure; `ARB_MARKET_HEADROOM_BPS` of each market's `max_market` kept free
+  for later hedges; `ARB_MAX_UNHEDGED_STROOPS` caps the first leg, which is
+  the exposure left if the second never fills; `ARB_MAX_OPEN_LEGS` and
+  `ARB_MAX_UNWIND_RETRIES` bound concurrent legs and unwind attempts.
+- **Execution** (`core/strategies/arb-executor.ts`): treasury calls are not
+  atomic, so the legs are sequential. The less liquid market goes first,
+  re-quoted and bought with `min_shares_out` = the planned shares. The second
+  market is then re-read; if its cost rose by more than `ARB_MAX_LEG_LOSS`
+  the first leg is sold back with `agent_sell`, otherwise the second leg is
+  bought. Every step is journaled before and after submission in
+  `ARB_JOURNAL_FILE`, and the next run finishes or unwinds any plan a crash
+  interrupted, settling ambiguous submissions from the treasury's positions.
+  A trace with the relation, graph hash, snapshots, plan and leg results is
+  published when a plan completes or is unwound. Dry-run only plans and logs.
+
+**Residual risks.** Between the legs the treasury holds one side naked: a
+fast move can cost up to `ARB_MAX_LEG_LOSS` plus the unwind's price impact,
+and if every unwind attempt fails the leg stays open (`ARB_UNHEDGED` is
+logged and the plan closes as `unwind-failed`). The relation file is
+trusted: a wrong relation produces confident, wrong trades, which is why
+compatibility must be declared and is checked against the chain.
 
 ## Known limitations (see docs/STATUS.md for the full, current list)
 

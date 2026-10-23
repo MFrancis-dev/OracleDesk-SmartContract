@@ -10,6 +10,12 @@
 import { BPS } from "../../core/fpmm.js";
 import { decideTrade, type MarketState } from "../../core/strategy.js";
 import { buildTrace, type TraceStore } from "../../core/trace.js";
+import {
+  isDueDiligenceApproved,
+  rejectChangedState,
+  unavailableDueDiligence,
+  type DueDiligenceVerdict,
+} from "../../core/due-diligence.js";
 import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { Task, TaskContext } from "../runtime.js";
 import { publishPendingTraces, recordPendingTrace } from "./traces.js";
@@ -25,7 +31,8 @@ export interface TraderCandidate {
 }
 
 export interface TraderDeps {
-  adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace">;
+  adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace"> &
+    Partial<Pick<StellarAdapter, "currentFeeBps">>;
   traceStore: TraceStore;
   candidates: () => Promise<TraderCandidate[]>;
   /** This deployment's treasury contract id (creator of our own markets). */
@@ -36,10 +43,22 @@ export interface TraderDeps {
   deadlineSecs: number;
   /** Unix seconds. */
   nowSecs: () => number;
+  /**
+   * Must re-read and verify current on-chain state, metadata, commitments,
+   * resolution viability, and applicable trust policy. Missing verifier
+   * configuration rejects trades.
+   */
+  dueDiligence?: (marketId: bigint) => Promise<DueDiligenceVerdict>;
 }
 
 export const TRADES = "trader.trades";
 export const EVALUATED = "trader.markets";
+
+async function verifyTrade(deps: TraderDeps, marketId: bigint, nowSecs: () => number): Promise<DueDiligenceVerdict> {
+  return deps.dueDiligence
+    ? deps.dueDiligence(marketId)
+    : unavailableDueDiligence(marketId, nowSecs() * 1000);
+}
 
 /** The pre-chain-state demo pair (YES at 40% vs fair 60%). */
 export async function fixtureCandidates(nowSecs: number): Promise<TraderCandidate[]> {
@@ -65,16 +84,6 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
       ctx.log.info("TRADER_DECISION", { market: market.marketId, action: decision.action, reasoning: decision.reasoning });
       if (decision.action === "skip") return;
 
-      const built = buildTrace({
-        agent: "trader",
-        marketId: market.marketId,
-        action: "buy",
-        reasoning: decision.reasoning,
-        inputs: { market, fairValueBps, decision },
-      });
-      const { cid } = await deps.traceStore.put(built.hash, built.json);
-      ctx.log.info("TRADER_TRACE", { trace: built.hash, cid });
-
       const outcome = { tag: decision.outcome!, values: undefined as void };
       const collateralIn = decision.collateralInStroops!;
       const quoted = await deps.adapter.quoteBuy({ market_id: BigInt(market.marketId), outcome, collateral_in: collateralIn });
@@ -84,11 +93,47 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
       ctx.log.info("TRADER_QUOTE", { quoted, minSharesOut, limitPriceBps, deadline });
       if (ctx.signal.aborted) return;
 
+      const verdict = await verifyTrade(deps, BigInt(market.marketId), deps.nowSecs);
+      const approved = isDueDiligenceApproved(verdict, String(market.marketId), ctx.now());
+      ctx.log.info("TRADER_DUE_DILIGENCE", { market: market.marketId, verdict });
+      const built = buildTrace({
+        agent: "trader",
+        marketId: market.marketId,
+        action: approved ? "buy" : "skip",
+        reasoning: approved
+          ? decision.reasoning
+          : `trade rejected by due diligence: ${verdict.reasons.map((reason) => reason.code).join(", ")}`,
+        inputs: { market, fairValueBps, decision, dueDiligence: verdict },
+      });
+      const { cid } = await deps.traceStore.put(built.hash, built.json);
+      ctx.log.info("TRADER_TRACE", { trace: built.hash, cid });
+
+      if (!approved) {
+        if (live) {
+          recordPendingTrace(ctx, {
+            marketId: BigInt(market.marketId),
+            action: "skip",
+            traceHash: built.hash,
+            cid,
+          });
+          await publishPendingTraces(deps.adapter, ctx);
+        }
+        return;
+      }
+
       const key = `${market.marketId}:${built.hash}`;
       if (live) ctx.state.set(TRADES, key, { status: "intent", at: ctx.now() });
-      const result = await ctx.submit(
-        () =>
-          deps.adapter.agentBuyV2({
+      const submission = await ctx.submit(async () => {
+        const observedVerdict = await verifyTrade(deps, BigInt(market.marketId), deps.nowSecs);
+        const finalVerdict = observedVerdict.stateFingerprint === verdict.stateFingerprint
+          ? observedVerdict
+          : rejectChangedState(observedVerdict);
+        if (!isDueDiligenceApproved(finalVerdict, String(market.marketId), ctx.now())) {
+          return { kind: "rejected" as const, verdict: finalVerdict };
+        }
+        return {
+          kind: "submitted" as const,
+          result: await deps.adapter.agentBuyV2({
             market_id: BigInt(market.marketId),
             outcome,
             collateral_in: collateralIn,
@@ -96,8 +141,30 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
             limit_price_bps: limitPriceBps,
             deadline,
           }),
-        `buy:${key}`,
-      );
+        };
+      }, `buy:${key}`);
+      if (submission.kind === "rejected") {
+        const rejectedTrace = buildTrace({
+          agent: "trader",
+          marketId: market.marketId,
+          action: "skip",
+          reasoning: `trade rejected by final due-diligence recheck: ${submission.verdict.reasons.map((reason) => reason.code).join(", ")}`,
+          inputs: { market, fairValueBps, decision, dueDiligence: submission.verdict },
+        });
+        const rejectedTraceStore = await deps.traceStore.put(rejectedTrace.hash, rejectedTrace.json);
+        ctx.log.warn("TRADER_DUE_DILIGENCE_REJECTED", { market: market.marketId, verdict: submission.verdict });
+        if (live) {
+          recordPendingTrace(ctx, {
+            marketId: BigInt(market.marketId),
+            action: "skip",
+            traceHash: rejectedTrace.hash,
+            cid: rejectedTraceStore.cid,
+          });
+          await publishPendingTraces(deps.adapter, ctx);
+        }
+        return;
+      }
+      const result = submission.result;
       ctx.log.info("TRADER_BUY", { result });
       if (result.dryRun) return;
       ctx.state.set(TRADES, key, { status: "done", shares: result.value, at: ctx.now() });
