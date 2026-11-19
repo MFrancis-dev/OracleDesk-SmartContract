@@ -160,12 +160,16 @@ redeploy fresh addresses at any time).
 | resolver | `CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR` | [View](https://stellar.expert/explorer/testnet/contract/CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR) |
 | treasury | `CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB` | [View](https://stellar.expert/explorer/testnet/contract/CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB) |
 | reasoning-registry | `CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M` | [View](https://stellar.expert/explorer/testnet/contract/CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M) |
-| USDC (self-issued test asset) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
+| USDC (`self-issued` default; configurable via `COLLATERAL_MODE=existing`) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
 
-The USDC above is a **self-issued testnet asset** (a real SEP-41 Stellar
-Asset Contract, 7 decimals) — not Circle's testnet USDC. No real USDC
-issuer address is hardcoded anywhere in this repo; see
-[`docs/STATUS.md`](oracledesk-stellar/docs/STATUS.md) for why.
+The deployment above uses `COLLATERAL_MODE=self-issued` (a self-issued 7-decimal
+SEP-41 Stellar Asset Contract). To deploy against Circle's official Stellar
+testnet USDC (or another 7-decimal classic asset SAC), pass
+`COLLATERAL_MODE=existing` and `COLLATERAL_ASSET=USDC:<issuer>` to
+`scripts/deploy-testnet.sh` — see
+[`oracledesk-stellar/docs/collateral.md`](oracledesk-stellar/docs/collateral.md)
+for the verified Circle issuer citation, issuer-flag checks, trustlines and
+faucet funding steps.
 
 ---
 

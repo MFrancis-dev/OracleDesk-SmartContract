@@ -300,11 +300,15 @@ anywhere under `oracledesk-stellar/`.
   Reflector's own current docs in this session (no browsing tool was
   used for this). The demo uses **signer mode** instead, which needs no
   external oracle. See `docs/wave-issues/05-reflector-feed-discovery.md`.
-- **A real testnet USDC issuer** (e.g. Circle's): not used. `scripts/
-  deploy-testnet.sh` deploys a **self-issued** test "USDC" (a real SEP-41
-  Stellar Asset Contract, 7 decimals, matching the design doc) rather than
-  guessing at a real issuer's address. This is called out as a
-  `TODO(maintainer)` in `scripts/deploy-testnet.sh` and `.env.example`.
+- **A real testnet USDC issuer** (Circle's): `scripts/deploy-testnet.sh` now
+  supports `COLLATERAL_MODE=existing` with
+  `COLLATERAL_ASSET=USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+  (verified against Circle's official testnet docs — see `docs/collateral.md`),
+  including pre-deploy SAC verification (`decimals == 7`), Horizon issuer flag
+  checks, idempotent G-account trustlines, `deposit`-based treasury funding and
+  `FORCE_REDEPLOY=1` switch protection. Default remains `COLLATERAL_MODE=self-issued`
+  so zero-faucet local/demo runs still work; live Circle faucet `make demo`
+  execution requires interactive faucet funding.
 - **Actually buying a trace through x402** (payment settlement via a real
   facilitator): not attempted. No x402-on-Stellar facilitator URL is known
   or hardcoded anywhere in this repo; finding and verifying one needs
@@ -359,9 +363,11 @@ markers in the files themselves:
 - `CODE_OF_CONDUCT.md` — a direct contact channel alongside GitHub's
   security-advisory reporting path, if wanted.
 - `CONTRIBUTING.md` — an expected PR review turnaround.
-- `scripts/deploy-testnet.sh` / `.env.example` — whether to switch the
-  testnet collateral token from the self-issued test USDC to Circle's real
-  testnet USDC issuer (needs verifying their current testnet address).
+- `scripts/deploy-testnet.sh` / `.env.example` — Circle's official Stellar
+  testnet USDC issuer (`GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`,
+  verified 2026-11-19) is now supported via `COLLATERAL_MODE=existing` (see
+  `docs/collateral.md`); switching the default testnet deployment remains a
+  maintainer decision (requires faucet funding and `FORCE_REDEPLOY=1`).
 - `.env.example` — the x402-on-Stellar facilitator URL to use for real
   payment settlement (none is hardcoded or guessed anywhere in this repo).
 
