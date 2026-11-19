@@ -94,7 +94,7 @@ for entry in "${CONTRACTS[@]}"; do
     "$OUT_DIR/$pkg_name/package.json" >"$tmp"
   mv "$tmp" "$OUT_DIR/$pkg_name/package.json"
   CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
-    extract --wasm "$WASM_DIR/$wasm_name.wasm" --contract "$pkg_name" > "$OUT_DIR/$pkg_name/interface.json"
+    extract --wasm "$WASM_DIR/$wasm_name.wasm" --contract "$pkg_name" >"$OUT_DIR/$pkg_name/interface.json"
 done
 
 echo "==> done. See $OUT_DIR/*/README.md for per-package usage." >&2

@@ -157,3 +157,23 @@ jobs:
         run: |
           cd agents
           npm run test:chaos
+
+  scripts:
+    name: Shell scripts (bats, shellcheck, shfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned shellcheck and shfmt
+        run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz -o /tmp/sc.tar.xz
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sudo mv /tmp/shellcheck-v0.10.0/shellcheck /usr/local/bin/shellcheck
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64 -o /tmp/shfmt
+          chmod +x /tmp/shfmt
+          sudo mv /tmp/shfmt /usr/local/bin/shfmt
+      - name: ShellCheck
+        run: shellcheck scripts/deploy-testnet.sh scripts/seed-market.sh scripts/demo.sh scripts/gen-bindings.sh scripts/create-issues.sh scripts/test/stubs/*
+      - name: shfmt
+        run: shfmt -i 2 -ci -d scripts/deploy-testnet.sh scripts/seed-market.sh scripts/demo.sh scripts/gen-bindings.sh scripts/create-issues.sh scripts/test/stubs/*
+      - name: Run bats script tests
+        run: make test-scripts
