@@ -150,21 +150,60 @@ if [ "$MODE" = "price" ]; then
     echo "error: failed to parse market_id/close_time from seed-market.sh output" >&2
     exit 1
   fi
-  # Align price timestamp to the oracle resolution slot when resolution() is available.
+  echo "### 2/5 wait for close"
+  wait_until "$((CLOSE_TIME + 1))" || "$SLEEP" "$((CLOSE_IN_SECONDS + 2))"
+
+  # Align price timestamp to the oracle resolution slot after close so
+  # test-oracle's FutureTimestamp check passes and slot <= close_time.
   ORACLE_RES=$(read_only "$ORACLE" resolution 2>/dev/null || echo 1)
   if [[ "$ORACLE_RES" =~ ^[0-9]+$ ]] && [ "$ORACLE_RES" -gt 1 ]; then
     PRICE_SLOT=$((CLOSE_TIME - (CLOSE_TIME % ORACLE_RES)))
-    echo "oracle resolution=${ORACLE_RES}s; posting price at aligned slot $PRICE_SLOT (raw close_time=$CLOSE_TIME)"
+    ALIGN_OFFSET=$((CLOSE_TIME - PRICE_SLOT))
+    if [ "$ALIGN_OFFSET" -gt 0 ]; then
+      echo "note: close_time=$CLOSE_TIME was ${ALIGN_OFFSET}s off the ${ORACLE_RES}s oracle grid; posting price at aligned slot $PRICE_SLOT (requires max_staleness >= ${ORACLE_RES}s)"
+    else
+      echo "note: close_time=$CLOSE_TIME landed exactly on the ${ORACLE_RES}s oracle grid (slot $PRICE_SLOT)"
+    fi
   else
     PRICE_SLOT=$CLOSE_TIME
   fi
-  # Price timestamp must be <= close_time and inside max_staleness.
-  invoke "$ORACLE" "$DEPLOYER_KEY" set_price --asset '{"Other":"XLM"}' --timestamp "$PRICE_SLOT" --price 2100
-  echo "### 2/5 wait for close"
-  wait_until "$((CLOSE_TIME + 1))" || "$SLEEP" "$((CLOSE_IN_SECONDS + 2))"
-  echo "### 3/5 resolve via price"
+  echo "### 3/5 post price at aligned slot $PRICE_SLOT and resolve via price"
+  invoke "$ORACLE" "$DEPLOYER_KEY" set_price --asset '{"Other":"XLM"}' --price 2100 --timestamp "$PRICE_SLOT"
   OUTCOME=$(invoke "$RESOLVER" "$AGENT_KEY" resolve_price --market_id "$MARKET_ID")
   echo "resolved outcome: $OUTCOME"
+  if [ "$(printf '%s' "$OUTCOME" | tr -d '"[:space:]')" != "Yes" ]; then
+    echo "FAILED: expected price-mode outcome Yes, got $OUTCOME" >&2
+    exit 1
+  fi
+
+  echo "### 4/5 publish and verify reasoning trace"
+  TRACE_JSON=$(mktemp)
+  cat >"$TRACE_JSON" <<TRACE
+{"agent":"market-maker","market_id":$MARKET_ID,"action":"create_market","mode":"price","reasoning":"OracleDesk price-mode demo run via scripts/demo.sh.","timestamp":$(now_epoch)}
+TRACE
+  if command -v sha256sum >/dev/null 2>&1; then
+    TRACE_HASH=$(sha256sum "$TRACE_JSON" | cut -d' ' -f1)
+  elif command -v shasum >/dev/null 2>&1; then
+    TRACE_HASH=$(shasum -a 256 "$TRACE_JSON" | cut -d' ' -f1)
+  else
+    TRACE_HASH=$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$TRACE_JSON")
+  fi
+  echo "trace hash: $TRACE_HASH"
+  TRACE_CID=${TRACE_CID:-oracledesk-price-demo-trace.json}
+  TRACE_DIR=${TRACE_DIR:-deployments/traces-$NETWORK}
+  mkdir -p "$TRACE_DIR"
+  cp "$TRACE_JSON" "$TRACE_DIR/$TRACE_CID"
+  TRACE_ID=$(invoke "$REGISTRY" "$AGENT_KEY" publish_trace \
+    --agent "$AGENT" --market_id "$MARKET_ID" --action CreateMarket \
+    --trace_hash "$TRACE_HASH" --ipfs_cid "\"$TRACE_CID\"")
+  echo "trace id: $TRACE_ID"
+  VERIFIED=$(read_only "$REGISTRY" verify_trace --trace_id "$TRACE_ID" --received_hash "$TRACE_HASH")
+  echo "verify_trace(correct hash) = $VERIFIED"
+  rm -f "$TRACE_JSON"
+  if [ "$VERIFIED" != "true" ]; then
+    echo "FAILED: trace hash did not verify" >&2
+    exit 1
+  fi
 else
   echo "### 1/6 create + seed market (treasury.agent_create_market)"
   SEED_OUT=$(NETWORK="$NETWORK" IDENTITY_PREFIX="$IDENTITY_PREFIX" DEPLOYMENTS="$DEPLOYMENTS" \

@@ -63,3 +63,17 @@ SH
   assert_failure
   assert_output --partial "failed to parse market_id/close_time"
 }
+
+@test "price_mode_aligns_slot_and_resolves" {
+  SLEEP=true NOW_CMD="echo 4000000000" run "$WORK_REPO/scripts/demo.sh" --mode price
+  assert_success
+  assert_output --partial "final market status: resolved"
+  assert_output --partial "mode=price"
+
+  run grep -q 'set_price --asset {"Other":"XLM"} --price 2100 --timestamp' "$STUB_LOG"
+  assert_success
+  run grep -q 'resolve_price --market_id 1' "$STUB_LOG"
+  assert_success
+  run grep -q 'verify_trace' "$STUB_LOG"
+  assert_success
+}

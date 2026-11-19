@@ -14,7 +14,7 @@ teardown() {
   run "$WORK_REPO/scripts/gen-bindings.sh"
   assert_success
 
-  for pkg in market-core resolver reasoning-registry treasury timelock router; do
+  for pkg in market-core resolver reasoning-registry treasury timelock router test-oracle; do
     assert_equal "$(jq -r '.name' "$WORK_REPO/packages/bindings/$pkg/package.json")" "@oracledesk/bindings-$pkg"
     assert [ -f "$WORK_REPO/packages/bindings/$pkg/interface.json" ]
   done

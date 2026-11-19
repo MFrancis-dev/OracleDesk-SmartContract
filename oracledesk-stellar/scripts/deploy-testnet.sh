@@ -206,12 +206,8 @@ ensure_trustline() {
 }
 
 # --- wasm must already be built -------------------------------------------
-EXTRA_WASM=""
-if [ "$NETWORK" = "local" ]; then
-  EXTRA_WASM="test_oracle"
-fi
 WASM_MISSING=0
-for f in market_core resolver reasoning_registry treasury timelock router $EXTRA_WASM; do
+for f in market_core resolver reasoning_registry treasury timelock router test_oracle; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     log "missing $WASM_DIR/$f.wasm — building all contracts first"
     WASM_MISSING=1
@@ -629,20 +625,29 @@ else
   fi
 fi
 
-# --- test oracle (testnet or local, #133) -----------------------------------
-if [ "$NETWORK" = "local" ] || [ "${DEPLOY_TEST_ORACLE:-0}" = "1" ]; then
+# --- test oracle (testnet and local only; never mainnet, #133) --------------
+# Deployed with Reflector-aligned defaults (USD base, 14 decimals, 300s
+# resolution, 86400s retention) and XLM registered as a supported asset.
+TEST_ORACLE_DECIMALS=${TEST_ORACLE_DECIMALS:-14}
+TEST_ORACLE_RESOLUTION=${TEST_ORACLE_RESOLUTION:-300}
+TEST_ORACLE_PERIOD=${TEST_ORACLE_PERIOD:-86400}
+if [ "$NETWORK" = "testnet" ] || [ "$NETWORK" = "local" ]; then
   TEST_ORACLE=$(json_get .contracts.test_oracle)
   [ -n "$TEST_ORACLE" ] || TEST_ORACLE=$(predict_id "$TEST_ORACLE_SALT")
   json_set_str ".salts.test_oracle" "$TEST_ORACLE_SALT"
   if [ "$(json_get .contracts.test_oracle)" = "" ]; then
-    log "deploying test oracle at deterministic address $TEST_ORACLE"
+    log "deploying SEP-40 test oracle at deterministic address $TEST_ORACLE"
     DEPLOYED=$(stellar contract deploy \
       --wasm "$WASM_DIR/test_oracle.wasm" \
       --salt "$TEST_ORACLE_SALT" \
       --source-account "$DEPLOYER_KEY" \
       --network "$NETWORK" \
       -- \
-      --admin "$ADMIN")
+      --admin "$ADMIN" \
+      --base '{"Other":"USD"}' \
+      --decimals "$TEST_ORACLE_DECIMALS" \
+      --resolution "$TEST_ORACLE_RESOLUTION" \
+      --period "$TEST_ORACLE_PERIOD")
     if [ "$DEPLOYED" != "$TEST_ORACLE" ]; then
       echo "error: test oracle landed at $DEPLOYED, expected $TEST_ORACLE" >&2
       exit 1
@@ -650,6 +655,14 @@ if [ "$NETWORK" = "local" ] || [ "${DEPLOY_TEST_ORACLE:-0}" = "1" ]; then
     json_set_str ".contracts.test_oracle" "$TEST_ORACLE"
   else
     log "test oracle already deployed: $TEST_ORACLE"
+  fi
+  if [ "$(json_get .test_oracle_assets_seeded)" != "true" ]; then
+    log "registering default asset Other(XLM) on test oracle"
+    if admin_invoke "$TEST_ORACLE" add_asset --asset '{"Other":"XLM"}'; then
+      json_set_raw ".test_oracle_assets_seeded" "true"
+    fi
+  else
+    log "test oracle default assets already registered"
   fi
 fi
 

@@ -60,7 +60,7 @@ The active implementation is [`oracledesk-stellar/`](oracledesk-stellar/):
 
 ```
 oracledesk-stellar/
-├── contracts/            market-core, resolver, treasury, reasoning-registry
+├── contracts/            market-core, resolver, treasury, reasoning-registry, test-oracle
 ├── model/fpmm_model.py   Python mirror of the FPMM math, property-tested
 ├── x402/                 the paid trace API (Express + @x402/*)
 ├── agents/               core/ (strategy + trace building), stellar/ (adapter), bin/ (CLIs)

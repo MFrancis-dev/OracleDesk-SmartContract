@@ -7,7 +7,7 @@
 # agents/ and x402/ install, since both depend on them by local file: path
 # and need real type declarations, not just a package.json, to typecheck.
 setup:
-	for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+	for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
 		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
 	done
 	cd agents && npm install
@@ -121,7 +121,7 @@ clean:
 # Compare to the PR target, not the contributor fork's tracking branch.
 INTERFACE_BASE_REF ?= upstream/develop
 interface-check:
-	@for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+	@for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
 		CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
 		check --pkg-dir packages/bindings/$$pkg --base-ref "$(INTERFACE_BASE_REF)" || exit 1; \
 	done

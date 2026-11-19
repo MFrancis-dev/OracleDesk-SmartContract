@@ -293,13 +293,14 @@ anywhere under `oracledesk-stellar/`.
 
 ## Blocked / not attempted
 
-- **Reflector (SEP-40) price-mode resolution on live testnet**: `resolver`'s
-  `PriceThreshold` mode is implemented and unit-tested (with a mock
-  reflector), but no real testnet Reflector contract address was used
-  anywhere — there was no way to look one up and verify it against
-  Reflector's own current docs in this session (no browsing tool was
-  used for this). The demo uses **signer mode** instead, which needs no
-  external oracle. See `docs/wave-issues/05-reflector-feed-discovery.md`.
+- **Reflector (SEP-40) price-mode resolution on live testnet**: `contracts/test-oracle`
+  is now a workspace member implementing the full SEP-40 read interface with
+  resolution-slot alignment and retention pruning (see `docs/test-oracle.md`).
+  `resolver` price-mode tests execute against the real `test-oracle` contract,
+  `deploy-testnet.sh` deploys `test-oracle` on testnet/local only, and
+  `MODE=price ./scripts/demo.sh` exercises the full commit -> reveal -> aligned
+  `set_price` -> `resolve_price` -> trace flow. Production Reflector testnet
+  feed discovery remains tracked in `docs/wave-issues/05-reflector-feed-discovery.md`.
 - **A real testnet USDC issuer** (Circle's): `scripts/deploy-testnet.sh` now
   supports `COLLATERAL_MODE=existing` with
   `COLLATERAL_ASSET=USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`

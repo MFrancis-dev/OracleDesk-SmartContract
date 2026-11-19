@@ -6871,4 +6871,106 @@ mod golden {
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #133: deployable SEP-40 test-oracle integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oracle_asset_xdr_matches_test_oracle_asset() {
+        let env = Env::default();
+        let sym = Symbol::new(&env, "XLM");
+        let addr = Address::generate(&env);
+
+        assert_eq!(
+            OracleAsset::Other(sym.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Other(sym).to_xdr(&env),
+        );
+        assert_eq!(
+            OracleAsset::Stellar(addr.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Stellar(addr).to_xdr(&env),
+        );
+    }
+
+    #[test]
+    fn price_mode_resolves_with_sep40_test_oracle() {
+        // Off-boundary close_time (2_150) with resolution = 300 => slot = 2_100,
+        // staleness delta = 50 <= max_staleness (300).
+        let f = fixture_at(2_150, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 300,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        // Advance past close_time so both test-oracle's FutureTimestamp check
+        // and resolver's MarketNotClosed check pass.
+        f.env.ledger().set_timestamp(2_200);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let outcome = f.resolver.resolve_price(&f.market_id);
+        assert_eq!(outcome, Outcome::Yes);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes),
+        );
+    }
+
+    #[test]
+    fn price_mode_stale_when_staleness_below_resolution() {
+        // Off-boundary close_time (2_250) with resolution = 300 => aligned slot
+        // is 2_100 (delta = 150s), which exceeds max_staleness = 60s.
+        let f = fixture_at(2_250, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 60,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        f.env.ledger().set_timestamp(2_300);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+        assert_eq!(err.unwrap(), Error::StalePrice);
+    }
 }
