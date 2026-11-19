@@ -395,6 +395,9 @@ pub enum Error {
     NotSupported = 30,
     /// A batch call carried no ids or more than `MAX_BATCH` of them.
     BatchTooLarge = 31,
+    /// Inbound collateral transfer delivered fewer (or different) units than
+    /// expected, e.g. a fee-on-transfer or under-delivering token (#137).
+    CollateralShortfall = 32,
 }
 
 impl From<MathError> for Error {
@@ -948,7 +951,7 @@ impl MarketCore {
             market.close_time,
         );
 
-        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
+        Self::pull_collateral(&env, &creator, seed_amount)?;
 
         MarketCreated {
             market_id: id,
@@ -1118,7 +1121,7 @@ impl MarketCore {
         }
 
         // interaction
-        Self::token(&env)?.transfer(&trader, env.current_contract_address(), &collateral_in);
+        Self::pull_collateral(&env, &trader, collateral_in)?;
 
         Trade {
             market_id,
@@ -2049,6 +2052,25 @@ impl MarketCore {
     fn require_resolver(env: &Env) -> Result<(), Error> {
         let resolver: Address = Self::instance_get(env, &DataKey::Resolver)?;
         resolver.require_auth();
+        Ok(())
+    }
+
+    /// Transfers `amount` from `from` into this contract and verifies that the
+    /// contract's observed collateral balance increased by exactly `amount`.
+    /// Rejects fee-on-transfer / under-delivering tokens before they can break
+    /// the solvency invariant (`balance == sets_minted + fees_accrued`, #137).
+    fn pull_collateral(env: &Env, from: &Address, amount: i128) -> Result<(), Error> {
+        let tok = Self::token(env)?;
+        let this = env.current_contract_address();
+        let before = tok.balance(&this);
+        tok.transfer(from, &this, &amount);
+        let after = tok.balance(&this);
+        let delta = after
+            .checked_sub(before)
+            .ok_or(Error::CollateralShortfall)?;
+        if delta != amount {
+            return Err(Error::CollateralShortfall);
+        }
         Ok(())
     }
 
@@ -5579,5 +5601,468 @@ mod multisig_account {
         }
         env.set_auths(&[entry]);
         assert!(client.try_set_paused(&true).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-41 token suite
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_token, mint_hostile, snapshot, TokenKind};
+        use adversarial_mocks::{
+            BudgetBurnerTokenClient, FlipFlopTokenClient, LyingBalanceTokenClient,
+            PanicTokenClient, ReentrantTokenClient, ShortTokenClient,
+        };
+        use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+        use soroban_sdk::{vec, IntoVal, Symbol, Val};
+
+        struct AdvFixture {
+            env: Env,
+            client: MarketCoreClient<'static>,
+            core_id: Address,
+            token_id: Address,
+            creator: Address,
+            trader: Address,
+            treasury: Address,
+            resolver: Address,
+        }
+
+        fn setup_hostile(kind: TokenKind) -> AdvFixture {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().set_timestamp(1_000);
+            let admin = Address::generate(&env);
+            let creator = Address::generate(&env);
+            let trader = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let resolver = Address::generate(&env);
+            let token_id = deploy_token(&env, kind);
+            mint_hostile(&env, kind, &token_id, &creator, 10_000 * 10_000_000);
+            mint_hostile(&env, kind, &token_id, &trader, 10_000 * 10_000_000);
+            let core_id = env.register(
+                MarketCore,
+                (
+                    admin,
+                    token_id.clone(),
+                    treasury.clone(),
+                    resolver.clone(),
+                    100u32,
+                    10_000u32,
+                ),
+            );
+            let client = MarketCoreClient::new(&env, &core_id);
+            AdvFixture {
+                env,
+                client,
+                core_id,
+                token_id,
+                creator,
+                trader,
+                treasury,
+                resolver,
+            }
+        }
+
+        fn create_default(f: &AdvFixture) -> Result<u64, Result<Error, soroban_sdk::InvokeError>> {
+            f.client.try_create_market(
+                &f.creator,
+                &BytesN::from_array(&f.env, &[1u8; 32]),
+                &BytesN::from_array(&f.env, &[2u8; 32]),
+                &String::from_str(&f.env, "ipfs://adv"),
+                &Category::Crypto,
+                &5_000u64,
+                &(100 * 10_000_000_i128),
+                &5_000u32,
+            )
+        }
+
+        #[test]
+        fn adversarial_create_market_with_panic_token_leaves_no_market() {
+            let f = setup_hostile(TokenKind::Panic);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert!(create_default(&f).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert_eq!(before, after);
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_short_token_reverts_with_collateral_shortfall() {
+            let f = setup_hostile(TokenKind::Short);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            let err = create_default(&f).unwrap_err();
+            assert_eq!(err.unwrap(), Error::CollateralShortfall);
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_buy_with_short_token_reverts_with_collateral_shortfall() {
+            let f = setup_hostile(TokenKind::Short);
+            let short = ShortTokenClient::new(&f.env, &f.token_id);
+            short.set_fee_bps(&0);
+            let id = create_default(&f).unwrap().unwrap();
+
+            short.set_fee_bps(&100);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            let err = f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .unwrap_err();
+            assert_eq!(err.unwrap(), Error::CollateralShortfall);
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_buy_with_panic_token_preserves_state() {
+            let f = setup_hostile(TokenKind::Panic);
+            let tok = PanicTokenClient::new(&f.env, &f.token_id);
+            tok.set_panic(&false);
+            let id = create_default(&f).unwrap().unwrap();
+            tok.set_panic(&true);
+
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_lying_balance_succeeds_exact() {
+            let f = setup_hostile(TokenKind::LyingBalance);
+            let id = create_default(&f).unwrap().unwrap();
+            let real = LyingBalanceTokenClient::new(&f.env, &f.token_id).real_balance(&f.core_id);
+            assert_eq!(real, 100 * 10_000_000_i128);
+            assert_eq!(f.client.get_market(&id).sets_minted, 100 * 10_000_000_i128);
+        }
+
+        #[test]
+        fn adversarial_sweep_fees_ignores_lying_balance() {
+            let f = setup_hostile(TokenKind::LyingBalance);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(50 * 10_000_000_i128), &0);
+            let expected_fees = f.client.get_market(&id).fees_accrued;
+            assert!(expected_fees > 0);
+            let swept = f.client.sweep_fees(&id);
+            assert_eq!(swept, expected_fees);
+            let real_treasury =
+                LyingBalanceTokenClient::new(&f.env, &f.token_id).real_balance(&f.treasury);
+            assert_eq!(real_treasury, expected_fees);
+        }
+
+        #[test]
+        fn adversarial_sell_with_flipflop_token_preserves_position_on_revert() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert!(f
+                .client
+                .try_sell(
+                    &f.trader,
+                    &id,
+                    &Outcome::Yes,
+                    &(5 * 10_000_000_i128),
+                    &(50 * 10_000_000_i128),
+                )
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_redeem_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            let burn = BudgetBurnerTokenClient::new(&f.env, &f.token_id);
+            burn.set_burn(&false, &0);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            burn.set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert!(f.client.try_redeem(&f.trader, &id).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_redeem_with_frozen_flipflop_preserves_position() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert!(f.client.try_redeem(&f.trader, &id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_claim_pool_remainder_with_flipflop_preserves_lp_state() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert!(f.client.try_claim_pool_remainder(&id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert_eq!(before, after);
+            assert!(!f.client.get_market(&id).lp_claimed);
+        }
+
+        #[test]
+        fn adversarial_sweep_fees_with_flipflop_preserves_fees() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.treasury, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert!(f.client.try_sweep_fees(&id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.treasury, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            BudgetBurnerTokenClient::new(&f.env, &f.token_id).set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            assert!(create_default(&f).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_buy_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            let burn = BudgetBurnerTokenClient::new(&f.env, &f.token_id);
+            burn.set_burn(&false, &0);
+            let id = create_default(&f).unwrap().unwrap();
+            burn.set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            let before = f.client.get_market(&id);
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.client.get_market(&id), before);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_flipflop_token_reverts_when_frozen() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            assert!(create_default(&f).is_err());
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_buy_with_flipflop_token_reverts_when_frozen() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = f.client.get_market(&id);
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            assert_eq!(f.client.get_market(&id), before);
+        }
+
+        #[test]
+        fn adversarial_reentrant_token_cannot_reenter_buy() {
+            let f = setup_hostile(TokenKind::Reentrant);
+            let id = create_default(&f).unwrap().unwrap();
+
+            let buy_amount = 10 * 10_000_000_i128;
+            let cb_args: Vec<Val> = vec![
+                &f.env,
+                f.trader.clone().into_val(&f.env),
+                id.into_val(&f.env),
+                Outcome::Yes.into_val(&f.env),
+                buy_amount.into_val(&f.env),
+                0i128.into_val(&f.env),
+            ];
+            ReentrantTokenClient::new(&f.env, &f.token_id).arm_callback(
+                &f.core_id,
+                &Symbol::new(&f.env, "buy"),
+                &cb_args,
+            );
+
+            // Targeted mock_auths (never mock_all_auths) for the outer buy + its
+            // nested transfer only; the reentrant callback must fail.
+            f.env.set_auths(&[]);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            let res = f
+                .client
+                .mock_auths(&[MockAuth {
+                    address: &f.trader,
+                    invoke: &MockAuthInvoke {
+                        contract: &f.core_id,
+                        fn_name: "buy",
+                        args: (f.trader.clone(), id, Outcome::Yes, buy_amount, 0i128)
+                            .into_val(&f.env),
+                        sub_invokes: &[MockAuthInvoke {
+                            contract: &f.token_id,
+                            fn_name: "transfer",
+                            args: (f.trader.clone(), f.core_id.clone(), buy_amount)
+                                .into_val(&f.env),
+                            sub_invokes: &[],
+                        }],
+                    },
+                }])
+                .try_buy(&f.trader, &id, &Outcome::Yes, &buy_amount, &0);
+            assert!(res.is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+            let _ = f.resolver;
+        }
     }
 }

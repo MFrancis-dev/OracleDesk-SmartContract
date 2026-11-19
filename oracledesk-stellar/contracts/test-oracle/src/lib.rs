@@ -264,11 +264,7 @@ impl TestOracle {
     }
 
     /// Posts a batch of `(asset, price)` observations for the same `timestamp`.
-    pub fn set_prices(
-        env: Env,
-        entries: Vec<(Asset, i128)>,
-        timestamp: u64,
-    ) -> Result<(), Error> {
+    pub fn set_prices(env: Env, entries: Vec<(Asset, i128)>, timestamp: u64) -> Result<(), Error> {
         Self::require_admin(&env)?;
         if entries.len() > MAX_PRICES_RECORDS {
             return Err(Error::TooManyRecords);
@@ -576,7 +572,10 @@ mod test {
         let (env, client, _, _, xlm) = setup();
         let eth = Asset::Other(Symbol::new(&env, "ETH"));
         client.add_asset(&eth);
-        client.set_prices(&vec![&env, (xlm.clone(), 2_000), (eth.clone(), 30_000)], &9_900);
+        client.set_prices(
+            &vec![&env, (xlm.clone(), 2_000), (eth.clone(), 30_000)],
+            &9_900,
+        );
         assert_eq!(client.price(&xlm, &9_900).unwrap().price, 2_000);
         assert_eq!(client.price(&eth, &9_900).unwrap().price, 30_000);
         client.set_period(&3_600);

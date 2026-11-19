@@ -1268,7 +1268,8 @@ impl Treasury {
     /// `get_position`); a view only, never on the trading path.
     pub fn market_valuation(env: Env, market_id: u64) -> Result<Valuation, Error> {
         let global = Self::load_global(&env)?;
-        let (floor_value, spot_value, _) = Self::holdings_value(&env, &global.market_core, market_id)?;
+        let (floor_value, spot_value, _) =
+            Self::holdings_value(&env, &global.market_core, market_id)?;
         let cost_basis = Self::load_net(&env, &global.market_core, market_id).cost_basis();
         Ok(Valuation {
             cost_basis,
@@ -2052,7 +2053,10 @@ impl Treasury {
             return Err(Error::TracePolicyPending);
         }
         let old = Self::load_trace_policy_config(&env);
-        let old_registry = env.storage().instance().get::<_, Address>(&DataKey::Registry);
+        let old_registry = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Registry);
         let new = TracePolicyConfig {
             policy,
             max_trace_age_ledgers,
@@ -2088,7 +2092,9 @@ impl Treasury {
         if env.ledger().timestamp() < pending.executable_at {
             return Err(Error::TraceTimelockActive);
         }
-        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingTracePolicy);
         env.storage()
             .instance()
             .set(&DataKey::TracePolicy, &pending.config);
@@ -2104,7 +2110,9 @@ impl Treasury {
         if !env.storage().instance().has(&DataKey::PendingTracePolicy) {
             return Err(Error::TracePolicyNotPending);
         }
-        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingTracePolicy);
         Ok(())
     }
 
@@ -4707,10 +4715,13 @@ impl Treasury {
     // ----- trace helpers -------------------------------------------------------
 
     fn load_trace_policy_config(env: &Env) -> TracePolicyConfig {
-        env.storage().instance().get(&DataKey::TracePolicy).unwrap_or(TracePolicyConfig {
-            policy: TracePolicy::Off,
-            max_trace_age_ledgers: 120,
-        })
+        env.storage()
+            .instance()
+            .get(&DataKey::TracePolicy)
+            .unwrap_or(TracePolicyConfig {
+                policy: TracePolicy::Off,
+                max_trace_age_ledgers: 120,
+            })
     }
 
     fn get_registry(env: &Env) -> Option<Address> {
@@ -4736,7 +4747,9 @@ impl Treasury {
             (Some(_), Some(_)) => false,
             (_, None) => false,
         };
-        policy_tightened && age_tightened && registry_tightened
+        policy_tightened
+            && age_tightened
+            && registry_tightened
             && (rank(&new.policy) > rank(&old.policy)
                 || new.max_trace_age_ledgers < old.max_trace_age_ledgers
                 || (old_registry.is_none() && new_registry.is_some()))
@@ -4747,14 +4760,11 @@ impl Treasury {
             return Ok(());
         };
         let args = vec![env, agent.clone().into_val(env)];
-        let record: Option<AgentRecord> = match env.try_invoke_contract(
-            &registry,
-            &Symbol::new(env, "get_agent"),
-            args,
-        ) {
-            Ok(Ok(v)) => v,
-            _ => return Err(Error::TraceRegistryCallFailed),
-        };
+        let record: Option<AgentRecord> =
+            match env.try_invoke_contract(&registry, &Symbol::new(env, "get_agent"), args) {
+                Ok(Ok(v)) => v,
+                _ => return Err(Error::TraceRegistryCallFailed),
+            };
         match record {
             Some(r) if matches!(r.status, AgentStatus::Active) => Ok(()),
             _ => Err(Error::Unauthorized),
@@ -4870,7 +4880,6 @@ impl Treasury {
             Error::TraceMismatch
         }
     }
-
 }
 
 #[cfg(test)]
@@ -9097,5 +9106,298 @@ mod test {
 
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-41 token suite for treasury
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_token, mint_hostile, snapshot, TokenKind};
+        use adversarial_mocks::{FlipFlopTokenClient, PanicTokenClient, ShortTokenClient};
+
+        fn fixture_hostile(kind: TokenKind) -> Fixture {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().set_timestamp(1_000);
+            let admin = Address::generate(&env);
+            let agent = Address::generate(&env);
+            let creator = Address::generate(&env);
+            let treasury_id = Address::generate(&env);
+            let token_id = deploy_token(&env, kind);
+
+            // Disarm during setup where needed so market creation succeeds.
+            if kind == TokenKind::Short {
+                ShortTokenClient::new(&env, &token_id).set_fee_bps(&0);
+            } else if kind == TokenKind::Panic {
+                PanicTokenClient::new(&env, &token_id).set_panic(&false);
+            }
+            mint_hostile(&env, kind, &token_id, &creator, 1_000 * 10_000_000_i128);
+            mint_hostile(&env, kind, &token_id, &treasury_id, 1_000 * 10_000_000_i128);
+
+            let resolver = Address::generate(&env);
+            let market_core_id = register_market_core(
+                &env,
+                (
+                    admin.clone(),
+                    token_id.clone(),
+                    treasury_id.clone(),
+                    resolver.clone(),
+                    100u32,
+                    10_000u32,
+                ),
+            );
+            let market_core = MarketCoreClient::new(&env, &market_core_id);
+            let market_id = market_core.create_market(
+                &creator,
+                &BytesN::from_array(&env, &[11u8; 32]),
+                &BytesN::from_array(&env, &[111u8; 32]),
+                &String::from_str(&env, "ipfs://treasury-adv"),
+                &Category::Crypto,
+                &MARKET_CLOSE,
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            );
+            let max_trade = 200 * 10_000_000_i128;
+            let max_market = 500 * 10_000_000_i128;
+            let max_daily = 600 * 10_000_000_i128;
+            let creation_policy = CreationPolicy {
+                max_seed: max_trade,
+                max_markets_per_window: 100,
+                creation_window_secs: 86_400,
+                min_close_horizon: 60,
+                max_close_horizon: 365 * DAY_SECONDS,
+                allowed_categories: 0x3F,
+            };
+            let treasury = env.register_at(
+                &treasury_id,
+                Treasury,
+                TreasuryArgs::__constructor(
+                    &admin,
+                    &agent,
+                    &token_id,
+                    &market_core_id,
+                    &max_trade,
+                    &max_market,
+                    &max_daily,
+                    &max_daily,
+                    &DELAY,
+                    &(max_daily * 10),
+                    &7u32,
+                    &creation_policy,
+                ),
+            );
+            install_price_policy(&env, &treasury, PERMISSIVE);
+            Fixture {
+                env: env.clone(),
+                admin,
+                agent,
+                treasury: TreasuryClient::new(&env, &treasury),
+                treasury_id,
+                token: token_id,
+                market_core,
+                market_id,
+            }
+        }
+
+        #[test]
+        fn adversarial_treasury_agent_buy_revert_keeps_daily_usage() {
+            let f = fixture_hostile(TokenKind::Short);
+            ShortTokenClient::new(&f.env, &f.token).set_fee_bps(&100);
+
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (
+                    f.treasury.daily_usage(),
+                    f.treasury.market_exposure(&f.market_id),
+                ),
+            );
+            assert!(f
+                .treasury
+                .try_agent_buy(
+                    &f.agent,
+                    &f.market_id,
+                    &Outcome::Yes,
+                    &(20 * 10_000_000_i128),
+                    &0,
+                )
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (
+                    f.treasury.daily_usage(),
+                    f.treasury.market_exposure(&f.market_id),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_treasury_agent_create_market_short_token_keeps_caps() {
+            let f = fixture_hostile(TokenKind::Short);
+            ShortTokenClient::new(&f.env, &f.token).set_fee_bps(&100);
+
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (f.treasury.daily_usage(), f.market_core.market_count()),
+            );
+            assert!(f
+                .treasury
+                .try_agent_create_market(
+                    &f.agent,
+                    &BytesN::from_array(&f.env, &[3u8; 32]),
+                    &BytesN::from_array(&f.env, &[4u8; 32]),
+                    &String::from_str(&f.env, "ipfs://adv-seed"),
+                    &Category::Crypto,
+                    &MARKET_CLOSE,
+                    &(100 * 10_000_000_i128),
+                    &5000u32,
+                )
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (f.treasury.daily_usage(), f.market_core.market_count()),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_treasury_agent_sell_revert_keeps_exposure() {
+            let f = fixture_hostile(TokenKind::FlipFlop);
+            f.treasury.agent_buy(
+                &f.agent,
+                &f.market_id,
+                &Outcome::Yes,
+                &(20 * 10_000_000_i128),
+                &0,
+            );
+            FlipFlopTokenClient::new(&f.env, &f.token).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (
+                    f.treasury.daily_usage(),
+                    f.treasury.market_exposure(&f.market_id),
+                ),
+            );
+            assert!(f
+                .treasury
+                .try_agent_sell(
+                    &f.agent,
+                    &f.market_id,
+                    &Outcome::Yes,
+                    &(5 * 10_000_000_i128),
+                    &(50 * 10_000_000_i128),
+                )
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                (
+                    f.treasury.daily_usage(),
+                    f.treasury.market_exposure(&f.market_id),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_treasury_settlement_revert_keeps_state() {
+            let f = fixture_hostile(TokenKind::FlipFlop);
+            f.treasury.agent_buy(
+                &f.agent,
+                &f.market_id,
+                &Outcome::Yes,
+                &(20 * 10_000_000_i128),
+                &0,
+            );
+            f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+            f.market_core.resolve(&f.market_id, &Outcome::Yes);
+
+            FlipFlopTokenClient::new(&f.env, &f.token).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                f.treasury.open_market_count(),
+            );
+            assert!(f.treasury.try_redeem(&f.agent, &f.market_id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                f.treasury.open_market_count(),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_treasury_collect_fees_revert_keeps_state() {
+            let f = fixture_hostile(TokenKind::FlipFlop);
+            f.treasury.agent_buy(
+                &f.agent,
+                &f.market_id,
+                &Outcome::Yes,
+                &(20 * 10_000_000_i128),
+                &0,
+            );
+            FlipFlopTokenClient::new(&f.env, &f.token).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                f.market_core.get_market(&f.market_id).fees_accrued,
+            );
+            assert!(f.treasury.try_collect_market_fees(&f.market_id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&f.treasury_id],
+                f.market_core.get_market(&f.market_id).fees_accrued,
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_treasury_deposit_and_withdraw_revert_cleanly() {
+            let f = fixture_hostile(TokenKind::Panic);
+            let depositor = Address::generate(&f.env);
+            mint_hostile(
+                &f.env,
+                TokenKind::Panic,
+                &f.token,
+                &depositor,
+                500 * 10_000_000_i128,
+            );
+            PanicTokenClient::new(&f.env, &f.token).set_panic(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token,
+                &[&depositor, &f.treasury_id],
+                f.treasury.total_shares(),
+            );
+            assert!(f
+                .treasury
+                .try_deposit(&depositor, &(100 * 10_000_000_i128))
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token,
+                &[&depositor, &f.treasury_id],
+                f.treasury.total_shares(),
+            );
+            assert_eq!(before, after);
+        }
     }
 }

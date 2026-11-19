@@ -27,3 +27,5 @@ soroban-sdk = { version = "27.0.6", features = ["testutils", "experimental_spec_
 market-core-native = { package = "market-core", path = "../market-core" }
 # Real deployable SEP-40 test oracle for price-mode integration tests (#133).
 test-oracle = { path = "../test-oracle" }
+# Hostile oracle mocks for adversarial tests (#137).
+adversarial-mocks = { path = "../adversarial-mocks", features = ["testutils"] }
