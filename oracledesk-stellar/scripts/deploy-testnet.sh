@@ -41,7 +41,7 @@ AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
 MAKER_KEY=${MAKER_KEY:-${IDENTITY_PREFIX}-maker}
 TRADER_KEY=${TRADER_KEY:-${IDENTITY_PREFIX}-trader}
 OUT=${OUT:-deployments/$NETWORK.json}
-WASM_DIR=target/wasm32v1-none/release
+WASM_DIR=${WASM_DIR:-target/wasm32v1-none/release}
 
 # treasury's risk caps (7-decimal USDC units). Must comfortably clear
 # market-core's MIN_SEED (100 USDC) since agent_create_market's seed amount
@@ -514,6 +514,14 @@ if [ "$NETWORK" = "local" ]; then
     log "test oracle already deployed: $TEST_ORACLE"
   fi
 fi
+
+# Record SHA-256 hashes of the deployed contract WASM files (additive, #127).
+for contract_name in market_core resolver treasury reasoning_registry; do
+  if [ -f "$WASM_DIR/${contract_name}.wasm" ]; then
+    wasm_hash=$(sha256sum "$WASM_DIR/${contract_name}.wasm" | awk '{print $1}')
+    json_set --arg k "$contract_name" --arg h "$wasm_hash" '.wasm_sha256[$k] = $h'
+  fi
+done
 
 json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_deployed_at = $ts'
 
