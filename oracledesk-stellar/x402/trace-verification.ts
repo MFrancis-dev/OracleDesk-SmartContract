@@ -12,6 +12,8 @@ export interface TraceRecord {
   traceHash: string;
   marketId?: bigint;
   agent?: string;
+  action?: string;
+  verdict?: TraceVerdict;
 }
 
 export function sha256Hex(content: Uint8Array): string {

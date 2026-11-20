@@ -768,8 +768,8 @@ impl Router {
         spec: &ResolutionSpecV2,
     ) -> Result<(), Error> {
         let args: SorobanVec<Val> = soroban_sdk::vec![env, market_id.into_val(env)];
-        let actual: Option<RuleKind> = env
-            .invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
+        let actual: Option<RuleKind> =
+            env.invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
         if actual == Some(Self::expected_rule_kind(spec)) {
             Ok(())
         } else {

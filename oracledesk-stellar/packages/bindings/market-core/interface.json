@@ -90,37 +90,6 @@
         ]
       }
     },
-    "add_collateral": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "Adds or updates a collateral on the allow-list (#151). `token` must be a SEP-41 token whose `decimals()` matches `params.decimals`; until the decimals-aware math lands only 7-decimal tokens are accepted.",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "token",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "name": "params",
-            "type_": {
-              "udt": {
-                "name": "CollateralParams"
-              }
-            }
-          }
-        ],
-        "name": "add_collateral",
-        "outputs": [
-          {
-            "result": {
-              "error_type": "error",
-              "ok_type": "void"
-            }
-          }
-        ]
-      }
-    },
     "admin": {
       "kind": "function_v0",
       "spec": {
@@ -394,35 +363,10 @@
         ]
       }
     },
-    "collateral_params": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "token",
-            "type_": "address"
-          }
-        ],
-        "name": "collateral_params",
-        "outputs": [
-          {
-            "option": {
-              "value_type": {
-                "udt": {
-                  "name": "CollateralParams"
-                }
-              }
-            }
-          }
-        ]
-      }
-    },
     "create_market": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Creates a market in the contract's legacy/default collateral. Kept for compatibility; `create_market_with_collateral` selects an allow-listed token per market (#151).",
+        "doc": "Creates a market and seeds the pool. `creator` becomes the sole LP. `initial_yes_bps` in [100, 9900] sets the opening YES probability; the creator receives the leftover shares of the likelier outcome.",
         "inputs": [
           {
             "doc": "",
@@ -478,80 +422,6 @@
           }
         ],
         "name": "create_market",
-        "outputs": [
-          {
-            "result": {
-              "error_type": "error",
-              "ok_type": "u64"
-            }
-          }
-        ]
-      }
-    },
-    "create_market_with_collateral": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "Creates a market denominated in an allow-listed `collateral` (#151).",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "creator",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "name": "collateral",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "name": "question_hash",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "resolution_hash",
-            "type_": {
-              "bytes_n": {
-                "n": 32
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "meta_uri",
-            "type_": "string"
-          },
-          {
-            "doc": "",
-            "name": "category",
-            "type_": {
-              "udt": {
-                "name": "Category"
-              }
-            }
-          },
-          {
-            "doc": "",
-            "name": "close_time",
-            "type_": "u64"
-          },
-          {
-            "doc": "",
-            "name": "seed_amount",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "name": "initial_yes_bps",
-            "type_": "u32"
-          }
-        ],
-        "name": "create_market_with_collateral",
         "outputs": [
           {
             "result": {
@@ -630,10 +500,10 @@
         ]
       }
     },
-    "get_market_collateral": {
+    "get_market_view": {
       "kind": "function_v0",
       "spec": {
-        "doc": "The token a market settles and trades in. Legacy markets (created before #151) fall back to the contract's default collateral.",
+        "doc": "Returns the market and its lifecycle. Integrators must use this view rather than `get_market` when deciding whether positions have value.",
         "inputs": [
           {
             "doc": "",
@@ -641,16 +511,25 @@
             "type_": "u64"
           }
         ],
-        "name": "get_market_collateral",
+        "name": "get_market_view",
         "outputs": [
-          "address"
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "MarketView"
+                }
+              }
+            }
+          }
         ]
       }
     },
     "get_position": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Returns zero for a closed market. Historical amounts must be recovered from `Redeemed`, `PositionTransferred`, and `MarketFinalized` events.",
         "inputs": [
           {
             "doc": "",
@@ -704,24 +583,7 @@
         ]
       }
     },
-    "locked": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "Collateral locked by all markets of `token`: `Σ(sets_minted + fees_accrued)` maintained on every money path.",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "token",
-            "type_": "address"
-          }
-        ],
-        "name": "locked",
-        "outputs": [
-          "i128"
-        ]
-      }
-    },
-    "market_collateral_info": {
+    "is_closed": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
@@ -732,13 +594,9 @@
             "type_": "u64"
           }
         ],
-        "name": "market_collateral_info",
+        "name": "is_closed",
         "outputs": [
-          {
-            "udt": {
-              "name": "MarketCollateralInfo"
-            }
-          }
+          "bool"
         ]
       }
     },
@@ -893,6 +751,37 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "purge_closed_positions": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Removes valueless position entries from a closed market. This is permissionless and does not refund rent; it only reduces live state.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "holders",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "purge_closed_positions",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
             }
           }
         ]
@@ -1181,33 +1070,6 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
-            }
-          }
-        ]
-      }
-    },
-    "set_collateral_enabled": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "Disables new markets for `token`; sells, redemptions, claims and fee sweeps for existing markets keep working.",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "token",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "name": "enabled",
-            "type_": "bool"
-          }
-        ],
-        "name": "set_collateral_enabled",
-        "outputs": [
-          {
-            "result": {
-              "error_type": "error",
-              "ok_type": "void"
             }
           }
         ]
@@ -1707,36 +1569,6 @@
         "name": "Category"
       }
     },
-    "CollateralParams": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "Admin-managed collateral allow-list entry (#151).",
-        "fields": [
-          {
-            "doc": "",
-            "name": "decimals",
-            "type_": "u32"
-          },
-          {
-            "doc": "",
-            "name": "enabled",
-            "type_": "bool"
-          },
-          {
-            "doc": "",
-            "name": "max_sets",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "name": "min_seed",
-            "type_": "i128"
-          }
-        ],
-        "lib": "",
-        "name": "CollateralParams"
-      }
-    },
     "CommitteeRef": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1847,15 +1679,6 @@
             }
           },
           {
-            "tuple_v0": {
-              "doc": "",
-              "name": "CollateralParams",
-              "type_": [
-                "address"
-              ]
-            }
-          },
-          {
             "void_v0": {
               "doc": "",
               "name": "DefaultBreaker"
@@ -1885,15 +1708,6 @@
           {
             "tuple_v0": {
               "doc": "",
-              "name": "Locked",
-              "type_": [
-                "address"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "",
               "name": "LpFees",
               "type_": [
                 "u64"
@@ -1904,15 +1718,6 @@
             "tuple_v0": {
               "doc": "",
               "name": "Market",
-              "type_": [
-                "u64"
-              ]
-            }
-          },
-          {
-            "tuple_v0": {
-              "doc": "",
-              "name": "MarketCollateral",
               "type_": [
                 "u64"
               ]
@@ -2141,6 +1946,34 @@
         "name": "HybridConfig"
       }
     },
+    "Lifecycle": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Closed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Final"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Open"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "Lifecycle"
+      }
+    },
     "Market": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2232,26 +2065,6 @@
         "name": "Market"
       }
     },
-    "MarketCollateralInfo": {
-      "kind": "udt_struct_v0",
-      "spec": {
-        "doc": "Per-market collateral snapshot (#151). Lives beside `Market` so its XDR shape (and every generated client) is unchanged; a missing entry falls back to the legacy `DataKey::Collateral`.",
-        "fields": [
-          {
-            "doc": "`max_sets` snapshotted at creation, so a later allow-list change never silently changes an existing market's size limit.",
-            "name": "max_sets",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "name": "token",
-            "type_": "address"
-          }
-        ],
-        "lib": "",
-        "name": "MarketCollateralInfo"
-      }
-    },
     "MarketStatus": {
       "kind": "udt_union_v0",
       "spec": {
@@ -2285,6 +2098,43 @@
         "doc": "",
         "lib": "",
         "name": "MarketStatus"
+      }
+    },
+    "MarketView": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "lifecycle",
+            "type_": {
+              "udt": {
+                "name": "Lifecycle"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "market",
+            "type_": {
+              "udt": {
+                "name": "Market"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "redeem_deadline",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "MarketView"
       }
     },
     "Observation": {
@@ -2746,6 +2596,12 @@
           {
             "void_v0": {
               "doc": "",
+              "name": "Closed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
               "name": "Duplicate"
             }
           },
@@ -2853,11 +2709,6 @@
             "value": 31
           },
           {
-            "doc": "`create_market` used a token missing from, or disabled in, the admin collateral allow-list (#151).",
-            "name": "CollateralNotAllowed",
-            "value": 32
-          },
-          {
             "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
             "name": "DeadlineExpired",
             "value": 19
@@ -2883,11 +2734,6 @@
             "value": 6
           },
           {
-            "doc": "Allow-list parameters failed validation (decimals, seed bounds).",
-            "name": "InvalidCollateralParams",
-            "value": 33
-          },
-          {
             "doc": "",
             "name": "InvalidFee",
             "value": 3
@@ -2911,6 +2757,11 @@
             "doc": "",
             "name": "MarketClosed",
             "value": 9
+          },
+          {
+            "doc": "The market was closed out and its remaining value swept.",
+            "name": "MarketClosedOut",
+            "value": 32
           },
           {
             "doc": "",
@@ -3074,67 +2925,35 @@
         ]
       }
     },
-    "CollateralAdded": {
+    "DefaultFeeSet": {
       "kind": "event_v0",
       "spec": {
         "data_format": "map",
-        "doc": "",
+        "doc": "V1 event: default fee for new markets changed.",
         "lib": "",
-        "name": "CollateralAdded",
+        "name": "DefaultFeeSet",
         "params": [
           {
             "doc": "",
             "location": "topic_list",
-            "name": "token",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "decimals",
+            "name": "version",
             "type_": "u32"
           },
           {
             "doc": "",
             "location": "data",
-            "name": "min_seed",
-            "type_": "i128"
+            "name": "old_fee_bps",
+            "type_": "u32"
           },
           {
             "doc": "",
             "location": "data",
-            "name": "max_sets",
-            "type_": "i128"
+            "name": "new_fee_bps",
+            "type_": "u32"
           }
         ],
         "prefix_topics": [
-          "collateral_added"
-        ]
-      }
-    },
-    "CollateralEnabledSet": {
-      "kind": "event_v0",
-      "spec": {
-        "data_format": "map",
-        "doc": "",
-        "lib": "",
-        "name": "CollateralEnabledSet",
-        "params": [
-          {
-            "doc": "",
-            "location": "topic_list",
-            "name": "token",
-            "type_": "address"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "enabled",
-            "type_": "bool"
-          }
-        ],
-        "prefix_topics": [
-          "collateral_enabled_set"
+          "default_fee_set"
         ]
       }
     },
@@ -3257,32 +3076,6 @@
         ],
         "prefix_topics": [
           "lp_transferred"
-        ]
-      }
-    },
-    "MarketCollateralSet": {
-      "kind": "event_v0",
-      "spec": {
-        "data_format": "map",
-        "doc": "",
-        "lib": "",
-        "name": "MarketCollateralSet",
-        "params": [
-          {
-            "doc": "",
-            "location": "topic_list",
-            "name": "market_id",
-            "type_": "u64"
-          },
-          {
-            "doc": "",
-            "location": "topic_list",
-            "name": "collateral",
-            "type_": "address"
-          }
-        ],
-        "prefix_topics": [
-          "market_collateral_set"
         ]
       }
     },
@@ -3412,6 +3205,32 @@
         ]
       }
     },
+    "PausedSet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: market pause state changed.",
+        "lib": "",
+        "name": "PausedSet",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paused",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "paused_set"
+        ]
+      }
+    },
     "PoolRemainderClaimed": {
       "kind": "event_v0",
       "spec": {
@@ -3441,6 +3260,44 @@
         ],
         "prefix_topics": [
           "pool_remainder_claimed"
+        ]
+      }
+    },
+    "PoolRemainderClaimedV1": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "V1 event: pool remainder claimed by creator after market finality.",
+        "lib": "",
+        "name": "PoolRemainderClaimedV1",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "creator",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "payout",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "pool_remainder_claimed_v1"
         ]
       }
     },
@@ -3489,6 +3346,32 @@
         ],
         "prefix_topics": [
           "position_transferred"
+        ]
+      }
+    },
+    "PositionsPurged": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "PositionsPurged",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "count",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "positions_purged"
         ]
       }
     },

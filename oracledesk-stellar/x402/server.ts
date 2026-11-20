@@ -6,6 +6,7 @@ import {
   MapTraceRepository,
   type TraceRecord,
   type TraceRepository,
+  type TraceListRepository,
 } from "./trace-api.js";
 import { createRegistryTraceRepository } from "./registry-trace-repository.js";
 
@@ -20,7 +21,7 @@ async function buildRepository(): Promise<BuiltRepository> {
     console.log(
       `OracleDesk x402: reading traces from reasoning-registry ${contractId}`,
     );
-    return createRegistryTraceRepository({
+    const repository = await createRegistryTraceRepository({
       contractId,
       rpcUrl:
         process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
@@ -36,9 +37,10 @@ async function buildRepository(): Promise<BuiltRepository> {
   const records = JSON.parse(
     process.env.TRACE_RECORDS_JSON ?? "[]",
   ) as TraceRecord[];
-  return new MapTraceRepository(
+  const repository = new MapTraceRepository(
     new Map(records.map((record) => [record.traceId, record])),
   );
+  return { repository };
 }
 
 async function main() {
@@ -70,7 +72,7 @@ async function main() {
     facilitatorTimeoutMs: Number(
       process.env.X402_FACILITATOR_TIMEOUT_MS ?? 5000,
     ),
-    repository: await buildRepository(),
+    ...(await buildRepository()),
     ipfsGateway: process.env.IPFS_GATEWAY_URL ?? "https://ipfs.io/ipfs",
     price: process.env.TRACE_PRICE_USDC ?? "0.01",
     paymentsDisabled: process.env.PAYMENTS_DISABLED === "1",

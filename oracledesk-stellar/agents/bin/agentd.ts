@@ -40,9 +40,10 @@ import type { StateStore } from "../runtime/state.js";
 import { guardTask } from "../runtime/tasks/guard.js";
 import { makerTask } from "../runtime/tasks/maker.js";
 import { traderTask } from "../runtime/tasks/trader.js";
+import { inventoryTask } from "../runtime/tasks/inventory.js";
 import type { StellarAdapter } from "../stellar/adapter.js";
 import { loadAgentConfig } from "../core/config.js";
-import { buildAdapter, createLease, createStateStore, makerDeps, runtimeOptions, traderDeps, traderRiskCheck } from "../runtime/wiring.js";
+import { buildAdapter, createLease, createStateStore, inventoryDeps, makerDeps, runtimeOptions, traderDeps, traderRiskCheck } from "../runtime/wiring.js";
 
 export interface AgentdArgs {
   once: boolean;
@@ -63,7 +64,7 @@ function parseKillCode(value: string | undefined): KillCode {
 }
 
 export function parseArgs(argv: string[]): AgentdArgs {
-  const args: AgentdArgs = { once: false, tasks: ["maker", "trader"], tasksExplicit: false, signal: true };
+  const args: AgentdArgs = { once: false, tasks: ["maker", "trader", "inventory"], tasksExplicit: false, signal: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--once") args.once = true;
@@ -127,6 +128,16 @@ function defaultFactories(
       return traderTask(traderDeps(cfg, adapter, cfg.deployments, () => Math.floor(Date.now() / 1000), undefined, traderRiskCheck(adapter)), {
         intervalMs: intEnv(env, "TRADER_INTERVAL_MS", 60_000),
         jitterMs: intEnv(env, "TRADER_JITTER_MS", 5_000),
+      });
+    },
+    inventory: async (env) => {
+      const cfg = await loadAgentConfig({ role: "trader", env, argv: [] });
+      scope.treasury = cfg.deployments.contracts.treasury;
+      const adapter = buildAdapter(cfg, sendGuard);
+      scope.adapter ??= adapter;
+      return inventoryTask(inventoryDeps(cfg, adapter, cfg.deployments), {
+        intervalMs: intEnv(env, "INVENTORY_INTERVAL_MS", 60_000),
+        jitterMs: intEnv(env, "INVENTORY_JITTER_MS", 5_000),
       });
     },
     guard: async (env) => {

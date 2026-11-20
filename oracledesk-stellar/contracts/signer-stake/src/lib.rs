@@ -145,9 +145,7 @@ impl SignerStakeContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
-        env.storage()
-            .instance()
-            .extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
     }
 
     pub fn bond(env: Env, signer: Address, amount: i128) {
@@ -170,9 +168,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         env.events().publish(("bond",), Bonded { signer, amount });
     }
@@ -186,12 +186,9 @@ impl SignerStakeContract {
 
         let mut bond = Self::get_bond(&env, &signer);
 
-        let available = bond
-            .amount
-            .checked_sub(bond.locked)
-            .unwrap_or_else(|_| {
-                panic_with_error!(&env, Error::UnbondingStaked);
-            });
+        let available = bond.amount.checked_sub(bond.locked).unwrap_or_else(|_| {
+            panic_with_error!(&env, Error::UnbondingStaked);
+        });
 
         if amount > available {
             panic_with_error!(&env, Error::UnbondingStaked);
@@ -201,24 +198,27 @@ impl SignerStakeContract {
             panic_with_error!(&env, Error::UnbondingStaked);
         });
 
-        bond.unbond_amount = bond
-            .unbond_amount
-            .checked_add(amount)
+        bond.unbond_amount = bond.unbond_amount.checked_add(amount).unwrap_or_else(|_| {
+            panic_with_error!(&env, Error::SlashAmountTooLarge);
+        });
+
+        let config = Self::get_config(&env);
+        bond.unbond_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(config.unbond_delay)
             .unwrap_or_else(|_| {
                 panic_with_error!(&env, Error::SlashAmountTooLarge);
             });
 
-        let config = Self::get_config(&env);
-        bond.unbond_at = env.ledger().timestamp().checked_add(config.unbond_delay).unwrap_or_else(|_| {
-            panic_with_error!(&env, Error::SlashAmountTooLarge);
-        });
-
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         env.events().publish(
             ("unbond_requested",),
@@ -250,9 +250,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         let config = Self::get_config(&env);
         let token_client = token::Client::new(&env, &config.token);
@@ -281,24 +283,33 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         env.storage()
             .persistent()
             .set(&DataKey::Lock(signer.clone(), market_id), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Lock(signer.clone(), market_id), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Lock(signer.clone(), market_id),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
-        let locked_amount = bond.amount.checked_sub(bond.locked).unwrap_or_else(|_| 0i128);
-        env.events()
-            .publish(("locked",), Locked {
+        let locked_amount = bond
+            .amount
+            .checked_sub(bond.locked)
+            .unwrap_or_else(|_| 0i128);
+        env.events().publish(
+            ("locked",),
+            Locked {
                 signer,
                 market_id,
                 amount: locked_amount,
-            });
+            },
+        );
     }
 
     pub fn unlock(env: Env, signer: Address, market_id: u64) {
@@ -318,7 +329,10 @@ impl SignerStakeContract {
             Unlocked {
                 signer,
                 market_id,
-                amount: bond.amount.checked_sub(bond.locked).unwrap_or_else(|_| 0i128),
+                amount: bond
+                    .amount
+                    .checked_sub(bond.locked)
+                    .unwrap_or_else(|_| 0i128),
             },
         );
     }
@@ -358,9 +372,11 @@ impl SignerStakeContract {
         env.storage()
             .persistent()
             .set(&DataKey::Bond(signer.clone()), &bond);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Bond(signer.clone()),
+            BUMP_THRESHOLD,
+            BUMP_TO,
+        );
 
         let token_client = token::Client::new(&env, &config.token);
         token_client.transfer(
@@ -391,7 +407,10 @@ impl SignerStakeContract {
         let config = Self::get_config(&env);
         let bond = Self::get_bond(&env, &signer);
 
-        let available = bond.amount.checked_sub(bond.unbond_amount).unwrap_or_else(|_| 0i128);
+        let available = bond
+            .amount
+            .checked_sub(bond.unbond_amount)
+            .unwrap_or_else(|_| 0i128);
         available >= config.min_stake
     }
 

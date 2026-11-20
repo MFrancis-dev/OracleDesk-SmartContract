@@ -8,6 +8,7 @@
  * trace through the pending-trace queue.
  */
 import { BPS } from "../../core/fpmm.js";
+import { deltaBps, type Inventory } from "../../core/inventory.js";
 import { decideTrade, decideTradeSized, type MarketState } from "../../core/strategy.js";
 import type { CapsView, Holdings, SizingParams } from "../../core/sizing.js";
 import { buildTrace, decisionHashBuy, type TraceStore } from "../../core/trace.js";
@@ -45,6 +46,7 @@ export interface TraderCandidate {
   holdings?: Holdings;
   caps?: CapsView;
   setsMinted?: bigint;
+  inventory?: Inventory;
 }
 
 export interface TraderDeps {
@@ -59,6 +61,7 @@ export interface TraderDeps {
   slippageBps: bigint;
   sizingParams?: SizingParams;
   uncertaintyBps?: bigint;
+  inventoryMaxDeltaBps?: bigint;
   deadlineSecs: number;
   /** Unix seconds. */
   nowSecs: () => number;
@@ -93,6 +96,13 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
   for (const c of candidates) {
     if (ctx.signal.aborted) return;
     const { market, fairValueBps } = c;
+    const directional = c.inventory && ((c.inventory.delta > 0n && fairValueBps > market.yesBps) ||
+      (c.inventory.delta < 0n && fairValueBps < market.yesBps));
+    if (c.inventory && directional && deps.inventoryMaxDeltaBps !== undefined &&
+        deltaBps(c.inventory, c.inventory.floor > 0n ? c.inventory.floor : 1n) > deps.inventoryMaxDeltaBps) {
+      ctx.log.info("TRADER_SKIP_INVENTORY_BAND", { market: market.marketId, delta: c.inventory.delta });
+      continue;
+    }
     const own = deps.treasury !== undefined && c.creator === deps.treasury;
     if (own && !ctx.locks.ownMarketTradable(market.marketId, c.questionHash)) {
       ctx.log.info("TRADER_SKIP_UNREVEALED", { market: market.marketId, status: ctx.locks.status(market.marketId) ?? "unknown" });

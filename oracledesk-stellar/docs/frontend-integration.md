@@ -333,12 +333,18 @@ mitigation.
 
 `transfer_position(from, to, market_id, outcome, amount)` sends outcome
 shares to another wallet (the sender signs; `transfer_lp(market_id,
-new_creator)` does the same for the creator/LP role). It is allowed while
-the market is open and after resolution, up to the moment shares are
-redeemed, and emits `PositionTransferred`. If your UI tracks balances
-itself, handle that event (and `LpTransferred`); until your indexer does,
-read balances from `get_position(market_id, holder)` rather than from
-event-derived state.
+new_creator)` does the same for the creator/LP role). Transfers remain
+allowed while paused and after the redemption deadline, but fail with
+`MarketClosedOut` once `finalize_market` closes the market. The same error
+applies to `transfer_lp`. A closed market's `get_position` view is always
+zero; use `get_market_view` and its `lifecycle` (`Open`, `Final`, or
+`Closed`) before valuing positions. If your UI tracks balances itself,
+handle `PositionTransferred`, `MarketFinalized`, and `LpTransferred`;
+`MarketFinalized` makes all remaining positions valueless.
+
+`get_market` remains the compatibility view of the stored market. Use
+`get_market_view(market_id)` whenever closure matters: it adds the lifecycle
+and redemption deadline without changing the stored `Market` XDR.
 
 ## Category enum
 
@@ -348,6 +354,21 @@ the bindings' `Category` type directly rather than hand-maintaining a
 separate list, so the UI can never drift from what the contract accepts.
 
 ## Reading trace data
+
+### Unpaid trace discovery
+
+The x402 service exposes `GET /traces?market=...` or
+`GET /traces?agent=...` (optionally `action`, `order=asc|desc`, and
+`limit=1..25`). It returns metadata and a static `priceQuote`, never an IPFS
+CID or trace content. `market` and `agent` are mutually exclusive; `action`
+requires `market`. Empty registry indexes return `total: "0"`.
+
+`nextCursor` is an opaque, HMAC-signed cursor bound to the complete query.
+It expires after 24 hours. Descending pages retain the total observed by the
+first request, so new publishes do not move an existing paging session; omit
+the cursor to see new traces. Configure signing and rotation with
+`X402_CURSOR_KEYS=kid:base64secret,kid2:base64secret`; the first key signs
+and all listed keys verify.
 
 `reasoning-registry`'s `get_trace(trace_id)` returns
 `{ market_id, agent, action, trace_hash, ipfs_cid, published_at }`. To show
