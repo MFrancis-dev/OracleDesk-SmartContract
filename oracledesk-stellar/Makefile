@@ -1,4 +1,12 @@
-.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+.PHONY: doctor check-toolchain-sync setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
+
+# Verify local or CI tool versions match `toolchain.env` (#135).
+doctor:
+	./scripts/doctor.sh
+
+# Fail if toolchain.env drifted from rust-toolchain.toml, Dockerfile, or flake.nix.
+check-toolchain-sync:
+	./scripts/check-toolchain-sync.sh
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see

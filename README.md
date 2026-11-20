@@ -178,11 +178,19 @@ issuer address is hardcoded anywhere in this repo; see
 
 ### Prerequisites
 
-- Rust (stable) with the `wasm32v1-none` target
-- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+
-- Node.js 22+ and npm
-- Python 3.10+
-- `jq`
+The recommended way to develop with byte-identical contract builds is via the
+pinned **Dev Container** (`.devcontainer/`) or **Nix Flake** (`flake.nix`), both
+driven by [`oracledesk-stellar/toolchain.env`](oracledesk-stellar/toolchain.env).
+See [`oracledesk-stellar/docs/dev-environment.md`](oracledesk-stellar/docs/dev-environment.md)
+for full devcontainer, Codespaces, Nix, and manual setup instructions.
+
+For manual local setups, verify exact versions with `make doctor`:
+
+- Rust `1.93.1` with the `wasm32v1-none` target (`rustfmt`, `clippy`)
+- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), `27.1.0`
+- Node.js `24.13.1` and npm
+- Python 3.10+ (pinned `3.12`)
+- `jq` `1.7.1`
 
 ### Install and build
 
