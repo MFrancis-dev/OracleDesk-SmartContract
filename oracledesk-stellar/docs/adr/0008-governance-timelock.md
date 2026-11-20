@@ -94,3 +94,19 @@ thresholds on each role's `require_auth`.
   which is slower but auditable.
 - The timelock itself has a two-step, expiring admin transfer like the other
   contracts, so controlling it can also be moved to a multisig.
+
+## Formal model
+
+The timelock is model-checked in
+[`docs/formal/governance.tla`](../formal/README.md#governance-model): `eta`,
+expiry, cancel-wins and the emergency allow-list hold. The model also documents
+the residual trust in the timelock **admin** (finding G4): `set_roles`,
+`set_delay` and lowering `set_default_delay` are instant, so one compromised
+admin key can make itself proposer and canceller, move the watchdog out of the
+way, and execute a configuration change after only the minimum delay
+(`governance_single_key.cfg`, `model_trace_timelock_admin_set_roles_instant`).
+With the timelock as its own admin and `execute` handling the `set_roles` /
+`accept_admin` self-calls, no single key has instant power
+(`governance_selfadmin.cfg`); today `execute` supports only `set_default_delay`,
+so that handover cannot happen yet
+(`model_trace_timelock_cannot_accept_its_own_admin`).

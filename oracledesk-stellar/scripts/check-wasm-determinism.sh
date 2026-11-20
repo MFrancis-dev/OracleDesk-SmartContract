@@ -74,6 +74,9 @@ check_pin contracts/treasury/market_core.wasm \
 check_pin contracts/resolver/reasoning_registry.wasm \
   "$work/a/wasm32v1-none/release/reasoning_registry.wasm" \
   contracts/resolver/reasoning_registry.wasm.sha256
+check_pin contracts/treasury/resolver.wasm \
+  "$work/a/wasm32v1-none/release/resolver.wasm" \
+  contracts/treasury/resolver.wasm.sha256
 
 if [ "$status" -ne 0 ]; then
   echo "wasm determinism/drift check FAILED" >&2

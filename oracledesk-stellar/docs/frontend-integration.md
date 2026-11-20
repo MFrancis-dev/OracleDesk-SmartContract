@@ -11,7 +11,7 @@ bindings' `AssembledTransaction` already does the simulate → sign → submit
 dance; you only need to plug in a `signTransaction` callback:
 
 ```ts
-import { Client as MarketCoreClient } from "@oracledesk/market-core-bindings";
+import { Client as MarketCoreClient } from "@oracledesk/bindings-market-core";
 import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api";
 
 const contract = new MarketCoreClient({
@@ -314,7 +314,7 @@ a merge needs a buy or split first.
 
 To offer "merge all", call `quote_merge_max(market_id, holder)`, which
 returns `min(position.yes, position.no)`. The same helper is exposed as
-`math::merge_max` and mirrored in `model/fpmm_model.py` / `agents/core/src/fpmm.ts`.
+`math::merge_max` and mirrored in `model/fpmm_model.py` / `agents/core/fpmm.ts`.
 
 ```ts
 const max = (await contract.quote_merge_max({ market_id, holder: userAddress })).result;

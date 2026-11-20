@@ -119,7 +119,7 @@ market-creation risk controls (#47), and Blend lending integration with JIT liqu
 are implemented on `feat/issues-45-46-47-48`.
 Key additions:
 - **Permissionless settlement (#45)**: `settle_market(caller, market_id)` allows anyone to settle resolved markets, recovering positions and LP remainders without hot agent keys. Graceful error handling for `market_core` errors (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`). Emits `MarketSettled`.
-- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
+- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and an automatic drawdown halt when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Since #272 a halt (`Mode::AgentsHalted`) stops agent openings only and is cleared by `resume_agents()`; see the operating-mode state machine below.
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
@@ -451,14 +451,14 @@ markers in the files themselves:
   agent registry are timelocked (loosening waits `config_delay`, tightening
   is immediate), which bounds what a compromised admin can unlock for the
   *agents*; it does not cover `set_paused`, `set_successor` +
-  `migrate_market` (which moves positions out of the vault), or any other
+  `migrate_markets` (which moves positions out of the vault), or any other
   contract's admin. Under the deferred timelock default (above) that
   exposure is still live on testnet.
 - **Treasury vault NAV is conservative, not mark-to-market.** Directional
   exposure in open markets counts as zero, so deposits are slightly cheap
   and withdrawals slightly expensive while positions are open; positions
   opened before a lazy migration from the pre-vault layout, or received by
-  a successor treasury via `migrate_market`, are not in the open-market
+  a successor treasury via `migrate_markets`, are not in the open-market
   index and count as zero until redeemed. See
   `docs/adr/0005-treasury-vault.md` for the residual risks (LP floor moved by
   rebalancing trades, fees swept just after a deposit).
@@ -513,3 +513,35 @@ The pinned x402 Stellar package declares Node >=22, so CI and the documented
 minimum now use Node 22. An additional isolated Node 20 smoke run passed the
 HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
 runtime target.
+
+## Treasury operating modes (#272)
+
+The treasury's four pause/drawdown booleans are replaced by an explicit state
+machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `Paused`,
+`Emergency`, plus the admin-set `Unwinding` from #150) and one gate table (`mode::allowed`), documented cell by cell in
+[ADR 0005](adr/0005-treasury-vault.md). What changed for operators:
+
+- A drawdown halt no longer opens `emergency_withdraw`. That exit needs an
+  explicit `declare_emergency`, which only works from an admin pause.
+- Admin pause and drawdown halt are independent: `unpause()` never clears a
+  halt, `resume_agents()` never clears a pause.
+- `resume_agents()` replaces `acknowledge_drawdown()` (now a no-op) plus the
+  unpause, and requires the window PnL to have recovered.
+- `close_trade` is refused while admin-paused (it is an agent reduction).
+- New events: `ModeChanged`. New views: `mode`, `mode_state`, `allowed`. New
+  errors: `EmergencyMode` (83), `NotRecovered` (84). `set_mode` and
+  `set_paused` stay as compatibility entrypoints over the same state.
+- The mode x entrypoint matrix is an in-crate test (`mode_by_entrypoint_matrix`)
+  that fails when a new entrypoint has no row.
+
+## Contributor addendum: declarative testnet deployer (#128)
+
+Added `scripts/deployer/` and `deployments/testnet.manifest.json` providing
+declarative `plan`, `apply`, `verify`, and `migrate-record` workflows against
+live Stellar testnet state, with atomic v2 record checkpointing (preserving all
+v1 top-level keys for `loadDeployments()`, `seed-market.sh`, and `demo.sh`),
+drift and testnet-reset detection, archived-instance restoration, and a hard
+testnet passphrase interlock. `scripts/deploy-testnet.sh` delegates testnet
+runs to the deployer while keeping `NETWORK=local` intact for local E2E runs.
+Verified locally via `scripts/deployer` unit tests (`plan.test.ts` and
+`record.test.ts`). Live testnet apply was not re-run in this session.

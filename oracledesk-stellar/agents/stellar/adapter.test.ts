@@ -148,6 +148,34 @@ test("dry-run agentBuy describes the call without touching the network", async (
   }
 });
 
+test("dry-run unwindSell describes caller and market", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    agentAddress: "GUNWINDER",
+    deployments,
+  });
+  const result = await adapter.unwindSell({
+    market_id: 4n,
+    outcome: { tag: "No", values: undefined },
+    collateral_out: 25n,
+    max_shares_in: 30n,
+  });
+  assert.equal(result.dryRun, true);
+  if (result.dryRun) {
+    assert.equal(result.contractId, "CTREASURY");
+    assert.equal(result.method, "unwind_sell");
+    assert.deepEqual(result.args, {
+      caller: "GUNWINDER",
+      market_id: 4n,
+      outcome: { tag: "No", values: undefined },
+      collateral_out: 25n,
+      max_shares_in: 30n,
+    });
+  }
+});
+
 test("dry-run agentBuy includes agent address", async () => {
   const adapter = new StellarAdapter({
     mode: "dry-run",

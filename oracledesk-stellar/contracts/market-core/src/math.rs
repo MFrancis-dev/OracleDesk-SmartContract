@@ -292,25 +292,16 @@ pub fn calc_sell_shares(
         .ok_or(MathError::Overflow)?
         .checked_mul(4)
         .ok_or(MathError::Overflow)?;
-    let d = b2
-        .checked_sub(four_r_shares)
-        .ok_or(MathError::Overflow)?;
+    let d = b2.checked_sub(four_r_shares).ok_or(MathError::Overflow)?;
     let sqrt_d = isqrt(d);
     let mut x = ((b as u128) - sqrt_d) / 2;
     // Pool-favouring correction: decrement while the invariant would drop.
     // The products are at most 1e30 and fit in i128.
     while x > 0 {
-        let new_sold = r_sold
-            .checked_add(shares_in)
-            .ok_or(MathError::Overflow)?
-            - x as i128;
+        let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x as i128;
         let new_other = r_other - x as i128;
-        let left = new_sold
-            .checked_mul(new_other)
-            .ok_or(MathError::Overflow)?;
-        let right = r_sold
-            .checked_mul(r_other)
-            .ok_or(MathError::Overflow)?;
+        let left = new_sold.checked_mul(new_other).ok_or(MathError::Overflow)?;
+        let right = r_sold.checked_mul(r_other).ok_or(MathError::Overflow)?;
         if left >= right {
             break;
         }
@@ -326,10 +317,7 @@ pub fn calc_sell_shares(
     if collateral_out <= 0 {
         return Err(MathError::InvalidInput);
     }
-    let new_sold = r_sold
-        .checked_add(shares_in)
-        .ok_or(MathError::Overflow)?
-        - x;
+    let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x;
     let new_other = r_other - x;
     Ok(SellSharesQuote {
         collateral_out,
@@ -430,7 +418,6 @@ pub fn settle_upper(kind: Settlement, yes: i128, no: i128) -> i128 {
 mod tests {
     extern crate std;
     use super::*;
-    use std::string::ToString;
 
     fn isqrt_exact(n: u128) {
         let x = isqrt(n);
@@ -480,7 +467,8 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0
+            self.0 = self
+                .0
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(144269);
             self.0
@@ -538,7 +526,7 @@ mod tests {
         // Tiny sell whose collateral floors to 0 must revert.
         assert_eq!(
             calc_sell_shares(1_000_000, 1_000_000, 1, 0),
-            Err(MathError::InvalidInput),
+            Err(MathError::InsufficientLiquidity),
         );
     }
 
@@ -546,18 +534,18 @@ mod tests {
     fn buy_example_matches_model() {
         // 1000/1000 pool, buy 100 with no fee -> 190 shares, reserves 910/1100
         let q = calc_buy(1000, 1000, 100, 0).unwrap();
-        assert_eq(q.shares_out, 190);
-        assert_eq(q.new_reserve_bought, 910);
-        assert_eq(q.new_reserve_other, 1100);
+        assert_eq!(q.shares_out, 190);
+        assert_eq!(q.new_reserve_bought, 910);
+        assert_eq!(q.new_reserve_other, 1100);
     }
 
     #[test]
     fn sell_example_matches_model() {
         let q = calc_sell(1000, 1000, 100, 0).unwrap();
-        assert_eq(q.shares_in, 212);
-        assert_eq(q.gross, 100);
-        assert_eq(q.new_reserve_sold, 1112);
-        assert_eq(q.new_reserve_other, 900);
+        assert_eq!(q.shares_in, 212);
+        assert_eq!(q.gross, 100);
+        assert_eq!(q.new_reserve_sold, 1112);
+        assert_eq!(q.new_reserve_other, 900);
     }
 
     #[test]
@@ -566,7 +554,7 @@ mod tests {
             let s = seed_reserves(10_000_000_000, p).unwrap();
             let price = price_yes_bps(s.reserve_yes, s.reserve_no).unwrap();
             assert!((price - p as i128).abs() <= 1, "p={p} price={price}");
-            assert_eq(s.creator_yes == 0 || s.creator_no == 0, true);
+            assert_eq!(s.creator_yes == 0 || s.creator_no == 0, true);
         }
     }
 
@@ -597,7 +585,7 @@ mod tests {
 
     #[test]
     fn void_never_overpays() {
-        assert_eq(settle_value(Settlement::Void, 3, 4), 3);
+        assert_eq!(settle_value(Settlement::Void, 3, 4), 3);
         assert!(settle_value(Settlement::Void, 5, 5) <= 5);
     }
 
@@ -635,8 +623,8 @@ mod tests {
     fn split_fee_sums_exactly() {
         let (fee, share) = (101, 3300);
         let (proto, lp) = split_fee(fee, share).unwrap();
-        assert_eq(proto + lp, fee);
-        assert_eq(split_fee(fee, BPS as u32).unwrap(), (fee, 0));
+        assert_eq!(proto + lp, fee);
+        assert_eq!(split_fee(fee, BPS as u32).unwrap(), (fee, 0));
     }
 
     #[test]

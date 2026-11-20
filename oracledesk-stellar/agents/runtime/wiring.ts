@@ -17,11 +17,15 @@ import type { AgentConfig, Tunables } from "../core/config.js";
 import { evaluateAgentRisk, type AgentRiskState, type AgentRiskEvaluation } from "../core/risk.js";
 import type { CapsView, SizingParams } from "../core/sizing.js";
 import { StellarAdapter, type Deployments } from "../stellar/adapter.js";
+import { BondBudget } from "../core/bond-budget.js";
+import { DEFAULT_POLICY } from "../core/dispute-policy.js";
+import { EvidenceTraceSource, ManualSource, PriceRuleSource, parsePriceQuestion, type OutcomeSource } from "../core/outcomes/index.js";
 import { assertNever, intEnv, type AgentMode } from "./config.js";
 import { FileLease, NoLease, type Lease } from "./lease.js";
 import type { RuntimeOptions } from "./runtime.js";
 import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
 import type { MakerDeps } from "./tasks/maker.js";
+import type { WatcherTaskDeps } from "./tasks/watcher.js";
 import { fixtureCandidates, type TraderCandidate, type TraderDeps, type TraderRiskCheck } from "./tasks/trader.js";
 
 /** Placeholder signal source until a real one is wired in (see docs/wave-issues).
@@ -260,5 +264,75 @@ export function runtimeOptions(env: NodeJS.ProcessEnv): Omit<RuntimeOptions, "ta
     maxFailuresInWindow: intEnv(env, "MAX_FAILURES_IN_WINDOW", 20, 1),
     backoffBaseMs: intEnv(env, "BACKOFF_BASE_MS", 1_000, 1),
     backoffMaxMs: intEnv(env, "BACKOFF_MAX_MS", 5 * 60_000, 1),
+  };
+}
+
+/**
+ * Fetches a trace or metadata document by URI: `local://<path>` (the dev trace
+ * store), or an IPFS CID / `ipfs://` URI through WATCHER_IPFS_GATEWAY.
+ */
+export function uriFetcher(env: NodeJS.ProcessEnv): (uri: string, signal: AbortSignal) => Promise<string | undefined> {
+  return async (uri, signal) => {
+    if (uri.startsWith("local://")) {
+      const { readFile } = await import("node:fs/promises");
+      return readFile(uri.slice("local://".length), "utf8").catch(() => undefined);
+    }
+    const gateway = env.WATCHER_IPFS_GATEWAY;
+    if (!gateway) return undefined;
+    const cid = uri.replace(/^ipfs:\/\//, "");
+    const res = await fetch(`${gateway.replace(/\/$/, "")}/ipfs/${cid}`, { signal });
+    return res.ok ? res.text() : undefined;
+  };
+}
+
+/**
+ * The watcher's real dependencies: price-rule and evidence-trace sources, an
+ * optional operator verdicts file, and a bond budget over the runtime's state.
+ * `candidates` scans markets the treasury holds, so a lost proposal event is
+ * rediscovered from resolver state.
+ */
+export function watcherDeps(cfg: AgentConfig, adapter: StellarAdapter): WatcherTaskDeps {
+  const fetchUri = uriFetcher(cfg.env);
+  const sources: OutcomeSource[] = [
+    new PriceRuleSource({
+      loadQuestion: async (metaUri, signal) => {
+        const raw = await fetchUri(metaUri, signal);
+        return raw === undefined ? undefined : parsePriceQuestion(JSON.parse(raw));
+      },
+      reflector: (address) => ({
+        resolution: () => adapter.reflectorResolution(address),
+        price: (asset, ts) => adapter.reflectorPrice(address, asset, ts),
+      }),
+    }),
+    new EvidenceTraceSource({
+      evidence: async (marketId) =>
+        (await adapter.attestationEvidence(marketId)).map((e) => ({ signer: e.signer, attested: e.outcome, traceId: e.traceId, traceHash: e.traceHash })),
+      fetchTrace: async (e, signal) => fetchUri(await adapter.traceCid(e.traceId), signal),
+    }),
+    new ManualSource(cfg.watcher.verdictsFile),
+  ];
+  const reader = stateReader(cfg.rpcUrl, cfg.deployments);
+  return {
+    cfg,
+    adapter,
+    sources,
+    traceStore: new LocalTraceStore(cfg.traceStoreDir),
+    budget: (state) =>
+      new BondBudget(state, {
+        maxBondStroops: cfg.watcher.maxBondStroops,
+        budgetStroops: cfg.watcher.budgetStroops,
+        maxDisputesPerDay: cfg.watcher.maxDisputesPerDay,
+      }),
+    policy: { ...DEFAULT_POLICY, minConfidenceBps: cfg.watcher.minConfidenceBps, minLeadSecs: BigInt(cfg.watcher.minLeadSecs) },
+    marketInfo: async (marketId) => {
+      const m = await adapter.readMarket(marketId).catch(() => undefined);
+      return m ? { metaUri: m.metaUri, closeTime: BigInt(m.closeTime) } : undefined;
+    },
+    candidates: async () => {
+      const snapshot = await reader.readSnapshot([]);
+      return [...snapshot.portfolio.positions]
+        .filter(([id, p]) => p.yes + p.no > 0n && snapshot.markets.get(id)?.status === "open")
+        .map(([id]) => id);
+    },
   };
 }

@@ -141,6 +141,95 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `MAX_FAILURES_IN_WINDOW` / `FAILURE_WINDOW_MS` | 20 / 600000 | failures across tasks that open the circuit |
 | `STATE_FLUSH_DEBOUNCE_MS` | 250 | state write debounce |
 | `MARKET_CLOSE_IN_SECS` | 3600 | close time of markets the maker creates |
+| `WATCHER_ENABLED` | `0` | enables the `watcher` task (see [Proposal watcher](#proposal-watcher)) |
+| `WATCHER_SECRET_KEY` | | the watcher's own key. Never falls back to `AGENT_SECRET_KEY`, and a treasury agent's key is refused |
+| `WATCHER_INTERVAL_MS` | 15000 | watcher schedule |
+| `WATCHER_MIN_CONFIDENCE_BPS` | 9500 | dispute only at or above this confidence |
+| `WATCHER_MIN_LEAD_SECS` | 60 | refuse to sign with less ledger time than this left in the window |
+| `WATCHER_MAX_BOND_STROOPS` | 500000000 | largest bond escrowed in one dispute |
+| `WATCHER_BUDGET_STROOPS` | 1000000000 | largest total bond at risk at once |
+| `WATCHER_MAX_DISPUTES_PER_DAY` | 5 | disputes opened per UTC day |
+| `WATCHER_VERDICTS_FILE` | `./watcher-verdicts.json` | operator verdicts for the manual source |
+| `WATCHER_IPFS_GATEWAY` | | gateway used to fetch metadata and evidence traces (`local://` URIs need none) |
+
+## Proposal watcher
+
+An optimistic oracle is only as safe as its challengers. For a
+`SignersDisputable` market, a signer quorum *proposes* an outcome and anyone
+may `dispute` it inside `dispute_window` by escrowing `dispute_bond`; if nobody
+does, `finalize_signers` settles the market on the proposal. The `watcher` task
+(`runtime/tasks/watcher.ts`) is the challenger:
+
+```
+npm run agentd -- --tasks watcher        # WATCHER_ENABLED=1, WATCHER_SECRET_KEY=S...
+```
+
+**What it does.**
+
+1. A dedicated `EventSubscriber`/`Dispatcher` (own checkpoint directory, so it
+   never shares a cursor with `trader --follow`) follows `ResolutionProposed`,
+   `Disputed`, `DisputeSettled` and `ResolutionFinalized`.
+2. For each proposal it reads the market's *committed* `DisputableSignerConfig`
+   (window, bond, escalation timeout) from the resolver. Non-disputable markets
+   are ignored.
+3. It evaluates the proposal against the `OutcomeSource`s once as soon as it is
+   seen and again at `deadline - 2 * WATCHER_MIN_LEAD_SECS`, and retries a tick
+   after a source failure. Sources are combined only when they agree; any
+   disagreement is an alert, never a dispute.
+4. `core/dispute-policy.ts` decides (below). If it says dispute, the task
+   re-reads `state()`, the proposal and the latest ledger close time, builds a
+   reasoning trace (`action: "other:dispute"`, with the proposal, verdict,
+   sources, exposure and bond), stores and publishes it, and only then submits
+   `dispute` through `ctx.submit` under the market's lock.
+5. It follows the dispute: `expire_dispute` once `opened_at +
+   escalation_timeout` has passed, and `claim_dispute_bond` when the payee is
+   the watcher.
+
+**Sources** (`core/outcomes/`):
+
+| source | covers | confidence |
+|---|---|---|
+| `PriceRuleSource` | markets whose metadata declares a `price_question` (`reflector`, `asset`, `threshold`, `direction`, `closeTime`, `maxStaleness`) | reads the same Reflector record as the resolver's `read_feed_on_grid` (close time rounded down to the oracle's resolution, walking back inside `max_staleness`, at most 12 records). Within one feed tick of the threshold the confidence is 0; it rises to 9900 bps at a 1 % margin. A missing close-time record (retention) is confidence 0 |
+| `EvidenceTraceSource` | markets with attestation-linked evidence traces | verifies each trace against its on-chain hash; majority conclusion of the verified traces, confidence from the share that agree (capped at 9500; needs at least two) |
+| `ManualSource` | anything else | `watcher-verdicts.json`, re-read on every call: `{ "<market id>": { "outcome": "No", "confidenceBps": 10000, "note": "..." } }` |
+
+**Decision rule.** A correct dispute only *refunds* the bond (the resolver
+pays no reward); a wrong one forfeits it to market-core's treasury. The watcher
+therefore profits only by protecting positions the treasury already holds, and
+disputes only when all of these hold:
+
+```
+verdict.outcome != proposal.outcome
+verdict.confidenceBps >= WATCHER_MIN_CONFIDENCE_BPS
+protected * p > bond * (1 - p)             p = confidenceBps / 10_000
+bond <= budget available                   (per-dispute cap, total budget, wallet balance, daily count)
+secondsLeft(ledger time) >= WATCHER_MIN_LEAD_SECS
+```
+
+`protected` is how much more the treasury is paid if the verdict settles than
+if the proposal does (YES/NO shares held, or its cost basis for `Invalid`). It
+is evaluated in integer stroops with a strict inequality, so ties and rounding
+go toward not disputing.
+
+**Timing.** The window is ledger time, but RPC event delivery lags. The task
+never trusts an event's age: every tick re-reads `state()`, the proposal and
+`getLatestLedger().closeTime`, so a cancelled proposal, a re-proposal or
+another party's dispute is noticed even if no event arrives. Simulation runs at
+the next ledger's timestamp, so `WATCHER_MIN_LEAD_SECS` (default 60) leaves
+well over two ledgers plus inclusion time. `candidates` (markets the treasury
+holds) lets a tick rediscover a pending proposal whose event was lost.
+
+**Bonds.** `core/bond-budget.ts` keeps one record per disputed market in the
+state store (`committed = at risk + refunded + forfeited`), so a restart never
+forgets a locked bond. A submission that may have landed keeps its bond
+committed and is reconciled against `Dispute(id)` on the next tick; one that
+certainly did not is released. Another party disputing first (`DisputeActive`)
+counts as success: nothing is spent and their dispute is followed.
+
+**Prerequisites.** The watcher key needs collateral for bonds and must be
+registered with the reasoning registry (`register_agent`), because the trace is
+published before the dispute. It never acts as an escalation member and does
+not change bond economics.
 
 ## Fees
 

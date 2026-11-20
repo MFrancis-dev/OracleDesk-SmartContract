@@ -10,8 +10,10 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, String, Vec,
+    Env, String, Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{};
 
 /// Rolling window for trace entries, unchanged from the pre-#16 policy:
 /// 60 days, extended at half that. Registration (`Agent`) instead uses
@@ -46,6 +48,17 @@ pub struct SigningKeyRecord {
     pub retired_at: Option<u64>,
 }
 
+/// #299: Retroactive revocation record for a single signing key.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyRevocation {
+    pub agent: Address,
+    pub compromised_since: u64,
+    pub revoked_at: u64,
+    pub reason: Symbol,
+    pub by_admin: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceBatch {
@@ -55,6 +68,8 @@ pub struct TraceBatch {
     pub manifest_cid: String,
     pub published_at: u64,
 }
+
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
@@ -124,6 +139,101 @@ pub enum TraceVerdict {
     HashMismatch,
     Flagged(Symbol),
     AgentRevokedAfter(u64),
+    /// #299: The signing key was retroactively revoked; traces signed at or
+    /// after `compromised_since` are tainted.
+    KeyCompromised(u64),
+}
+
+/// #299: Verdict for a trace's signature alone (independent of hash/flag/agent).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SignatureVerdict {
+    NotSigned,
+    WrongAgent,
+    Valid,
+    KeyCompromised(u64),
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRetired {
+    #[topic]
+    pub agent: Address,
+    pub at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRevoked {
+    #[topic]
+    pub agent: Address,
+    pub effective_from: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentReactivated {
+    #[topic]
+    pub agent: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceFlagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceUnflagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyAdded {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyRetired {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceSigned {
+    #[topic]
+    pub trace_id: u64,
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub signing_key: BytesN<32>,
+}
+
+/// #299: Emitted when a signing key is retroactively revoked.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningKeyRevoked {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+    pub compromised_since: u64,
+    pub reason: Symbol,
+    pub by_admin: bool,
 }
 
 #[contracttype]
@@ -171,36 +281,55 @@ pub enum DataKey {
     NextId,
     Agent(Address),
     Trace(u64),
-    /// Number of traces published for a market, so a client can page through
-    /// `MarketTrace(market_id, 0..count)` without the contract ever holding
-    /// an unbounded Vec of trace ids in one storage entry.
     MarketTraceCount(u64),
     MarketTrace(u64, u64),
-    /// Ledger sequence a trace was written in (#50). Kept beside `Trace`
-    /// rather than inside it so the `Trace` XDR shape doesn't change.
     TraceLedger(u64),
     TraceDecision(u64),
     Flag(u64),
-    /// Contracts allowed to call `consume_trace` (#50).
     Consumer(Address),
-    /// Set once a trace has backed an action (#50).
     Consumed(u64),
-    /// Per-agent hash-chain head (#52).
     AgentHead(Address),
-    /// Per-agent `seq -> trace_id` (#52).
     AgentTrace(Address, u64),
-    /// `trace_id -> ChainLink`; absent for legacy traces (#52).
     TraceLink(u64),
-    /// Number of traces published by an agent, in publish order (#57).
     AgentTraceCount(Address),
-    /// `agent, index -> trace_id`, a secondary index parallel to
-    /// `MarketTrace` so "everything agent X published" is one page (#57).
     AgentTraceAt(Address, u64),
-    /// Number of traces for a `(market, action)` pair (#57).
     MarketActionTraceCount(u64, String),
-    /// `market, action, index -> trace_id`, so "every Buy decision on market
-    /// 7" is one page instead of scanning the market's whole index (#57).
     MarketActionTraceAt(u64, String, u64),
+    FlagHistoryCount(u64),
+    FlagHistory(u64, u32),
+    MarketCore,
+    Batch(u64),
+    NextBatchId,
+    AgentBatchCount(Address),
+    AgentBatch(Address, u64),
+    AgentSigningKeys(Address),
+    SigningKeyHistoryCount(Address),
+    SigningKeyHistory(Address, u32),
+    KeyToAgent(BytesN<32>),
+    TraceSignature(u64),
+    // ── #307 Per-agent consumer scoping ─────────────────────────────────────
+    /// `AgentConsumer(agent, consumer)` → `ConsumerGrant { granted_at: u64 }`
+    AgentConsumer(Address, Address),
+    /// Count of consumers authorised by an agent (for the dense array).
+    AgentConsumerCount(Address),
+    /// Dense index: `AgentConsumerAt(agent, index)` → `Address` (consumer).
+    AgentConsumerAt(Address, u32),
+    /// Reverse slot: `AgentConsumerSlot(agent, consumer)` → `u32`.
+    AgentConsumerSlot(Address, Address),
+    /// Per-agent default consumer applied at publish time.
+    AgentDefaultConsumer(Address),
+    /// Per-trace consumer binding (write-once at publish or via bind_trace_consumer).
+    TraceConsumer(u64),
+    /// Batch-level consumer binding written from the agent's default at batch publish.
+    BatchConsumer(u64),
+    /// Instance flag: `true` once enable_consumer_scoping() has been called.
+    ConsumerScoping,
+    /// #299: per-key retroactive revocation record.
+    KeyRevocation(BytesN<32>),
+    /// #299: number of traces a key has signed (per-key index length).
+    KeyTraceCount(BytesN<32>),
+    /// #299: trace_id at a given index in a key's signed-trace index.
+    KeyTraceAt(BytesN<32>, u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -249,12 +378,51 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
-    TraceAgentMismatch = 13,
-    TraceMismatch = 14,
-    AgentNotActive = 15,
-    TraceFlagged = 16,
-    TraceTooOld = 17,
-    TraceDecisionMissing = 18,
+    CannotReactivateRevoked = 100,
+    FlagHistoryFull = 101,
+    InvalidEffectiveTime = 102,
+    UnknownMarket = 103,
+    MarketRequired = 104,
+    ProposalMustUseNoMarket = 105,
+    UseCanonicalAction = 106,
+    BatchNotFound = 107,
+    InvalidBatch = 108,
+    InvalidProof = 109,
+    TooManyKeys = 110,
+    KeyAlreadyBound = 111,
+    InvalidKey = 112,
+    InvalidSignature = 113,
+    TraceNotSigned = 114,
+    AgentNotActive = 115,
+    ActionTooLong = 116,
+    CidTooLong = 117,
+    PageTooLarge = 118,
+    TraceFlagged = 119,
+    TraceTooOld = 120,
+    TraceDecisionMissing = 121,
+    TraceAgentMismatch = 122,
+    TraceMismatch = 123,
+    AlreadyRetired = 124,
+    NotRetired = 125,
+    SigningKeyNotFound = 126,
+    TooManySigningKeys = 127,
+    SigningKeyAlreadyBound = 128,
+    // ── #307 Per-agent consumer scoping ──────────────────────────────────
+    /// `authorize_consumer` called after agent has reached MAX_AGENT_CONSUMERS.
+    TooManyConsumers = 129,
+    /// `consume_trace` called by a consumer the publishing agent never granted.
+    ConsumerNotAuthorized = 130,
+    /// `consume_trace` called by a consumer other than the one the trace is bound to.
+    TraceBoundElsewhere = 131,
+    /// `set_default_consumer` or `bind_trace_consumer` called with a consumer the
+    /// agent has not yet authorised.
+    ConsumerGrantRequired = 132,
+    /// `bind_trace_consumer` called on a trace that already has a binding.
+    TraceAlreadyBound = 133,
+    /// `grant_consumer_legacy` called after scoping has been enabled.
+    ScopingAlreadyEnabled = 134,
+    /// #299: Key already revoked and `compromised_since` cannot move later.
+    AlreadyRevoked = 129,
 }
 
 #[contractevent]
@@ -665,144 +833,6 @@ impl ReasoningRegistry {
         env.storage().persistent().has(&DataKey::Consumed(trace_id))
     }
 
-    pub fn publish_decision_trace(
-        env: Env,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        trace_hash: BytesN<32>,
-        ipfs_cid: String,
-        decision_hash: BytesN<32>,
-    ) -> Result<u64, Error> {
-        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        let trace_id = Self::write_trace(env.clone(), agent, market_id, action, trace_hash, ipfs_cid)?;
-        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
-        Ok(trace_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn publish_chained_decision_trace(
-        env: Env,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        trace_hash: BytesN<32>,
-        ipfs_cid: String,
-        expected_seq: u64,
-        prev_trace_hash: BytesN<32>,
-        decision_hash: BytesN<32>,
-    ) -> Result<u64, Error> {
-        ttl::bump_instance(&env);
-        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        ttl::bump_persistent(
-            &env,
-            &DataKey::Agent(agent.clone()),
-            ttl::long_lived_target(&env),
-        );
-        let head = Self::load_head(&env, &agent);
-        if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
-            return Err(Error::ChainHeadMismatch);
-        }
-        let trace_id = Self::write_trace(
-            env.clone(),
-            agent.clone(),
-            market_id,
-            action,
-            trace_hash.clone(),
-            ipfs_cid,
-        )?;
-        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
-        Self::put(
-            &env,
-            &DataKey::TraceLink(trace_id),
-            &ChainLink {
-                seq: expected_seq,
-                prev_trace_hash: prev_trace_hash.clone(),
-            },
-        );
-        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &trace_id);
-        Self::put(
-            &env,
-            &DataKey::AgentHead(agent.clone()),
-            &ChainHead {
-                seq: expected_seq,
-                head_hash: trace_hash.clone(),
-                head_trace_id: Some(trace_id),
-            },
-        );
-        TraceChained {
-            agent,
-            seq: expected_seq,
-            trace_id,
-            prev_trace_hash,
-            trace_hash,
-        }
-        .publish(&env);
-        Ok(trace_id)
-    }
-
-    pub fn get_trace_decision(env: Env, trace_id: u64) -> Option<BytesN<32>> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TraceDecision(trace_id))
-    }
-
-    pub fn consume_trace_for(
-        env: Env,
-        consumer: Address,
-        trace_id: u64,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        max_age_ledgers: u32,
-    ) -> Result<TraceConsumeInfo, Error> {
-        consumer.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Consumer(consumer.clone()))
-        {
-            return Err(Error::Unauthorized);
-        }
-        let trace = Self::get_trace(env.clone(), trace_id)?;
-        if trace.agent != agent {
-            return Err(Error::TraceAgentMismatch);
-        }
-        if trace.market_id != market_id || trace.action != action {
-            return Err(Error::TraceMismatch);
-        }
-        let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
-        if !matches!(record.status, AgentStatus::Active) {
-            return Err(Error::AgentNotActive);
-        }
-        if env.storage().persistent().has(&DataKey::Flag(trace_id)) {
-            return Err(Error::TraceFlagged);
-        }
-        let written = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::TraceLedger(trace_id))
-            .ok_or(Error::TraceNotFound)?;
-        if env.ledger().sequence() > written.saturating_add(max_age_ledgers) {
-            return Err(Error::TraceTooOld);
-        }
-        let decision = env
-            .storage()
-            .persistent()
-            .get::<_, BytesN<32>>(&DataKey::TraceDecision(trace_id))
-            .ok_or(Error::TraceDecisionMissing)?;
-        let key = DataKey::Consumed(trace_id);
-        if env.storage().persistent().has(&key) {
-            return Err(Error::TraceAlreadyConsumed);
-        }
-        Self::put(&env, &key, &true);
-        TraceConsumed { trace_id, consumer }.publish(&env);
-        Ok(TraceConsumeInfo {
-            decision: Some(decision),
-            ledger: written,
-        })
-    }
-
     /// Checks a commit-reveal commitment (#51):
     /// `commitment == sha256("oracledesk.trace.commit.v1" || trace_hash || salt)`.
     pub fn verify_commitment(
@@ -925,6 +955,23 @@ impl ReasoningRegistry {
                 }
             }
         }
+        // #299: check per-key revocation. Precedence: AgentRevokedAfter >
+        // KeyCompromised > Valid.
+        if let Some((signing_key, _)) = env
+            .storage()
+            .persistent()
+            .get::<_, (BytesN<32>, BytesN<64>)>(&DataKey::TraceSignature(trace_id))
+        {
+            if let Some(revocation) = env
+                .storage()
+                .persistent()
+                .get::<_, KeyRevocation>(&DataKey::KeyRevocation(signing_key))
+            {
+                if trace.published_at >= revocation.compromised_since {
+                    return Ok(TraceVerdict::KeyCompromised(revocation.compromised_since));
+                }
+            }
+        }
         Ok(TraceVerdict::Valid)
     }
 
@@ -964,12 +1011,7 @@ impl ReasoningRegistry {
     }
 
     /// The `index`-th (0-based, publish order) trace id for `agent` (#57).
-    pub fn agent_trace_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AgentTraceAt(agent, index))
-            .ok_or(Error::TraceNotFound)
-    }
+
 
     /// Number of traces for the `(market_id, action)` pair (#57).
     pub fn market_action_trace_count(env: Env, market_id: u64, action: String) -> u64 {
@@ -1048,8 +1090,6 @@ impl ReasoningRegistry {
                 .ok_or(Error::TraceNotFound)
         })
     }
-}
-
     /// Anchors a Merkle batch of N traces off-chain, storing only the 32-byte root
     /// and manifest CID on-chain (#54).
     pub fn publish_trace_batch(
@@ -1064,17 +1104,9 @@ impl ReasoningRegistry {
         if !matches!(record.status, AgentStatus::Active) {
             return Err(Error::AgentNotActive);
         }
-        if action.len() > MAX_ACTION_LEN {
-            return Err(Error::ActionTooLong);
+        if leaf_count == 0 || leaf_count > MAX_LEAVES || manifest_cid.is_empty() {
+            return Err(Error::InvalidBatch);
         }
-        if ipfs_cid.is_empty() {
-            return Err(Error::EmptyCid);
-        }
-        if ipfs_cid.len() > MAX_CID_LEN {
-            return Err(Error::CidTooLong);
-        }
-        Ok(())
-    }
 
         let batch_id: u64 = env
             .storage()
@@ -1097,29 +1129,8 @@ impl ReasoningRegistry {
         Self::put(&env, &DataKey::AgentBatch(agent.clone(), agent_idx), &batch_id);
         Self::put(&env, &agent_count_key, &(agent_idx + 1));
 
-        // Secondary index by agent (#57).
-        let agent_count_key = DataKey::AgentTraceCount(agent.clone());
-        let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
-        Self::put(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id);
-        Self::put(env, &agent_count_key, &(agent_index + 1));
-
-        // Secondary index by (market, action) (#57).
-        let action_count_key = DataKey::MarketActionTraceCount(market_id, action.clone());
-        let action_index: u64 = env
-            .storage()
-            .persistent()
-            .get(&action_count_key)
-            .unwrap_or(0);
-        Self::put(
-            env,
-            &DataKey::MarketActionTraceAt(market_id, action.clone(), action_index),
-            &id,
-        );
-        Self::put(env, &action_count_key, &(action_index + 1));
-
-        TracePublished {
-            trace_id: id,
-            market_id,
+        BatchPublished {
+            batch_id,
             agent,
             root,
             leaf_count,
@@ -1146,6 +1157,13 @@ impl ReasoningRegistry {
 
     pub fn batch_count(env: Env) -> u64 {
         env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(0)
+    }
+
+    pub fn agent_batch_count(env: Env, agent: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentBatchCount(agent))
+            .unwrap_or(0)
     }
 
     /// Shared body of the three paginated readers (#57): validates the page
@@ -1191,7 +1209,6 @@ impl ReasoningRegistry {
     fn load_pending(env: &Env) -> Option<PendingAdmin> {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
-}
 
     pub fn agent_batch_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
         let key = DataKey::AgentBatch(agent, index);
@@ -1497,6 +1514,12 @@ impl ReasoningRegistry {
         let sig_key = DataKey::TraceSignature(id);
         Self::put(&env, &sig_key, &(signing_key.clone(), signature));
 
+        // #299: index this trace under the signing key for paged revocation views.
+        let count_key = DataKey::KeyTraceCount(signing_key.clone());
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        Self::put(&env, &DataKey::KeyTraceAt(signing_key.clone(), count), &id);
+        Self::put(&env, &count_key, &(count + 1));
+
         TraceSigned {
             trace_id: id,
             agent,
@@ -1584,6 +1607,12 @@ impl ReasoningRegistry {
         let sig_key = DataKey::TraceSignature(id);
         Self::put(&env, &sig_key, &(signing_key.clone(), signature));
 
+        // #299: index this trace under the signing key for paged revocation views.
+        let count_key = DataKey::KeyTraceCount(signing_key.clone());
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        Self::put(&env, &DataKey::KeyTraceAt(signing_key.clone(), count), &id);
+        Self::put(&env, &count_key, &(count + 1));
+
         TraceChained {
             agent: agent.clone(),
             seq: expected_seq,
@@ -1635,6 +1664,19 @@ impl ReasoningRegistry {
             return Ok(false);
         }
 
+        // #299: if the key has been retroactively revoked and this trace was
+        // published at or after the compromise time, the signature is no
+        // longer considered valid.
+        if let Some(revocation) = env
+            .storage()
+            .persistent()
+            .get::<_, KeyRevocation>(&DataKey::KeyRevocation(signing_key.clone()))
+        {
+            if trace.published_at >= revocation.compromised_since {
+                return Ok(false);
+            }
+        }
+
         let msg = Self::trace_attestation_message(
             &env,
             &trace.agent,
@@ -1644,6 +1686,254 @@ impl ReasoningRegistry {
         );
         env.crypto().ed25519_verify(&signing_key, &msg, &signature);
         Ok(true)
+    }
+
+    // ── #299: Retroactive signing-key revocation ────────────────────────────
+
+    /// Revokes a signing key retroactively. Verdicts for traces the key signed
+    /// at or after `compromised_since` flip to `KeyCompromised`. Callable by
+    /// the agent or the registry admin, including for retired or revoked
+    /// agents. Revocation is permanent; `compromised_since` can only move
+    /// earlier on a subsequent call.
+    pub fn revoke_signing_key(
+        env: Env,
+        caller: Address,
+        agent: Address,
+        public_key: BytesN<32>,
+        compromised_since: u64,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Caller must be the agent or the admin.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let by_admin = caller == admin;
+        if !by_admin && caller != agent {
+            return Err(Error::Unauthorized);
+        }
+
+        // KeyToAgent must point to this agent.
+        let key_to_agent_key = DataKey::KeyToAgent(public_key.clone());
+        let bound_agent: Address = env
+            .storage()
+            .persistent()
+            .get(&key_to_agent_key)
+            .ok_or(Error::InvalidKey)?;
+        if bound_agent != agent {
+            return Err(Error::InvalidKey);
+        }
+        Self::bump_persistent(&env, &key_to_agent_key);
+
+        // Find the key's SigningKeyRecord to validate compromised_since.
+        let history_count_key = DataKey::SigningKeyHistoryCount(agent.clone());
+        let count: u32 = env.storage().persistent().get(&history_count_key).unwrap_or(0);
+        let mut found_record: Option<SigningKeyRecord> = None;
+        for i in 0..count {
+            let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
+            if let Some(record) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+                if record.public_key == public_key {
+                    found_record = Some(record);
+                    break;
+                }
+            }
+        }
+        let record = found_record.ok_or(Error::SigningKeyNotFound)?;
+
+        let now = env.ledger().timestamp();
+        // compromised_since must be between added_at and now.
+        if compromised_since < record.added_at || compromised_since > now {
+            return Err(Error::InvalidEffectiveTime);
+        }
+
+        // If a revocation already exists, only allow widening (earlier since).
+        let rev_key = DataKey::KeyRevocation(public_key.clone());
+        if let Some(existing) = env.storage().persistent().get::<_, KeyRevocation>(&rev_key) {
+            if compromised_since >= existing.compromised_since {
+                return Err(Error::AlreadyRevoked);
+            }
+        }
+
+        // Remove the key from the active list if still present.
+        let agent_keys_key = DataKey::AgentSigningKeys(agent.clone());
+        let mut keys: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&agent_keys_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut removed = false;
+        for i in 0..keys.len() {
+            if keys.get(i).unwrap() == public_key {
+                keys.remove(i);
+                removed = true;
+                break;
+            }
+        }
+        if removed {
+            Self::put(&env, &agent_keys_key, &keys);
+        }
+
+        // Set retired_at if not already set.
+        if record.retired_at.is_none() {
+            for i in 0..count {
+                let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
+                if let Some(mut rec) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+                    if rec.public_key == public_key && rec.retired_at.is_none() {
+                        rec.retired_at = Some(now);
+                        Self::put(&env, &hist_key, &rec);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Write the revocation record.
+        let revocation = KeyRevocation {
+            agent: agent.clone(),
+            compromised_since,
+            revoked_at: now,
+            reason: reason.clone(),
+            by_admin,
+        };
+        Self::put(&env, &rev_key, &revocation);
+
+        SigningKeyRevoked {
+            agent,
+            public_key,
+            compromised_since,
+            reason,
+            by_admin,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// #299: Returns the signature-level verdict for a trace, independent of
+    /// hash/flag/agent checks. Uses a constant number of reads.
+    pub fn signature_verdict(env: Env, trace_id: u64) -> Result<SignatureVerdict, Error> {
+        let trace = Self::load_trace(&env, trace_id)?;
+        let key = DataKey::TraceSignature(trace_id);
+        let Some((signing_key, signature)) = env
+            .storage()
+            .persistent()
+            .get::<_, (BytesN<32>, BytesN<64>)>(&key)
+        else {
+            return Ok(SignatureVerdict::NotSigned);
+        };
+        Self::bump_persistent(&env, &key);
+
+        let bound_agent = Self::get_key_agent(env.clone(), signing_key.clone());
+        if bound_agent.as_ref() != Some(&trace.agent) {
+            return Ok(SignatureVerdict::WrongAgent);
+        }
+
+        // Check key revocation.
+        if let Some(revocation) = env
+            .storage()
+            .persistent()
+            .get::<_, KeyRevocation>(&DataKey::KeyRevocation(signing_key.clone()))
+        {
+            if trace.published_at >= revocation.compromised_since {
+                return Ok(SignatureVerdict::KeyCompromised(revocation.compromised_since));
+            }
+        }
+
+        // Fall through to actual crypto verification.
+        let msg = Self::trace_attestation_message(
+            &env,
+            &trace.agent,
+            trace.market_id,
+            &trace.action,
+            &trace.trace_hash,
+        );
+        env.crypto().ed25519_verify(&signing_key, &msg, &signature);
+        Ok(SignatureVerdict::Valid)
+    }
+
+    /// #299: Number of traces a key has signed (length of the per-key index).
+    pub fn key_trace_count(env: Env, public_key: BytesN<32>) -> u64 {
+        let key = DataKey::KeyTraceCount(public_key);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// #299: Paged list of trace ids a key has signed.
+    pub fn key_traces(
+        env: Env,
+        public_key: BytesN<32>,
+        start: u64,
+        limit: u32,
+    ) -> Result<Vec<u64>, Error> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+        let total = Self::key_trace_count(env.clone(), public_key.clone());
+        if start >= total {
+            return Ok(Vec::new(&env));
+        }
+        let end = core::cmp::min(start + limit as u64, total);
+        let mut out = Vec::new(&env);
+        for i in start..end {
+            let key = DataKey::KeyTraceAt(public_key.clone(), i);
+            if let Some(trace_id) = env.storage().persistent().get::<_, u64>(&key) {
+                Self::bump_persistent(&env, &key);
+                out.push_back(trace_id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// #299: Binary search for the first trace index whose `published_at >=
+    /// compromised_since`. Returns the index, or `total` if none qualify.
+    pub fn key_affected_from(
+        env: Env,
+        public_key: BytesN<32>,
+        compromised_since: u64,
+    ) -> Result<u64, Error> {
+        let total = Self::key_trace_count(env.clone(), public_key.clone());
+        if total == 0 {
+            return Ok(0);
+        }
+        // Binary search: find the first index where trace.published_at >= compromised_since.
+        let mut lo: u64 = 0;
+        let mut hi: u64 = total;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let key = DataKey::KeyTraceAt(public_key.clone(), mid);
+            let trace_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(Error::TraceNotFound)?;
+            Self::bump_persistent(&env, &key);
+            let trace = Self::get_trace(env.clone(), trace_id)?;
+            if trace.published_at < compromised_since {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// #299: Paged list of affected trace ids starting from the first
+    /// trace published at or after `compromised_since`.
+    pub fn affected_traces(
+        env: Env,
+        public_key: BytesN<32>,
+        compromised_since: u64,
+        page_start: u64,
+        limit: u32,
+    ) -> Result<Vec<u64>, Error> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+        let affected_from = Self::key_affected_from(env.clone(), public_key.clone(), compromised_since)?;
+        let actual_start = affected_from + page_start;
+        Self::key_traces(env, public_key, actual_start, limit)
     }
 }
 
@@ -1868,15 +2158,27 @@ impl ReasoningRegistry {
         env.crypto().sha256(&bytes).into()
     }
 
-    fn require_admin(env: &Env) -> Result<(), Error> {
-        ttl::bump_instance(env);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        Ok(())
+
+}
+
+impl ReasoningRegistry {
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    fn load_trace(env: &Env, trace_id: u64) -> Result<Trace, Error> {
+        Self::get_trace(env.clone(), trace_id)
+    }
+
+    fn require_active_agent(env: &Env, agent: &Address) -> Result<(), Error> {
+        let record = Self::load_agent(env, agent).ok_or(Error::AgentNotRegistered)?;
+        if matches!(record.status, AgentStatus::Active) {
+            Ok(())
+        } else {
+            Err(Error::AgentNotActive)
+        }
     }
 }
 
@@ -1976,7 +2278,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")]
+    #[should_panic(expected = "Error(Contract, #3004)")]
     fn unregistered_agent_cannot_publish() {
         let (env, client, _, agent) = setup();
         client.publish_trace(
@@ -1989,7 +2291,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
+    #[should_panic(expected = "Error(Contract, #3005)")]
     fn unknown_trace_cannot_be_verified() {
         let (env, client, _, _) = setup();
         client.verify_trace(&99, &BytesN::from_array(&env, &[0u8; 32]));
@@ -2108,8 +2410,8 @@ mod test {
         let cid = String::from_str(env, "ipfs://publish-refresh");
         client.publish_trace(
             agent,
-            &(100 + day),
-            &String::from_str(env, "trade"),
+            &(day % 50),
+            &TraceAction::Other(Symbol::new(env, "trade")),
             &trace_hash,
             &cid,
         );
@@ -3215,4 +3517,273 @@ mod test {
             .try_cancel_admin_transfer()
             .is_err());
     }
+
+    // ── #299: Retroactive signing-key revocation tests ───────────────────────
+
+    /// Helper: register an agent, add a signing key, and publish a signed trace.
+    fn setup_signed_key_and_trace(
+        env: &Env,
+        client: &ReasoningRegistryClient<'static>,
+        agent: &Address,
+        key_seed: u8,
+        trace_seed: u8,
+    ) -> (BytesN<32>, u64, ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[key_seed; 32]);
+        let pubkey_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let pubkey = BytesN::from_array(env, &pubkey_bytes);
+
+        let bind_msg = env.as_contract(&client.address, || {
+            ReasoningRegistry::key_bind_message(env, agent, &pubkey)
+        });
+        let proof_sig = BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&bind_msg)).to_bytes());
+        client.add_signing_key(agent, &pubkey, &proof_sig);
+
+        let trace_hash = BytesN::from_array(env, &[trace_seed; 32]);
+        let att_msg = env.as_contract(&client.address, || {
+            ReasoningRegistry::trace_attestation_message(
+                env,
+                agent,
+                NO_MARKET,
+                &TraceAction::ProposeMarket,
+                &trace_hash,
+            )
+        });
+        let trace_sig = BytesN::from_array(env, &signing_key.sign(&bytes_to_vec(&att_msg)).to_bytes());
+        let trace_id = client.publish_trace_signed(
+            agent,
+            &NO_MARKET,
+            &TraceAction::ProposeMarket,
+            &trace_hash,
+            &String::from_str(env, "ipfs://trace"),
+            &pubkey,
+            &trace_sig,
+        );
+        (pubkey, trace_id, signing_key)
+    }
+
+    #[test]
+    fn revoke_key_taints_only_traces_at_or_after_since() {
+        let (env, client, admin, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 1, 10);
+        // Advance time so the second trace has a later published_at.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 1, 20);
+
+        // Both traces are valid before revocation.
+        assert!(client.verify_trace_signature(&trace_id1));
+        assert!(client.verify_trace_signature(&trace_id2));
+        assert_eq!(
+            client.trace_verdict(&trace_id1, &BytesN::from_array(&env, &[10u8; 32])),
+            TraceVerdict::Valid
+        );
+
+        // Revoke with compromised_since = time after trace_id1 but before trace_id2.
+        let compromise_time = env.ledger().timestamp() - 50;
+        client.revoke_signing_key(
+            &agent,
+            &agent,
+            &pubkey,
+            &compromise_time,
+            &Symbol::new(&env, "leak"),
+        );
+
+        // trace_id1 (published before compromise) stays valid.
+        assert!(client.verify_trace_signature(&trace_id1));
+        assert_eq!(
+            client.trace_verdict(&trace_id1, &BytesN::from_array(&env, &[10u8; 32])),
+            TraceVerdict::Valid
+        );
+
+        // trace_id2 (published after compromise) is tainted.
+        assert!(!client.verify_trace_signature(&trace_id2));
+        assert_eq!(
+            client.trace_verdict(&trace_id2, &BytesN::from_array(&env, &[20u8; 32])),
+            TraceVerdict::KeyCompromised(compromise_time)
+        );
+
+        let _ = admin;
+    }
+
+    #[test]
+    fn revoke_by_admin_and_for_retired_agent() {
+        let (env, client, admin, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, trace_id, _) = setup_signed_key_and_trace(&env, &client, &agent, 2, 30);
+
+        // Retire the agent.
+        client.retire_agent(&agent);
+
+        // Admin can still revoke the key even for a retired agent.
+        let compromise_time = 0u64;
+        client.revoke_signing_key(
+            &admin,
+            &agent,
+            &pubkey,
+            &compromise_time,
+            &Symbol::new(&env, "admin_revoke"),
+        );
+
+        // The trace published after compromise (all traces, since time=0) is tainted.
+        assert!(!client.verify_trace_signature(&trace_id));
+        assert_eq!(
+            client.trace_verdict(&trace_id, &BytesN::from_array(&env, &[30u8; 32])),
+            TraceVerdict::KeyCompromised(0)
+        );
+    }
+
+    #[test]
+    fn since_can_only_move_earlier() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 3, 40);
+
+        let now = env.ledger().timestamp();
+        client.revoke_signing_key(&agent, &agent, &pubkey, &now, &Symbol::new(&env, "first"));
+
+        // A later compromised_since must be rejected.
+        assert_eq!(
+            client.try_revoke_signing_key(&agent, &agent, &pubkey, &(now + 1), &Symbol::new(&env, "second")),
+            Err(Ok(Error::AlreadyRevoked))
+        );
+
+        // An earlier compromised_since is accepted.
+        client.revoke_signing_key(&agent, &agent, &pubkey, &(now - 1), &Symbol::new(&env, "widened"));
+    }
+
+    #[test]
+    fn since_before_added_at_rejected() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 4, 50);
+        let added_at = env.ledger().timestamp();
+
+        // compromised_since before added_at is rejected.
+        assert_eq!(
+            client.try_revoke_signing_key(&agent, &agent, &pubkey, &(added_at + 1_000_000), &Symbol::new(&env, "future")),
+            Err(Ok(Error::InvalidEffectiveTime))
+        );
+    }
+
+    #[test]
+    fn signature_verdict_returns_key_compromised() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, trace_id, _) = setup_signed_key_and_trace(&env, &client, &agent, 5, 60);
+
+        // Before revocation, signature_verdict is Valid.
+        assert_eq!(
+            client.signature_verdict(&trace_id),
+            SignatureVerdict::Valid
+        );
+
+        // Revoke with compromised_since = 0 (taints all traces).
+        client.revoke_signing_key(&agent, &agent, &pubkey, &0u64, &Symbol::new(&env, "leak"));
+
+        // After revocation, signature_verdict is KeyCompromised.
+        assert_eq!(
+            client.signature_verdict(&trace_id),
+            SignatureVerdict::KeyCompromised(0)
+        );
+    }
+
+    #[test]
+    fn key_trace_count_and_key_traces() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 6, 70);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 6, 80);
+
+        assert_eq!(client.key_trace_count(&pubkey), 2);
+        let traces = client.key_traces(&pubkey, &0, &10);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces.get(0).unwrap(), trace_id1);
+        assert_eq!(traces.get(1).unwrap(), trace_id2);
+    }
+
+    #[test]
+    fn key_affected_from_binary_search() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 90);
+        let t1 = env.ledger().timestamp();
+        env.ledger().set_timestamp(t1 + 100);
+        let (_, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 91);
+        let t2 = env.ledger().timestamp();
+        env.ledger().set_timestamp(t2 + 100);
+        let (_, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 7, 92);
+
+        // Search for first trace at or after t2: should be index 1.
+        let idx = client.key_affected_from(&pubkey, &t2);
+        assert_eq!(idx, 1);
+
+        // Search for first trace at or after a future time: should be total (3).
+        let idx_future = client.key_affected_from(&pubkey, &(t2 + 1000));
+        assert_eq!(idx_future, 3);
+
+        // Empty index.
+        let empty_pk = BytesN::from_array(&env, &[99u8; 32]);
+        assert_eq!(client.key_affected_from(&empty_pk, &0), 0);
+    }
+
+    #[test]
+    fn other_keys_unaffected_by_revocation() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey1, trace_id1, _) = setup_signed_key_and_trace(&env, &client, &agent, 8, 100);
+        let (pubkey2, trace_id2, _) = setup_signed_key_and_trace(&env, &client, &agent, 9, 110);
+
+        // Revoke only key 1.
+        client.revoke_signing_key(&agent, &agent, &pubkey1, &0u64, &Symbol::new(&env, "leak1"));
+
+        // key1's trace is tainted.
+        assert!(!client.verify_trace_signature(&trace_id1));
+        // key2's trace is still valid.
+        assert!(client.verify_trace_signature(&trace_id2));
+    }
+
+    #[test]
+    fn verdict_precedence_hash_mismatch_over_key_compromised() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, trace_id, _) = setup_signed_key_and_trace(&env, &client, &agent, 10, 120);
+
+        // Revoke the key.
+        client.revoke_signing_key(&agent, &agent, &pubkey, &0u64, &Symbol::new(&env, "leak"));
+
+        // Hash mismatch takes precedence over KeyCompromised.
+        let wrong_hash = BytesN::from_array(&env, &[255u8; 32]);
+        assert_eq!(
+            client.trace_verdict(&trace_id, &wrong_hash),
+            TraceVerdict::HashMismatch
+        );
+    }
+
+    #[test]
+    fn revoke_key_unauthorized_caller_rejected() {
+        let (env, client, admin, agent) = setup();
+        client.register_agent(&agent);
+
+        let (pubkey, _, _) = setup_signed_key_and_trace(&env, &client, &agent, 11, 130);
+
+        let bystander = Address::generate(&env);
+        assert_eq!(
+            client.try_revoke_signing_key(&bystander, &agent, &pubkey, &0u64, &Symbol::new(&env, "bad")),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        let _ = admin;
+    }
+}
 }

@@ -78,7 +78,9 @@ draft) are no longer present.
 
 ## Contract Architecture
 
-### `market-core`
+Full per-contract specifications (functions, signatures, types, error codes, events, and storage keys) are generated from compiled WASM specs under [`oracledesk-stellar/docs/reference/`](oracledesk-stellar/docs/reference/):
+
+### `market-core` ([full reference](oracledesk-stellar/docs/reference/market-core.md))
 
 One instance holds every market, keyed by `market_id`. Pricing is a
 Gnosis-style constant-product FPMM — no floating point, no on-chain
@@ -89,25 +91,26 @@ off-chain (`model/fpmm_model.py` / `agents/core/fpmm.ts`) and calling
 | Function | Caller | Purpose |
 |---|---|---|
 | `create_market(...)` | Anyone | Seeds a market; caller becomes the sole LP; commits to `resolution_hash` |
-| `buy` / `sell` | Any trader | Trade while the market is open |
+| `buy` / `buy_v2` / `sell` / `sell_v2` | Any trader | Trade while the market is open (v2 adds deadline and limit-price bounds) |
 | `resolve` / `void_market` | Resolver only | Finalize a market after close |
 | `redeem` | Position holder | Claim a final position's payout |
-| `claim_pool_remainder` | Creator | Withdraw the LP's remaining pool after finality |
-| `sweep_fees` | Anyone | Moves accrued trading fees to the treasury |
+| `claim_pool_remainder` / `claim_lp_fees` | LP holder | Withdraw remaining LP pool and accrued LP fees |
+| `sweep_fees` | Anyone | Moves accrued protocol trading fees to the treasury |
+| `get_config` / `market_count` / `get_market` / `get_position` | Anyone | Read-only config, market state, and position views |
 | `get_price` / `quote_buy` / `quote_sell` | Anyone | Read-only pricing views |
-| `set_paused` / `set_default_fee_bps` / `set_resolver` / `set_treasury` | Admin only | Config |
+| `set_paused` / `set_default_fee_bps` / `propose_resolver` / `propose_treasury` | Admin only | Config and authenticated wiring |
 
 **Solvency invariant** (contract-tested): token balance for a market equals
 `sets_minted + fees_accrued`; `reserve_yes + Σ(user yes positions) ==
 sets_minted` (symmetrically for `no`).
 
-### `resolver`
+### `resolver` ([full reference](oracledesk-stellar/docs/reference/resolver.md))
 
 | Function | Caller | Purpose |
 |---|---|---|
-| `register_price_spec` / `register_signer_spec` | Anyone | Reveals a resolution rule; accepted only if it hashes to the market's commitment |
+| `register_price_spec` / `register_signer_spec` / `register_spec_v2` | Anyone | Reveals a resolution rule; accepted only if it hashes to the market's commitment |
 | `resolve_price` | Anyone | Resolves via a Reflector feed once the market is closed |
-| `attest` | A configured signer | Votes on an outcome (Attested mode) |
+| `attest` / `attest_with_evidence` | A configured signer | Votes on an outcome (Attested mode) |
 | `finalize_signers` | Anyone | Finalizes once threshold + dispute window have passed |
 | `cancel_proposal` / `guardian_void_market` | Admin (guardian) only | Edge-case recourse during a dispute |
 
@@ -115,14 +118,15 @@ Spec registration has **no caller restriction** — the cryptographic
 commitment is the only gate. See
 [ADR 0001](oracledesk-stellar/docs/adr/0001-resolution-commitment.md).
 
-### `treasury`
+### `treasury` ([full reference](oracledesk-stellar/docs/reference/treasury.md))
 
 | Function | Caller | Purpose |
 |---|---|---|
-| `agent_create_market` / `agent_buy` / `agent_sell` | Agent only | The only path that moves treasury capital; checks caps, then calls market-core itself |
-| `redeem` / `claim_pool_remainder` | Agent only | Recover the treasury's own positions after resolution |
+| `agent_create_market` / `agent_buy` / `agent_buy_v2` / `agent_sell` / `agent_sell_v2` | Authorized agent | The only path that moves treasury capital; checks caps, then calls market-core itself |
+| `close_trade` | Authorized agent | Closes open position accounting without erasing cumulative per-market lifetime spend |
+| `redeem` / `claim_pool_remainder` / `settle_market` | Agent / Permissionless (`settle_market`) | Recover the treasury's positions and LP remainders after resolution |
 | `deposit` | Anyone | Add USDC to the treasury |
-| `withdraw` | Admin only | Remove USDC |
+| `withdraw` | Admin / Depositor | Remove USDC |
 | `collect_market_fees` | Admin only | Pulls accrued fees from market-core |
 | `set_paused` | Admin only | Kill switch for agent trading |
 | `available_capital` / `daily_usage` / `get_config` | Anyone | Read-only views |
@@ -134,13 +138,14 @@ treasury -> market-core)`) needs the treasury to pre-authorize it via
 proven to fail without the fix and pass with it. See
 [ADR 0002](oracledesk-stellar/docs/adr/0002-cross-contract-calls.md).
 
-### `reasoning-registry`
+### `reasoning-registry` ([full reference](oracledesk-stellar/docs/reference/reasoning-registry.md))
 
 | Function | Caller | Purpose |
 |---|---|---|
 | `register_agent` / `unregister_agent` | Admin only | Maintains the allow-list of agents that can publish traces |
-| `publish_trace` | A registered agent | Records `{market_id, action, trace_hash, cid}`, returns a `trace_id` |
-| `get_trace` / `verify_trace` | Anyone | Read a trace / check a candidate hash against it |
+| `is_registered` | Anyone | Checks whether an agent address is currently registered |
+| `publish_trace` / `publish_chained_trace` | A registered agent | Records `{market_id, action, trace_hash, cid}`, returns a `trace_id` |
+| `get_trace` / `verify_trace` / `trace_count` | Anyone | Read a trace, verify a candidate hash, or query total published traces |
 | `market_trace_count` / `market_trace_at` | Anyone | Bounded per-market trace index (no unbounded storage growth) |
 
 ---
@@ -214,17 +219,19 @@ make test    # cargo test (40 tests), model/fpmm_model.py, x402 + agents test su
 
 ```bash
 cd oracledesk-stellar
-make deploy-testnet   # idempotent: generates/funds two throwaway testnet
-                       # identities, deploys all 4 contracts + a self-issued
-                       # test USDC, wires them together, writes
-                       # deployments/testnet.json
+make deploy-plan      # read live testnet state vs deployments/testnet.manifest.json
+                      # exits 0 if up to date, 2 if changes are planned, 1 if blocked
+make deploy-testnet   # apply planned changes via scripts/deployer/ with atomic
+                      # checkpointing to deployments/testnet.json (schema v2)
+make deploy-verify    # verify live contract wiring, agent registration, and funding
 make demo             # create -> trade -> resolve -> record trace -> verify
-                       # hash, entirely on testnet, with real transaction output
+                      # hash, entirely on testnet, with real transaction output
 ```
 
-Both scripts submit real Stellar testnet transactions using throwaway
-identities generated via `stellar keys generate --fund`. Nothing here ever
-touches mainnet.
+The declarative deployer (`scripts/deployer/`) enforces a hard Stellar testnet
+passphrase interlock and refuses non-testnet networks. `scripts/deploy-testnet.sh`
+delegates testnet runs to the declarative deployer for backward compatibility.
+Nothing here ever touches mainnet.
 
 ---
 

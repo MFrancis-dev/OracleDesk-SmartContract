@@ -9,7 +9,7 @@ const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
 #[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StakeConfig {
     pub admin: Address,
     pub token: Address,
@@ -23,7 +23,7 @@ pub struct StakeConfig {
 }
 
 #[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bond {
     pub amount: i128,
     pub locked: i128,
@@ -32,7 +32,7 @@ pub struct Bond {
 }
 
 #[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Config,
     Bond(Address),
@@ -163,7 +163,7 @@ impl SignerStakeContract {
         token_client.transfer(&signer, &env.current_contract_address(), &amount);
 
         let mut bond = Self::get_bond(&env, &signer);
-        bond.amount = bond.amount.checked_add(amount).unwrap_or_else(|_| {
+        bond.amount = bond.amount.checked_add(amount).unwrap_or_else(|| {
             panic_with_error!(&env, Error::SlashAmountTooLarge);
         });
 
@@ -174,7 +174,7 @@ impl SignerStakeContract {
             .persistent()
             .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
 
-        env.events().publish(("bond",), Bonded { signer, amount });
+        Bonded { signer, amount }.publish(&env);
     }
 
     pub fn request_unbond(env: Env, signer: Address, amount: i128) {
@@ -189,7 +189,7 @@ impl SignerStakeContract {
         let available = bond
             .amount
             .checked_sub(bond.locked)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 panic_with_error!(&env, Error::UnbondingStaked);
             });
 
@@ -197,19 +197,19 @@ impl SignerStakeContract {
             panic_with_error!(&env, Error::UnbondingStaked);
         }
 
-        bond.amount = bond.amount.checked_sub(amount).unwrap_or_else(|_| {
+        bond.amount = bond.amount.checked_sub(amount).unwrap_or_else(|| {
             panic_with_error!(&env, Error::UnbondingStaked);
         });
 
         bond.unbond_amount = bond
             .unbond_amount
             .checked_add(amount)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 panic_with_error!(&env, Error::SlashAmountTooLarge);
             });
 
         let config = Self::get_config(&env);
-        bond.unbond_at = env.ledger().timestamp().checked_add(config.unbond_delay).unwrap_or_else(|_| {
+        bond.unbond_at = env.ledger().timestamp().checked_add(config.unbond_delay).unwrap_or_else(|| {
             panic_with_error!(&env, Error::SlashAmountTooLarge);
         });
 
@@ -220,14 +220,11 @@ impl SignerStakeContract {
             .persistent()
             .extend_ttl(&DataKey::Bond(signer.clone()), BUMP_THRESHOLD, BUMP_TO);
 
-        env.events().publish(
-            ("unbond_requested",),
-            UnbondRequested {
+        UnbondRequested {
                 signer,
                 amount,
                 unbond_at: bond.unbond_at,
-            },
-        );
+            }.publish(&env);
     }
 
     pub fn withdraw(env: Env, signer: Address) {
@@ -259,8 +256,7 @@ impl SignerStakeContract {
 
         token_client.transfer(&env.current_contract_address(), &signer, &amount);
 
-        env.events()
-            .publish(("withdrawn",), Withdrawn { signer, amount });
+        Withdrawn { signer, amount }.publish(&env);
     }
 
     pub fn lock(env: Env, signer: Address, market_id: u64) {
@@ -292,13 +288,12 @@ impl SignerStakeContract {
             .persistent()
             .extend_ttl(&DataKey::Lock(signer.clone(), market_id), BUMP_THRESHOLD, BUMP_TO);
 
-        let locked_amount = bond.amount.checked_sub(bond.locked).unwrap_or_else(|_| 0i128);
-        env.events()
-            .publish(("locked",), Locked {
+        let locked_amount = bond.amount.checked_sub(bond.locked).unwrap_or_else(|| 0i128);
+        Locked {
                 signer,
                 market_id,
                 amount: locked_amount,
-            });
+            }.publish(&env);
     }
 
     pub fn unlock(env: Env, signer: Address, market_id: u64) {
@@ -313,14 +308,11 @@ impl SignerStakeContract {
         env.storage().persistent().remove(&key);
 
         let bond = Self::get_bond(&env, &signer);
-        env.events().publish(
-            ("unlocked",),
-            Unlocked {
+        Unlocked {
                 signer,
                 market_id,
-                amount: bond.amount.checked_sub(bond.locked).unwrap_or_else(|_| 0i128),
-            },
-        );
+                amount: bond.amount.checked_sub(bond.locked).unwrap_or_else(|| 0i128),
+            }.publish(&env);
     }
 
     pub fn slash(env: Env, signer: Address, bps: u32, reporter: Option<Address>) -> i128 {
@@ -335,11 +327,11 @@ impl SignerStakeContract {
         let slash_amount = bond
             .amount
             .checked_mul(bps as i128)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 panic_with_error!(&env, Error::SlashAmountTooLarge);
             })
             .checked_div(10_000)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 panic_with_error!(&env, Error::InsufficientSlashAmount);
             });
 
@@ -347,7 +339,7 @@ impl SignerStakeContract {
             panic_with_error!(&env, Error::SlashAmountTooLarge);
         }
 
-        bond.amount = bond.amount.checked_sub(slash_amount).unwrap_or_else(|_| {
+        bond.amount = bond.amount.checked_sub(slash_amount).unwrap_or_else(|| {
             panic_with_error!(&env, Error::InsufficientSlashAmount);
         });
 
@@ -370,15 +362,12 @@ impl SignerStakeContract {
         );
 
         let reason = Symbol::new(&env, "slashed");
-        env.events().publish(
-            ("slashed",),
-            Slashed {
+        Slashed {
                 signer: signer.clone(),
                 amount: slash_amount,
                 reason,
                 reporter: reporter.clone(),
-            },
-        );
+            }.publish(&env);
 
         slash_amount
     }
@@ -391,7 +380,7 @@ impl SignerStakeContract {
         let config = Self::get_config(&env);
         let bond = Self::get_bond(&env, &signer);
 
-        let available = bond.amount.checked_sub(bond.unbond_amount).unwrap_or_else(|_| 0i128);
+        let available = bond.amount.checked_sub(bond.unbond_amount).unwrap_or_else(|| 0i128);
         available >= config.min_stake
     }
 
@@ -399,7 +388,7 @@ impl SignerStakeContract {
         env.storage()
             .instance()
             .get::<_, StakeConfig>(&DataKey::Config)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 panic_with_error!(env, Error::InvalidConfig);
             })
     }

@@ -37,7 +37,7 @@ export class MarketQueue {
 
 export type FollowAdapter = Pick<
   StellarAdapter,
-  "rpcServer" | "contractIds" | "getMarket" | "treasuryPosition" | "resolutionState" | "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace"
+  "rpcServer" | "contractIds" | "getMarket" | "disputableConfig" | "treasuryPosition" | "resolutionState" | "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace"
 >;
 
 export interface FollowDeps {
@@ -81,7 +81,9 @@ export async function followTask(d: FollowDeps): Promise<Task & { queue: MarketQ
           return p.yes + p.no;
         },
         proposalState: (id) => d.adapter.resolutionState(id),
-        disputeWindowSecs: async () => BigInt(d.cfg.events.disputeWindowSecs),
+        // The market's committed window (resolver `Disputable(id)`); the config
+        // constant is only the fallback for a market that does not expose one.
+        disputeWindowSecs: async (id) => (await d.adapter.disputableConfig(id))?.disputeWindow ?? BigInt(d.cfg.events.disputeWindowSecs),
         alert: (a) => log("PROPOSAL_ALERT", { ...a }),
       }),
       finalityTracker({

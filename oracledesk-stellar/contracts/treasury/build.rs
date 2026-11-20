@@ -5,4 +5,7 @@ mod verify_wasm_hash;
 
 fn main() {
     verify_wasm_hash::verify_wasm_hash("market_core.wasm", "market_core.wasm.sha256");
+    // The resolver client (register_spec_v2, trade_status, spec_kind) is
+    // generated from this copy; it is pinned like market_core.wasm (#273).
+    verify_wasm_hash::verify_wasm_hash("resolver.wasm", "resolver.wasm.sha256");
 }

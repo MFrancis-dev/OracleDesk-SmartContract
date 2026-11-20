@@ -26,6 +26,71 @@ mod market_core {
 }
 use market_core::Client as MarketCoreClient;
 
+// ─── Cross-contract call helpers (#293 / ADR 0006) ───────────────────────────
+
+/// Base discriminant for resolver error codes (ADR 0006: 1001..=1999).
+pub const RESOLVER_ERROR_BASE: u32 = 1000;
+
+/// Map a market-core error to the resolver's cross-contract error range.
+fn map_market_core_error(e: market_core::Error) -> Error {
+    use market_core::Error as M;
+    match e {
+        M::MarketNotFound => Error::MarketCoreMarketNotFound,
+        M::NotFinal => Error::MarketCoreNotFinal,
+        M::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        M::MarketClosed => Error::MarketCoreMarketClosed,
+        M::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        M::InsufficientShares => Error::MarketCoreInsufficientShares,
+        M::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        M::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        M::InvalidAmount => Error::MarketCoreInvalidAmount,
+        M::Overflow => Error::MarketCoreOverflow,
+        M::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Unwrap a cross-contract call result into the resolver's error type.
+///
+/// soroban-sdk 27 `try_*` clients return `Result<Result<T, ConversionError>,
+/// Result<ContractError, InvokeError>>`: a return-value conversion failure is
+/// the inner `Err`, and a contract error is the outer `Err(Ok(_))`.
+fn core_call<T>(
+    r: Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(e)) => Err(map_market_core_error(e)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Unwrap a reasoning-registry cross-contract call.
+///
+/// Same soroban-sdk 27 `try_*` shape as `core_call`; any failure is opaque to
+/// the caller, so the error payloads are not inspected.
+fn registry_call<T, E>(
+    r: Result<Result<T, soroban_sdk::ConversionError>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(Error::RegistryCallFailed),
+    }
+}
+
+/// Convert the shared `Outcome` (Yes/No only) to the market-core imported
+/// `Outcome`. `Invalid` never reaches here: it is routed to `void_market`.
+fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
+    match o {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+    }
+}
+
 // The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
 // sha256(spec.to_xdr())`), so its definitions now live in the shared
 // `oracledesk-types` crate rather than being duplicated per contract. Re-export
@@ -72,12 +137,8 @@ pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
+// #293: removed duplicate local OracleAsset — the shared type from oracledesk_types is re-exported
+// above (line 35). Keeping it here caused E0255 / orphan-impl errors.
 
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
@@ -113,6 +174,42 @@ impl ResolutionState {
     fn is_terminal(self) -> bool {
         matches!(self, Self::Finalized | Self::Expired)
     }
+}
+
+/// Which kind of resolution rule a market has *revealed*, as read by
+/// [`Resolver::spec_kind`]. `ResolutionState` cannot tell "revealed" from "not
+/// revealed": a revealed price or signer market still reads `Unconfigured`
+/// until it is finalized, disputed or reset, so the kind is derived from which
+/// spec entry exists (#273).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecKind {
+    /// No spec has been revealed for this market.
+    None,
+    Price,
+    ScaledPrice,
+    Twap,
+    Signers,
+    Disputable,
+    WeightedKeys,
+    Committee,
+    /// A hybrid price-then-signers market, before and after its fallback opens.
+    Hybrid,
+}
+
+/// Everything the treasury's pre-trade resolvability check needs, in one
+/// cross-contract call (#273).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeStatus {
+    pub spec: SpecKind,
+    pub state: ResolutionState,
+    /// market-core `close_time`.
+    pub close_time: u64,
+    /// `close_time + RESOLUTION_GRACE_SECS`: when `expire_market` becomes callable.
+    pub deadline: u64,
+    /// A signer proposal is pending (its dispute window may be open).
+    pub open_proposal: bool,
 }
 
 /// Which resolution path a market was on when it expired.
@@ -508,6 +605,20 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
+    MarketCoreMarketNotFound      = 1044,
+    MarketCoreNotFinal            = 1045,
+    MarketCoreMarketNotOpen       = 1046,
+    MarketCoreMarketClosed        = 1047,
+    MarketCoreInsufficientLiquidity = 1048,
+    MarketCoreInsufficientShares  = 1049,
+    MarketCoreAlreadyClaimed      = 1050,
+    MarketCoreNothingToRedeem     = 1051,
+    MarketCoreInvalidAmount       = 1052,
+    MarketCoreOverflow            = 1053,
+    MarketCoreSlippageExceeded    = 1054,
+    MarketCoreCallFailed          = 1055,
+    RegistryCallFailed            = 1056,
 }
 
 #[contracttype]
@@ -565,6 +676,26 @@ pub enum DataKey {
     /// discipline, issue #27): a revealed TWAP rule's `TwapConfig` lives
     /// under its own key so no stored payload is ever reinterpreted.
     PriceTwap(u64),
+    /// #297: timestamp at which an epoch of a committee started. Written in
+    /// `create_committee` (epoch 1) and `execute_rotation` (new epoch). Used
+    /// by `epoch_at` to walk back from the current epoch to the one in force
+    /// at a market's close_time.
+    EpochStart(u64, u32),
+    /// #297: the pinned (committee_id, epoch) for a committee market, set on
+    /// the first attestation after close or through `pin_committee_epoch`.
+    /// Absent until pinned, so pre-attestation views compute the would-be pin
+    /// without writing.
+    MarketEpoch(u64),
+}
+
+/// #297: A committee member set snapshotted at a specific epoch. Loaded from
+/// `MemberAt(committee_id, epoch)` so attestations and quorum always use the
+/// epoch that was in force at the market's close_time, not the live committee.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeSnapshot {
+    pub epoch: u32,
+    pub members: Vec<Address>,
+    pub threshold: u32,
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -574,7 +705,11 @@ enum SignerAuthority {
     Signers(SignerConfig),
     Weighted(WeightedKeyConfig),
     Disputable(DisputableSignerConfig),
-    Committee(CommitteeRef, Committee),
+    /// #297: the second field is the pinned epoch snapshot, loaded from
+    /// `MemberAt(committee_id, pinned_epoch)`. If the market is not yet pinned
+    /// (no attestation has happened and `pin_committee_epoch` has not run),
+    /// the snapshot is computed from the would-be pin without writing.
+    Committee(CommitteeRef, CommitteeSnapshot),
     Hybrid(HybridConfig),
 }
 
@@ -778,6 +913,18 @@ pub struct RotationExecuted {
 pub struct RotationCancelled {
     #[topic]
     pub committee_id: u64,
+}
+
+/// #297: Emitted when a committee market's epoch is pinned to the epoch in
+/// force at close_time, either through the first attestation or through
+/// `pin_committee_epoch`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeEpochPinned {
+    #[topic]
+    pub market_id: u64,
+    pub committee_id: u64,
+    pub epoch: u32,
 }
 
 #[contractevent]
@@ -1065,13 +1212,7 @@ impl Resolver {
         spec: CommitteeRef,
     ) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
-        let committee = Self::load_committee(&env, spec.committee_id)?;
-        if committee.epoch < spec.min_epoch {
-            return Err(Error::RotationBoundExceeded);
-        }
-        if spec.dispute_window == 0 {
-            return Err(Error::InvalidConfig);
-        }
+        Self::validate_committee_ref(&env, &spec)?;
         let rule = ResolutionSpec::Committee(spec);
         Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
         Self::store_rule(&env, market_id, &rule);
@@ -1085,6 +1226,9 @@ impl Resolver {
     }
 
     /// Creates a reusable committee with an admin, member set, threshold, and time-lock delay.
+    /// The named `admin` must authorise creation (#304): without this gate anyone could
+    /// create a committee claiming any address as its admin, consuming sequential ids and
+    /// filling instance storage at zero cost beyond fees.
     pub fn create_committee(
         env: Env,
         admin: Address,
@@ -1092,6 +1236,8 @@ impl Resolver {
         threshold: u32,
         rotation_delay: u64,
     ) -> Result<u64, Error> {
+        // #304: require the named admin's auth before allocating a committee id.
+        admin.require_auth();
         Self::validate_committee_members(&members)?;
         if threshold == 0 || threshold > members.len() {
             return Err(Error::InvalidConfig);
@@ -1115,6 +1261,10 @@ impl Resolver {
 
         let snap_key = DataKey::MemberAt(id, 1);
         Self::persist(&env, &snap_key, &(members.clone(), threshold));
+
+        // #297: record the timestamp at which epoch 1 started.
+        let epoch_start_key = DataKey::EpochStart(id, 1);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
 
         CommitteeCreated {
             committee_id: id,
@@ -1184,6 +1334,9 @@ impl Resolver {
             &DataKey::MemberAt(committee_id, new_epoch),
             &(pending.members, pending.threshold),
         );
+        // #297: record the timestamp at which the new epoch started.
+        let epoch_start_key = DataKey::EpochStart(committee_id, new_epoch);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
         RotationExecuted {
             committee_id,
             epoch: new_epoch,
@@ -1208,6 +1361,50 @@ impl Resolver {
     /// Reads committee state and extends its storage TTL.
     pub fn get_committee(env: Env, committee_id: u64) -> Result<Committee, Error> {
         Self::load_committee(&env, committee_id)
+    }
+
+    /// #297: Permissionlessly pins the committee epoch for a market to the
+    /// epoch in force at `close_time`. Can be called by keepers right after
+    /// close, before any rotation lands. Idempotent: if already pinned, the
+    /// existing pin is kept. Must not run before close_time.
+    pub fn pin_committee_epoch(env: Env, market_id: u64) -> Result<(u64, u32), Error> {
+        let ref_spec: CommitteeRef = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitteeSpec(market_id))
+            .ok_or(Error::MarketNotConfigured)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let snapshot = Self::pin_epoch_for_market(&env, market_id, &ref_spec, market.close_time)?;
+        Ok((ref_spec.committee_id, snapshot.epoch))
+    }
+
+    /// #297: View returning the pinned (committee_id, epoch) for a market, or
+    /// `None` if not yet pinned.
+    pub fn market_committee_epoch(env: Env, market_id: u64) -> Option<(u64, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketEpoch(market_id))
+    }
+
+    /// #297: View returning the members and threshold for a committee at a
+    /// specific epoch, from the `MemberAt` snapshot.
+    pub fn committee_members_at(
+        env: Env,
+        committee_id: u64,
+        epoch: u32,
+    ) -> Result<(Vec<Address>, u32), Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok((members, threshold))
     }
 
     /// Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.
@@ -1393,13 +1590,10 @@ impl Resolver {
         }
         Self::persist(&env, &cancel_key, &(cancels + 1));
         Self::remove_proposal(&env, market_id);
-        if storage.has(&DataKey::WeightedKeys(market_id)) {
-            Self::persist(
-                &env,
-                &DataKey::Round(market_id),
-                &(Self::round(&env, market_id) + 1),
-            );
-        }
+        // #286: bump round for every signer mode, not just weighted-key markets.
+        // This allows signers to re-attest after a cancel, fixing the stranded-quorum bug.
+        let next_round = Self::round(&env, market_id) + 1;
+        Self::persist(&env, &DataKey::Round(market_id), &next_round);
         Self::bump_market_entries(&env, market_id, close_time);
         GuardianAction {
             market_id,
@@ -2320,6 +2514,55 @@ impl Resolver {
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
     }
+
+    /// Which kind of rule `market_id` has revealed (`SpecKind::None` before any
+    /// reveal). Existence checks only (`has`), so the read footprint stays
+    /// minimal; a missing or archived entry reads as `None`, it never panics.
+    /// Needed because `state()` stays `Unconfigured` for a revealed price or
+    /// signer market (#273).
+    pub fn spec_kind(env: Env, market_id: u64) -> SpecKind {
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::Price(market_id)) {
+            SpecKind::Price
+        } else if storage.has(&DataKey::PriceScaled(market_id)) {
+            SpecKind::ScaledPrice
+        } else if storage.has(&DataKey::PriceTwap(market_id)) {
+            SpecKind::Twap
+        } else if storage.has(&DataKey::Signers(market_id)) {
+            SpecKind::Signers
+        } else if storage.has(&DataKey::Disputable(market_id)) {
+            SpecKind::Disputable
+        } else if storage.has(&DataKey::WeightedKeys(market_id)) {
+            SpecKind::WeightedKeys
+        } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
+            SpecKind::Committee
+        } else if storage.has(&DataKey::Hybrid(market_id)) {
+            SpecKind::Hybrid
+        } else {
+            SpecKind::None
+        }
+    }
+
+    /// The spec kind, resolution state, deadline and proposal flag in one read:
+    /// one cross-contract call from the treasury instead of four. Reads
+    /// market-core's `close_time` once. A pure view: it does not extend any TTL
+    /// (so a simulation stays read-only), unlike `instance_get`.
+    pub fn trade_status(env: Env, market_id: u64) -> Result<TradeStatus, Error> {
+        let market_core: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        Ok(TradeStatus {
+            spec: Self::spec_kind(env.clone(), market_id),
+            state: Self::resolution_state(&env, market_id),
+            close_time: market.close_time,
+            deadline: Self::deadline(&market),
+            open_proposal: Self::has_proposal(&env, market_id),
+        })
+    }
 }
 
 impl Resolver {
@@ -2554,8 +2797,11 @@ impl Resolver {
             return Ok(SignerAuthority::Weighted(cfg));
         }
         if let Some(ref_spec) = storage.get::<_, CommitteeRef>(&DataKey::CommitteeSpec(market_id)) {
-            let comm = Self::load_committee(env, ref_spec.committee_id)?;
-            return Ok(SignerAuthority::Committee(ref_spec, comm));
+            // #297: use the pinned epoch snapshot, or compute the would-be pin
+            // without writing, so views stay read-only before the first attestation.
+            let close_time = Self::market_close_time(env, market_id)?;
+            let snapshot = Self::committee_snapshot(env, market_id, &ref_spec, close_time)?;
+            return Ok(SignerAuthority::Committee(ref_spec, snapshot));
         }
         if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(SignerAuthority::Hybrid(cfg));
@@ -2582,20 +2828,17 @@ impl Resolver {
                 let round = Self::round(env, market_id);
                 Self::round_weight(env, market_id, round, &o) >= cfg.weight_threshold
             }),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return false;
-                }
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: quorum is counted against the pinned epoch's snapshot
+                // only. Rotations after close have no effect.
+                let _ = ref_spec;
                 let mut votes: u32 = 0;
-                for member in comm.members.iter() {
+                for member in snapshot.members.iter() {
                     if Self::has_attested(env, market_id, outcome, &member) {
                         votes += 1;
                     }
                 }
-                votes >= comm.threshold
+                votes >= snapshot.threshold
             }
             SignerAuthority::Hybrid(cfg) => {
                 Self::attestation_count(env, market_id, outcome) >= cfg.fallback.threshold
@@ -2971,13 +3214,10 @@ impl Resolver {
             ResolutionSpec::WeightedKeys(cfg) => Self::weighted_config_is_valid(cfg),
             ResolutionSpec::SignersDisputable(cfg) => Self::disputable_config_is_valid(cfg),
             ResolutionSpec::Committee(cfg) => {
-                if cfg.dispute_window == 0 {
-                    return Err(Error::InvalidConfig);
-                }
-                let committee = Self::load_committee(env, cfg.committee_id)?;
-                if committee.epoch < cfg.min_epoch {
-                    return Err(Error::RotationBoundExceeded);
-                }
+                // #297: the V2/V3 reveal path now validates the committee ref
+                // through validate_committee_ref, shared with
+                // register_committee_spec.
+                Self::validate_committee_ref(env, cfg)?;
                 true
             }
             ResolutionSpec::Hybrid(cfg) => {
@@ -3000,7 +3240,7 @@ impl Resolver {
 
     fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
         let storage = env.storage().persistent();
-        let (_key, state) = match rule {
+        let (key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
                 storage.set(&key, cfg);
@@ -3149,6 +3389,174 @@ impl Resolver {
         Ok(comm)
     }
 
+    // ── #297: epoch binding helpers ───────────────────────────────────────
+
+    /// Maximum `max_rotation_delta` a committee market may declare. Bounds the
+    /// `epoch_at` walk-back footprint so a single attestation never reads more
+    /// than `MAX_ROTATION_DELTA + 1` `EpochStart` entries.
+    pub const MAX_ROTATION_DELTA: u32 = 16;
+
+    /// Walk back from `current` epoch to the epoch whose `EpochStart` is <=
+    /// `ts`, at most `max_steps + 1` reads. Returns the epoch in force at `ts`.
+    /// For committees created before this change (no `EpochStart` for epoch 1),
+    /// a missing entry at epoch 1 is treated as "started at creation" (0).
+    fn epoch_at(
+        env: &Env,
+        committee_id: u64,
+        current: u32,
+        ts: u64,
+        max_steps: u32,
+    ) -> Result<u32, Error> {
+        let mut epoch = current;
+        let mut steps = 0u32;
+        loop {
+            let key = DataKey::EpochStart(committee_id, epoch);
+            let started_at = env.storage().persistent().get::<_, u64>(&key);
+            match started_at {
+                Some(t) if t <= ts => return Ok(epoch),
+                Some(_) => {}
+                None => {
+                    // Legacy committee without EpochStart: epoch 1 started at
+                    // creation (treated as 0, which is <= any ts). Other epochs
+                    // without EpochStart are unknown → fall back to current.
+                    if epoch == 1 {
+                        return Ok(1);
+                    }
+                }
+            }
+            if steps >= max_steps || epoch == 0 {
+                return Err(Error::RotationBoundExceeded);
+            }
+            epoch = epoch.saturating_sub(1);
+            steps += 1;
+        }
+    }
+
+    /// Load the member set and threshold for a committee at a specific epoch.
+    fn load_snapshot(env: &Env, committee_id: u64, epoch: u32) -> Result<CommitteeSnapshot, Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok(CommitteeSnapshot {
+            epoch,
+            members,
+            threshold,
+        })
+    }
+
+    /// Compute the epoch that was in force at `close_time` for a committee
+    /// market, without writing. Used by views before pinning.
+    fn compute_pinned_epoch(
+        env: &Env,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<u32, Error> {
+        let comm = Self::load_committee(env, ref_spec.committee_id)?;
+        if ref_spec.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let epoch = Self::epoch_at(
+            env,
+            ref_spec.committee_id,
+            comm.epoch,
+            close_time,
+            ref_spec.max_rotation_delta,
+        )?;
+        if epoch < ref_spec.min_epoch
+            || epoch.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
+        {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(epoch)
+    }
+
+    /// Load or compute the pinned snapshot for a committee market. If the
+    /// market is already pinned, use the stored epoch. If not, compute the
+    /// would-be pin without writing (for views like `has_valid_proposal`).
+    fn committee_snapshot(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        if let Some((committee_id, epoch)) =
+            env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+        {
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        // Not yet pinned: compute the would-be pin.
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        Self::load_snapshot(env, ref_spec.committee_id, epoch)
+    }
+
+    /// Pin the epoch for a committee market: write `MarketEpoch` and bump
+    /// `MemberAt`, `EpochStart`, and `CommitteeSpec` to the market target.
+    fn pin_epoch_for_market(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        let storage = env.storage().persistent();
+        let pin_key = DataKey::MarketEpoch(market_id);
+        if let Some((committee_id, epoch)) = storage.get::<_, (u64, u32)>(&pin_key) {
+            // Already pinned: return the existing snapshot.
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        let snapshot = Self::load_snapshot(env, ref_spec.committee_id, epoch)?;
+
+        // Write the pin.
+        let pin_value = (ref_spec.committee_id, epoch);
+        Self::persist(env, &pin_key, &pin_value);
+
+        // Bump the snapshot and epoch-start entries to the market target so
+        // they survive until the market finalizes.
+        let target = ttl::market_target(env, close_time);
+        let member_key = DataKey::MemberAt(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&member_key) {
+            ttl::bump_persistent(env, &member_key, target);
+        }
+        let epoch_start_key = DataKey::EpochStart(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&epoch_start_key) {
+            ttl::bump_persistent(env, &epoch_start_key, target);
+        }
+        // Bump the CommitteeSpec entry too.
+        let spec_key = DataKey::CommitteeSpec(market_id);
+        if env.storage().persistent().has(&spec_key) {
+            ttl::bump_persistent(env, &spec_key, target);
+        }
+
+        CommitteeEpochPinned {
+            market_id,
+            committee_id: ref_spec.committee_id,
+            epoch,
+        }
+        .publish(env);
+
+        Ok(snapshot)
+    }
+
+    /// #297: Validate a CommitteeRef against the live committee registry.
+    /// Shared between `register_committee_spec` and the V2/V3 reveal path so
+    /// both check existence, min_epoch, and dispute_window consistently.
+    fn validate_committee_ref(env: &Env, cfg: &CommitteeRef) -> Result<(), Error> {
+        if cfg.dispute_window == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if cfg.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let committee = Self::load_committee(env, cfg.committee_id)?;
+        if committee.epoch < cfg.min_epoch {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(())
+    }
+
     fn record_attestation(
         env: &Env,
         market_id: u64,
@@ -3171,17 +3579,27 @@ impl Resolver {
                 (cfg.threshold, None)
             }
             SignerAuthority::Weighted(_) => return Err(Error::WrongMode),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return Err(Error::RotationBoundExceeded);
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: pin the epoch on the first attestation after close.
+                // The snapshot is already loaded; pin it to storage so future
+                // reads use the pinned epoch. The epoch bound check is already
+                // enforced by compute_pinned_epoch inside committee_snapshot.
+                if !env.storage().persistent().has(&DataKey::MarketEpoch(market_id)) {
+                    let close_time = Self::market_close_time(env, market_id)?;
+                    Self::pin_epoch_for_market(env, market_id, ref_spec, close_time)?;
                 }
-                if !Self::contains(&comm.members, &signer) {
+                // Re-read the pinned snapshot to be sure we use the stored pin.
+                let pinned = if let Some((cid, ep)) =
+                    env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+                {
+                    Self::load_snapshot(env, cid, ep)?
+                } else {
+                    snapshot.clone()
+                };
+                if !Self::contains(&pinned.members, &signer) {
                     return Err(Error::NotSigner);
                 }
-                (comm.threshold, Some(current))
+                (pinned.threshold, Some(pinned.epoch))
             }
             SignerAuthority::Hybrid(cfg) => {
                 if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
@@ -3364,10 +3782,30 @@ impl Resolver {
             DataKey::CountV2(market_id, AttestedOutcome::Yes),
             DataKey::CountV2(market_id, AttestedOutcome::No),
             DataKey::CountV2(market_id, AttestedOutcome::Invalid),
+            // #297: committee epoch-binding entries are bumped alongside the
+            // market's other entries so they survive until finalization.
+            DataKey::CommitteeSpec(market_id),
+            DataKey::MarketEpoch(market_id),
         ];
         for key in keys {
             if env.storage().persistent().has(&key) {
                 ttl::bump_persistent(env, &key, target);
+            }
+        }
+        // #297: also bump the pinned snapshot's MemberAt and EpochStart entries.
+        // These are shared across markets; each market bumping them is idempotent.
+        if let Some((committee_id, epoch)) = env
+            .storage()
+            .persistent()
+            .get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+        {
+            let member_key = DataKey::MemberAt(committee_id, epoch);
+            if env.storage().persistent().has(&member_key) {
+                ttl::bump_persistent(env, &member_key, target);
+            }
+            let epoch_start_key = DataKey::EpochStart(committee_id, epoch);
+            if env.storage().persistent().has(&epoch_start_key) {
+                ttl::bump_persistent(env, &epoch_start_key, target);
             }
         }
     }
@@ -3957,7 +4395,7 @@ mod test {
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -3986,7 +4424,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4279,7 +4717,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
@@ -4521,7 +4959,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5002,7 +5440,7 @@ mod test {
         open(&d);
         let treasury = d.f.market_core.get_config().treasury;
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
         assert_eq!(
             d.f.resolver.state(&d.f.market_id),
             ResolutionState::Finalized
@@ -5024,7 +5462,10 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_escrow(&d, 0);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -5084,7 +5525,10 @@ mod test {
         assert_eq!(status(&d), MarketStatus::Open);
         d.f.resolver
             .escalation_attest(&d.f.market_id, &d.members[2], &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
@@ -5237,7 +5681,7 @@ mod test {
                 },
             }])
             .settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     #[test]
@@ -5409,7 +5853,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5592,7 +6036,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5711,7 +6155,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5950,7 +6394,7 @@ mod test {
         assert!(last_price_resolution(&f).from_snapshot);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6113,7 +6557,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6268,7 +6712,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
         // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
         assert_eq!(
@@ -6277,7 +6724,10 @@ mod test {
             Err(Ok(Error::AlreadyFinalized))
         );
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
@@ -6297,7 +6747,10 @@ mod test {
         f.env.ledger().set_timestamp(2_000);
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
             Err(Ok(Error::AlreadyFinalized))
@@ -6398,7 +6851,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
@@ -6491,9 +6947,13 @@ mod test {
         f.market_core.accept_resolver();
 
         f.env.ledger().set_timestamp(2_000);
-        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core
+            .resolve(&f.market_id, &market_core::Outcome::No);
 
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
         // This resolver saw none of it: no votes, still "pending", and it
         // can no longer move the market (market-core rejects it as resolver).
         assert_eq!(
@@ -6509,7 +6969,10 @@ mod test {
         attest_both(&f, AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
     }
 
     /// Everything observable about market-core through a resolver scenario,
@@ -6523,25 +6986,31 @@ mod test {
         let mut t = std::vec::Vec::new();
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "quote {}",
-            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+            f.market_core
+                .quote_buy(&id, &market_core::Outcome::Yes, &(10 * one))
         ));
         t.push(format!(
             "buy {}",
             f.market_core
-                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+                .buy(&creator, &id, &market_core::Outcome::Yes, &(10 * one), &0)
         ));
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "sell {}",
-            f.market_core
-                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+            f.market_core.sell(
+                &creator,
+                &id,
+                &market_core::Outcome::Yes,
+                &(3 * one),
+                &(100 * one)
+            )
         ));
         t.push(format!(
             "pos {:?}",
@@ -6591,6 +7060,323 @@ mod test {
         model_trace_expire_blocked_by_valid_proposal,
         model_trace_admin_bypass_resolves_without_threshold,
     );
+
+    // ----- spec_kind / trade_status (#273) ----------------------------------
+
+    #[test]
+    fn spec_kind_none_before_reveal() {
+        // A market whose spec is committed to but not yet revealed.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        // An id that does not exist is also None, never a panic.
+        assert_eq!(f.resolver.spec_kind(&9_999), SpecKind::None);
+        let t = f.resolver.trade_status(&f.market_id);
+        assert_eq!(t.spec, SpecKind::None);
+        assert_eq!(t.state, ResolutionState::Unconfigured);
+        assert!(!t.open_proposal);
+        assert_eq!(t.close_time, 2_000);
+        assert_eq!(t.deadline, 2_000 + RESOLUTION_GRACE_SECS);
+    }
+
+    #[test]
+    fn trade_status_of_an_unknown_market_is_an_error_not_a_panic() {
+        let f = signer_fixture();
+        assert!(f.resolver.try_trade_status(&9_999).is_err());
+    }
+
+    #[test]
+    fn spec_kind_for_each_register_path() {
+        // Signers: state() moves to SignersPending on reveal.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Signers);
+
+        // Price: state() stays Unconfigured after the reveal, which is exactly
+        // why spec_kind exists.
+        let f = fixture(|env, r, _a, _b| ResolutionSpec::Price(price_spec(env, r)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::Unconfigured
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Price);
+
+        // Disputable.
+        let d = dispute_fixture(false);
+        assert_eq!(d.f.resolver.spec_kind(&d.f.market_id), SpecKind::Disputable);
+
+        // Weighted keys.
+        let w = weighted_fixture();
+        assert_eq!(w.resolver.spec_kind(&w.market_id), SpecKind::WeightedKeys);
+    }
+
+    #[test]
+    fn spec_kind_for_scaled_and_twap_paths() {
+        let (f, cfg) = scaled_fixture_at(2_000, |env, reflector, _a, _b| ScaledPriceConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            threshold: 2_000,
+            threshold_decimals: 7,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_scaled_price_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::ScaledPrice);
+
+        let (f, cfg) = twap_fixture(|env, reflector, _a, _b| {
+            twap_price_spec(env, reflector, 2_000, PriceDirection::Above, 30, 2, 10)
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_twap_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Twap);
+    }
+
+    #[test]
+    fn spec_kind_for_hybrid_and_committee_paths() {
+        // Hybrid, revealed through the V2 envelope. The kind survives the
+        // fallback opening (the Hybrid entry is never removed).
+        let salt = [5u8; 32];
+        let f = v2_fixture(salt, |env, r, a, b| {
+            ResolutionSpec::Hybrid(HybridConfig {
+                price: price_spec(env, r),
+                fallback: signer_spec(env, a, b),
+                fallback_after: 100,
+            })
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Hybrid);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::HybridPricePending
+        );
+        assert_eq!(
+            f.resolver.trade_status(&f.market_id).state,
+            ResolutionState::HybridPricePending
+        );
+
+        // Committee: the market commits to a reusable committee registry entry.
+        let salt = [6u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 0,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        let id = f
+            .resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        assert_eq!(id, 0, "the fixture committed to the first committee id");
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Committee);
+    }
+
+    #[test]
+    fn trade_status_reports_open_proposal_and_dispute() {
+        let d = dispute_fixture(false);
+        // dispute_fixture leaves a pending proposal (signers attested at 2_000).
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.spec, SpecKind::Disputable);
+        assert_eq!(t.state, ResolutionState::SignersPending);
+        assert!(t.open_proposal);
+        // A dispute moves the state to Disputed; the proposal stays pending.
+        open(&d);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Disputed);
+        assert!(t.open_proposal);
+        // After the ruling the market is final.
+        d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Finalized);
+    }
+
+    // ── #297: committee epoch binding tests ──────────────────────────────────
+
+    /// Helper: builds a committee market fixture with given members and
+    /// threshold, advances time to close, and returns the fixture plus members.
+    fn committee_market(
+        member_count: u32,
+        threshold: u32,
+        max_rotation_delta: u32,
+    ) -> (Fixture, std::vec::Vec<Address>) {
+        let members_cell = std::cell::RefCell::new(std::vec::Vec::new());
+        let f = fixture(|env, _r, _a, _b| {
+            let list: std::vec::Vec<Address> =
+                (0..member_count).map(|_| Address::generate(env)).collect();
+            members_cell.borrow_mut().extend(list.iter().cloned());
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            })
+        });
+        let members: std::vec::Vec<Address> = members_cell.into_inner();
+        let member_vec = Vec::from_slice(&f.env, &members);
+        f.resolver
+            .create_committee(&f.admin, &member_vec, &threshold, &MIN_ROTATION_DELAY);
+        f.resolver
+            .register_committee_spec(&f.market_id, &CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            });
+        (f, members)
+    }
+
+    #[test]
+    fn rotation_after_attestations_does_not_drop_quorum() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &members[0].clone(), &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &members[1].clone(), &AttestedOutcome::Yes);
+
+        let pin = f.resolver.market_committee_epoch(&f.market_id);
+        assert!(pin.is_some());
+        assert_eq!(pin.unwrap().1, 1u32);
+
+        let new_members = Vec::from_array(&f.env, [members[1].clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        // finalize_signers should still succeed — old members' votes count.
+        f.env.ledger().set_timestamp(2_000 + 200);
+        f.resolver.finalize_signers(&f.market_id);
+    }
+
+    #[test]
+    fn rotation_after_close_new_members_cannot_attest() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+
+        let new_member = Address::generate(&f.env);
+        let new_members = Vec::from_array(&f.env, [new_member.clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver.pin_committee_epoch(&f.market_id);
+        let pin = f.resolver.market_committee_epoch(&f.market_id).unwrap();
+        assert_eq!(pin.1, 1u32, "should pin to epoch 1 (in force at close)");
+
+        f.env.ledger().set_timestamp(2_000 + 10);
+        let result = f
+            .resolver
+            .try_attest(&f.market_id, &new_member, &AttestedOutcome::Yes);
+        assert_eq!(result, Err(Ok(Error::NotSigner)));
+    }
+
+    #[test]
+    fn pin_committee_epoch_is_idempotent() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        let first = f.resolver.pin_committee_epoch(&f.market_id);
+        let second = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(first.1, second.1);
+    }
+
+    #[test]
+    fn pin_committee_epoch_rejects_before_close() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(1_000);
+        let result = f.resolver.try_pin_committee_epoch(&f.market_id);
+        assert_eq!(result, Err(Ok(Error::MarketNotClosed)));
+    }
+
+    #[test]
+    fn committee_members_at_returns_snapshot() {
+        let (f, _members) = committee_market(3, 2, 1);
+        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1);
+        assert_eq!(threshold, 2);
+        assert_eq!(returned_members.len(), 3);
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_committee_exists() {
+        let salt = [9u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 99,
+                min_epoch: 1,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::CommitteeNotFound)));
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_max_rotation_delta_bound() {
+        let salt = [10u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta: 99,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        f.resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)));
+    }
+
+    #[test]
+    fn legacy_committee_without_epoch_start_pins_epoch_1() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.storage()
+            .persistent()
+            .remove(&DataKey::EpochStart(0, 1));
+        f.env.ledger().set_timestamp(2_000);
+        let pinned = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(pinned.1, 1u32);
+    }
 }
 
 #[cfg(test)]
