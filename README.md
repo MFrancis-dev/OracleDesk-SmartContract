@@ -159,6 +159,7 @@ Current live deployment — see
 for the source of truth (`scripts/deploy-testnet.sh` is idempotent and may
 redeploy fresh addresses at any time).
 
+<!-- BEGIN:DEPLOYED_ADDRESSES -->
 | Contract | Address | Explorer |
 |---|---|---|
 | market-core | `CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O` | [View](https://stellar.expert/explorer/testnet/contract/CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O) |
@@ -166,6 +167,7 @@ redeploy fresh addresses at any time).
 | treasury | `CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB` | [View](https://stellar.expert/explorer/testnet/contract/CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB) |
 | reasoning-registry | `CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M` | [View](https://stellar.expert/explorer/testnet/contract/CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M) |
 | USDC (self-issued test asset) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
+<!-- END:DEPLOYED_ADDRESSES -->
 
 The USDC above is a **self-issued testnet asset** (a real SEP-41 Stellar
 Asset Contract, 7 decimals) — not Circle's testnet USDC. No real USDC
