@@ -13,7 +13,7 @@ oracledesk-types = { path = "../oracledesk-types" }
 
 [dev-dependencies]
 # testutils is test-only; enabling it for the wasm build breaks the contract build.
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"

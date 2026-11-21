@@ -169,6 +169,36 @@ pub struct HybridConfig {
     pub fallback_after: u64,
 }
 
+/// Richer fallback authority for `HybridV2`: any attested resolution mode
+/// that can produce a quorum, not just bare signers.
+///
+/// Variants are intentionally additive and appended after `Signers` so that
+/// existing discriminant positions are stable (Soroban encodes as positional).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FallbackAuthority {
+    /// A simple threshold of well-known signers.
+    Signers(SignerConfig),
+    /// A committee registered in the resolver's registry.
+    Committee(CommitteeRef),
+    /// An explicit set of pubkeys with per-key weights.
+    WeightedKeys(WeightedKeyConfig),
+}
+
+/// Extended hybrid mode: price feed first, falling back to any attested
+/// authority after `fallback_after` seconds past `close_time`.
+///
+/// A separate struct (not an in-place update to `HybridConfig`) because
+/// `HybridConfig` is consensus-critical — existing commitment hashes must
+/// continue to verify.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HybridConfigV2 {
+    pub price: PriceConfig,
+    pub fallback: FallbackAuthority,
+    pub fallback_after: u64,
+}
+
 /// The full resolution rule a market's `resolution_hash` commits to. Hashing
 /// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
 /// modes in disjoint hash spaces even if their field encodings could
@@ -182,6 +212,9 @@ pub enum ResolutionSpec {
     SignersDisputable(DisputableSignerConfig),
     Committee(CommitteeRef),
     Hybrid(HybridConfig),
+    /// Extended hybrid with richer fallback authority (issue #314).
+    /// Appended last to preserve discriminant positions of existing variants.
+    HybridV2(HybridConfigV2),
 }
 
 /// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
