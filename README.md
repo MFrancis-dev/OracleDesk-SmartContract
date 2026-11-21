@@ -159,6 +159,7 @@ Current live deployment — see
 for the source of truth (`scripts/deploy-testnet.sh` is idempotent and may
 redeploy fresh addresses at any time).
 
+<!-- BEGIN:DEPLOYED_ADDRESSES -->
 | Contract | Address | Explorer |
 |---|---|---|
 | market-core | `CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O` | [View](https://stellar.expert/explorer/testnet/contract/CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O) |
@@ -175,6 +176,13 @@ testnet USDC (or another 7-decimal classic asset SAC), pass
 [`oracledesk-stellar/docs/collateral.md`](oracledesk-stellar/docs/collateral.md)
 for the verified Circle issuer citation, issuer-flag checks, trustlines and
 faucet funding steps.
+| USDC (self-issued test asset) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
+<!-- END:DEPLOYED_ADDRESSES -->
+
+The USDC above is a **self-issued testnet asset** (a real SEP-41 Stellar
+Asset Contract, 7 decimals) — not Circle's testnet USDC. No real USDC
+issuer address is hardcoded anywhere in this repo; see
+[`docs/STATUS.md`](oracledesk-stellar/docs/STATUS.md) for why.
 
 ---
 
@@ -182,11 +190,19 @@ faucet funding steps.
 
 ### Prerequisites
 
-- Rust (stable) with the `wasm32v1-none` target
-- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+
-- Node.js 22+ and npm
-- Python 3.10+
-- `jq`
+The recommended way to develop with byte-identical contract builds is via the
+pinned **Dev Container** (`.devcontainer/`) or **Nix Flake** (`flake.nix`), both
+driven by [`oracledesk-stellar/toolchain.env`](oracledesk-stellar/toolchain.env).
+See [`oracledesk-stellar/docs/dev-environment.md`](oracledesk-stellar/docs/dev-environment.md)
+for full devcontainer, Codespaces, Nix, and manual setup instructions.
+
+For manual local setups, verify exact versions with `make doctor`:
+
+- Rust `1.93.1` with the `wasm32v1-none` target (`rustfmt`, `clippy`)
+- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), `27.1.0`
+- Node.js `24.13.1` and npm
+- Python 3.10+ (pinned `3.12`)
+- `jq` `1.7.1`
 
 ### Install and build
 

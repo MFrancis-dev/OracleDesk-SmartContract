@@ -68,7 +68,15 @@ AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
 MAKER_KEY=${MAKER_KEY:-${IDENTITY_PREFIX}-maker}
 TRADER_KEY=${TRADER_KEY:-${IDENTITY_PREFIX}-trader}
 OUT=${OUT:-deployments/$NETWORK.json}
-WASM_DIR=target/wasm32v1-none/release
+WASM_DIR=${WASM_DIR:-target/wasm32v1-none/release}
+case "$WASM_DIR" in
+  *local-short*)
+    [ "$NETWORK" = "local" ] || {
+      echo "error: local-short-windows wasm may only be deployed on NETWORK=local" >&2
+      exit 1
+    }
+    ;;
+esac
 
 # treasury's risk caps (7-decimal USDC units). Must comfortably clear
 # market-core's MIN_SEED (100 USDC) since agent_create_market's seed amount
@@ -102,6 +110,9 @@ RESOLVER_SALT=${RESOLVER_SALT:-6f7261636c656465736b2d7265736f6c7665722d7631}
 TREASURY_SALT=${TREASURY_SALT:-6f7261636c656465736b2d74726561737572792d7631}
 REGISTRY_SALT=${REGISTRY_SALT:-6f7261636c656465736b2d72656769737472792d7631}
 TIMELOCK_SALT=${TIMELOCK_SALT:-6f7261636c656465736b2d74696d656c6f636b2d7631}
+ROUTER_SALT=${ROUTER_SALT:-6f7261636c656465736b2d726f757465722d7631}
+# Local-only Reflector-shaped oracle (contracts/test-oracle). Never deployed
+# on testnet, so nobody can commit a real market to a fake feed.
 TEST_ORACLE_SALT=${TEST_ORACLE_SALT:-6f7261636c656465736b2d746573742d6f7261636c652d7631}
 USE_TIMELOCK=${USE_TIMELOCK:-0}
 TIMELOCK_PROPOSER_KEY=${TIMELOCK_PROPOSER_KEY:-$DEPLOYER_KEY}
@@ -522,6 +533,53 @@ if [ "$WIRED" != "true" ] || [ "$WIRED_RESOLVER" != "$RESOLVER" ] || [ "$WIRED_T
   if [ "$WIRING_OK" = "1" ]; then
     json_del 'del(.needs_treasury_wiring)'
     json_set_raw ".wired" "true"
+# --- optional router ---------------------------------------------------------
+if [ "${DEPLOY_ROUTER:-0}" = "1" ] || [ "${NETWORK}" = "local" ]; then
+  ROUTER=$(json_get .contracts.router)
+  [ -n "$ROUTER" ] || ROUTER=$(predict_id "$ROUTER_SALT")
+  json_set --arg s "$ROUTER_SALT" '.salts.router = $s'
+  if [ "$(json_get .contracts.router)" = "" ]; then
+    log "deploying router at deterministic address $ROUTER"
+    DEPLOYED=$(stellar contract deploy \
+      --wasm "$WASM_DIR/router.wasm" \
+      --salt "$ROUTER_SALT" \
+      --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" \
+      -- \
+      --market_core "$MARKET_CORE" \
+      --resolver "$RESOLVER" \
+      --reasoning_registry "$REGISTRY")
+    [ "$DEPLOYED" = "$ROUTER" ] || {
+      echo "error: router landed at $DEPLOYED, expected $ROUTER" >&2
+      exit 1
+    }
+    json_set --arg id "$ROUTER" '.contracts.router = $id'
+  else
+    log "router already deployed: $ROUTER"
+  fi
+fi
+
+# --- authenticate the resolver/treasury wiring (#61) ------------------------
+# The constructor already stored the real addresses; this handshake makes each
+# downstream contract prove (by calling back `market_core()`) that it is
+# configured for this market-core, and emits ResolverChanged/TreasuryChanged.
+# It is idempotent: skip once `wired` is recorded.
+if [ "$(json_get .wired)" != "true" ]; then
+  log "authenticating market-core ↔ resolver wiring"
+  if admin_invoke "$MARKET_CORE" propose_resolver --resolver "$RESOLVER"; then
+    # The resolver proves the wiring by calling market-core itself; its own
+    # signature is not needed (contract-to-contract auth).
+    stellar contract invoke --id "$RESOLVER" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- accept_market_core_role
+
+    log "authenticating market-core ↔ treasury wiring"
+    admin_invoke "$MARKET_CORE" propose_treasury --treasury "$TREASURY"
+    stellar contract invoke --id "$TREASURY" --source-account "$DEPLOYER_KEY" \
+      --network "$NETWORK" -- accept_market_core_role
+
+    json_set 'del(.needs_treasury_wiring) | .wired = true'
+  else
+    log "wiring is timelocked; run scripts/migrate-market-core-wiring.sh after the delay"
   fi
 else
   log "market-core already wired to resolver/treasury"
@@ -667,6 +725,15 @@ if [ "$NETWORK" = "testnet" ] || [ "$NETWORK" = "local" ]; then
 fi
 
 json_set_str ".last_deployed_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Record SHA-256 hashes of the deployed contract WASM files (additive, #127).
+for contract_name in market_core resolver treasury reasoning_registry; do
+  if [ -f "$WASM_DIR/${contract_name}.wasm" ]; then
+    wasm_hash=$(sha256sum "$WASM_DIR/${contract_name}.wasm" | awk '{print $1}')
+    json_set --arg k "$contract_name" --arg h "$wasm_hash" '.wasm_sha256[$k] = $h'
+  fi
+done
+
+json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_deployed_at = $ts'
 
 log "done. Deployment record: $OUT"
 cat "$OUT"
