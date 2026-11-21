@@ -1,4 +1,6 @@
 import { createHash, createPublicKey, verify } from "node:crypto";
+import { verifyBatchTraceProof } from "../agents/core/merkle.js";
+export type { BatchTraceProof, TraceLeafV2 } from "../agents/core/merkle.js";
 
 export type TraceVerdict =
   | { tag: "Valid"; values?: void }
@@ -144,6 +146,48 @@ export function verifyChain(
   }
 
   return { ok: true, tainted };
+}
+
+// ---------------------------------------------------------------------------
+// Batch inclusion verification (issue #308)
+// ---------------------------------------------------------------------------
+
+export interface BatchInclusionResult {
+  verified: boolean;
+  root: string;
+  index: number;
+  traceHash: string;
+  agent: string;
+  marketId: bigint;
+  action: string;
+}
+
+/**
+ * Verifies that a trace is included in an on-chain Merkle batch, using the v2
+ * leaf encoding that binds agent/market/action/position.
+ *
+ * The `batchRoot` must come from the on-chain `publish_trace_batch` call;
+ * the `batchProof` is produced by `prove_batched_trace`.
+ *
+ * Returns `verified: false` rather than throwing so callers can handle
+ * partial-batch scenarios gracefully.
+ */
+export function verifyBatchInclusion(
+  batchRoot: string,
+  batchProof: BatchTraceProof,
+): BatchInclusionResult {
+  const normalizedRoot = batchRoot.toLowerCase().replace(/^0x/, "");
+  const proofWithRoot = { ...batchProof, root: normalizedRoot };
+  const verified = verifyBatchTraceProof(proofWithRoot);
+  return {
+    verified,
+    root: normalizedRoot,
+    index: batchProof.index,
+    traceHash: batchProof.leaf.traceHash,
+    agent: batchProof.leaf.agent,
+    marketId: batchProof.leaf.marketId,
+    action: batchProof.leaf.action,
+  };
 }
 
 // ─── Ed25519 trace attestations (#53) ───────────────────────────────────────
