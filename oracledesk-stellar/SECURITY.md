@@ -38,7 +38,9 @@ See [`docs/security-ci.md`](docs/security-ci.md) for the automated supply-chain 
 
 In scope: `contracts/`, `x402/`, `agents/`, `packages/bindings/` (the
 generation script and its templates, not third-party generated code
-itself), and the deployment scripts in `scripts/`.
+itself), and the deployment scripts in `scripts/`. See
+[`docs/adversarial-matrix.md`](docs/adversarial-matrix.md) for the tested
+dependency trust boundary against hostile SEP-41 tokens and SEP-40 oracles.
 
 Out of scope: the separate frontend repository, and any third-party
 dependency's own vulnerabilities (report those upstream — `npm audit` /

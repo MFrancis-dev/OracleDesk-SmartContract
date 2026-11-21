@@ -7671,4 +7671,231 @@ mod golden {
         let b = DeclaredReversed { beta: 2, alpha: 1 }.to_xdr(&env);
         assert_eq!(a, b);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #133: deployable SEP-40 test-oracle integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oracle_asset_xdr_matches_test_oracle_asset() {
+        let env = Env::default();
+        let sym = Symbol::new(&env, "XLM");
+        let addr = Address::generate(&env);
+
+        assert_eq!(
+            OracleAsset::Other(sym.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Other(sym).to_xdr(&env),
+        );
+        assert_eq!(
+            OracleAsset::Stellar(addr.clone()).to_xdr(&env),
+            ::test_oracle::Asset::Stellar(addr).to_xdr(&env),
+        );
+    }
+
+    #[test]
+    fn price_mode_resolves_with_sep40_test_oracle() {
+        // Off-boundary close_time (2_150) with resolution = 300 => slot = 2_100,
+        // staleness delta = 50 <= max_staleness (300).
+        let f = fixture_at(2_150, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 300,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        // Advance past close_time so both test-oracle's FutureTimestamp check
+        // and resolver's MarketNotClosed check pass.
+        f.env.ledger().set_timestamp(2_200);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let outcome = f.resolver.resolve_price(&f.market_id);
+        assert_eq!(outcome, Outcome::Yes);
+        assert_eq!(
+            f.market_core.get_market(&f.market_id).status,
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes),
+        );
+    }
+
+    #[test]
+    fn price_mode_stale_when_staleness_below_resolution() {
+        // Off-boundary close_time (2_250) with resolution = 300 => aligned slot
+        // is 2_100 (delta = 150s), which exceeds max_staleness = 60s.
+        let f = fixture_at(2_250, |env, _, _, _| {
+            let oracle_admin = Address::generate(env);
+            let base = ::test_oracle::Asset::Other(Symbol::new(env, "USD"));
+            let oracle_id = env.register(
+                ::test_oracle::TestOracle,
+                (oracle_admin, base, 14u32, 300u32, 86_400u64),
+            );
+            let oracle = ::test_oracle::TestOracleClient::new(env, &oracle_id);
+            oracle.add_asset(&::test_oracle::Asset::Other(Symbol::new(env, "XLM")));
+            ResolutionSpec::Price(PriceConfig {
+                reflector: oracle_id,
+                asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                threshold: 2_000,
+                direction: PriceDirection::Above,
+                max_staleness: 60,
+            })
+        });
+        let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+            unreachable!()
+        };
+        f.resolver.register_price_spec(&f.market_id, &cfg);
+
+        f.env.ledger().set_timestamp(2_300);
+        let oracle = ::test_oracle::TestOracleClient::new(&f.env, &cfg.reflector);
+        oracle.set_price(
+            &::test_oracle::Asset::Other(Symbol::new(&f.env, "XLM")),
+            &2_500,
+            &2_100,
+        );
+
+        let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+        assert_eq!(err.unwrap(), Error::StalePrice);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-40 oracle suite
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_oracle, OracleKind};
+        use adversarial_mocks::{BudgetBurnerOracleClient, ExtremeOracleClient};
+
+        fn setup_oracle_fixture(kind: OracleKind) -> (Fixture, Address) {
+            let f = fixture_at(2_100, |env, _, _, _| {
+                let oracle_id = deploy_oracle(env, kind);
+                ResolutionSpec::Price(PriceConfig {
+                    reflector: oracle_id,
+                    asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+                    threshold: 2_000,
+                    direction: PriceDirection::Above,
+                    max_staleness: 300,
+                })
+            });
+            let ResolutionSpec::Price(cfg) = f.spec.clone() else {
+                unreachable!()
+            };
+            f.resolver.register_price_spec(&f.market_id, &cfg);
+            f.env.ledger().set_timestamp(2_200);
+            let oracle_id = cfg.reflector.clone();
+            (f, oracle_id)
+        }
+
+        #[test]
+        fn adversarial_resolve_price_rejects_zero_and_negative_price() {
+            for bad_price in [0_i128, -1_i128, i128::MIN] {
+                let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+                ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&bad_price);
+                let state_before = f.resolver.state(&f.market_id);
+                let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+                assert_eq!(err.unwrap(), Error::InvalidPrice);
+                assert_eq!(f.resolver.state(&f.market_id), state_before);
+                assert_eq!(state_before, ResolutionState::Unconfigured);
+            }
+        }
+
+        #[test]
+        fn adversarial_resolve_price_extreme_positive_price_tolerated() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::Extreme);
+            ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&i128::MAX);
+            let outcome = f.resolver.resolve_price(&f.market_id);
+            assert_eq!(outcome, Outcome::Yes);
+        }
+
+        #[test]
+        fn adversarial_future_dated_price_is_stale() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Future);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_none_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::None);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::StalePrice);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_resolve_price_with_panic_oracle_keeps_state_unconfigured() {
+            let (f, _) = setup_oracle_fixture(OracleKind::Panic);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+            assert_eq!(state_before, ResolutionState::Unconfigured);
+        }
+
+        #[test]
+        fn adversarial_budget_burner_oracle_reverts_cleanly() {
+            let (f, oracle_id) = setup_oracle_fixture(OracleKind::BudgetBurner);
+            BudgetBurnerOracleClient::new(&f.env, &oracle_id).set_iterations(&50_000);
+            let state_before = f.resolver.state(&f.market_id);
+            f.env.cost_estimate().budget().reset_default();
+            assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_wrong_shape_oracle_fails_safely() {
+            let (f, _) = setup_oracle_fixture(OracleKind::WrongShape);
+            let state_before = f.resolver.state(&f.market_id);
+            let err = f.resolver.try_resolve_price(&f.market_id).unwrap_err();
+            assert_eq!(err.unwrap(), Error::PriceUnavailable);
+            assert_eq!(f.resolver.state(&f.market_id), state_before);
+        }
+
+        #[test]
+        fn adversarial_guardian_void_succeeds_after_oracle_failure() {
+            for kind in [
+                OracleKind::Extreme,
+                OracleKind::Future,
+                OracleKind::None,
+                OracleKind::Panic,
+                OracleKind::WrongShape,
+            ] {
+                let (f, oracle_id) = setup_oracle_fixture(kind);
+                if kind == OracleKind::Extreme {
+                    ExtremeOracleClient::new(&f.env, &oracle_id).set_price(&0);
+                }
+                assert!(f.resolver.try_resolve_price(&f.market_id).is_err());
+                // Advance past close_time + ORACLE_GRACE_SECS so guardian escape hatch opens.
+                f.env.ledger().set_timestamp(2_100 + ORACLE_GRACE_SECS + 1);
+                f.resolver
+                    .guardian_void_market(&f.market_id, &GuardianReason::OracleUnavailable);
+                assert_eq!(
+                    f.market_core.get_market(&f.market_id).status,
+                    market_core::MarketStatus::Void,
+                );
+                assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
+            }
+        }
+    }
 }

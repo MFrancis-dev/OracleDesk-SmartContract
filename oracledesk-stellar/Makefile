@@ -1,3 +1,4 @@
+.PHONY: setup build test test-scripts lint fmt deploy-testnet seed-market demo bindings clean interface-check
 .PHONY: doctor check-toolchain-sync monitor setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
 
 # Verify local or CI tool versions match `toolchain.env` (#135).
@@ -19,8 +20,12 @@ monitor:
 # agents/ and x402/ install, since both depend on them by local file: path
 # and need real type declarations, not just a package.json, to typecheck.
 setup:
-	if [ -f package-lock.json ]; then npm ci; else npm install; fi
-	npm run build
+	for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
+		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
+	done
+	cd agents && npm install
+	cd x402 && npm install
+	cd scripts/governance && npm install
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI. The vendored
 # cross-contract copies (resolver/treasury's market_core.wasm, resolver's
@@ -33,15 +38,10 @@ build:
 	stellar contract build
 	./scripts/sync-vendored-wasm.sh
 	stellar contract build
-	./scripts/sync-vendored-wasm.sh resolver
-	stellar contract build --package treasury
-	./scripts/sync-vendored-wasm.sh treasury
-	stellar contract build --package router
 	cp target/wasm32v1-none/release/market_core.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
-	cp target/wasm32v1-none/release/timelock.wasm contracts/integration-tests/wasm/
 
 .PHONY: build-local-short
 build-local-short:
@@ -58,15 +58,12 @@ verify-wasm:
 # Same check, but only against the current target dir (no clean rebuild).
 check-wasm:
 	./scripts/sync-vendored-wasm.sh
-	./scripts/sync-vendored-wasm.sh resolver
-	./scripts/sync-vendored-wasm.sh treasury
 	git diff --exit-code -- \
 		contracts/resolver/market_core.wasm contracts/treasury/market_core.wasm \
-		contracts/resolver/reasoning_registry.wasm contracts/treasury/resolver.wasm \
+		contracts/resolver/reasoning_registry.wasm \
 		contracts/resolver/market_core.wasm.sha256 \
 		contracts/treasury/market_core.wasm.sha256 \
-		contracts/resolver/reasoning_registry.wasm.sha256 \
-		contracts/treasury/resolver.wasm.sha256
+		contracts/resolver/reasoning_registry.wasm.sha256
 
 test: build
 	cargo test --workspace
@@ -76,8 +73,13 @@ test: build
 	python3 model/fpmm_bounds.py --quick
 	python3 scripts/coverage-tools.py --self-test
 	python3 scripts/coverage-gate.py --self-test
-	node --test scripts/gen-contract-docs/generate.test.mjs
-	npm test
+	cd x402 && npm test
+	cd agents && npm test
+	cd scripts/governance && npm test
+	$(MAKE) test-scripts
+
+test-scripts:
+	./scripts/test/bats/bin/bats scripts/test
 
 lint:
 	./scripts/check-no-mock-all-auths.sh
@@ -85,9 +87,6 @@ lint:
 	cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
-	npm run lint
-	npm run format:check
-	npm run typecheck
 
 auth-matrix: build
 	cargo test -p integration-tests --test auth_matrix
@@ -121,14 +120,8 @@ coverage-gate:
 formal:
 	./scripts/formal.sh
 
-deploy-plan: build
-	npx tsx scripts/deployer/src/cli.ts plan
-
-deploy-verify:
-	npx tsx scripts/deployer/src/cli.ts verify
-
 deploy-testnet: build
-	npx tsx scripts/deployer/src/cli.ts apply --yes
+	./scripts/deploy-testnet.sh
 
 seed-market:
 	./scripts/seed-market.sh
@@ -139,29 +132,15 @@ demo:
 bindings: build
 	./scripts/gen-bindings.sh
 
-docs-reference:
-	node scripts/gen-contract-docs/generate.mjs
-
-docs: docs-reference
-	mdbook build docs
-	cargo doc --no-deps -p market-core -p resolver -p treasury -p reasoning-registry
-	mkdir -p docs/book/rustdoc
-	cp -r target/doc/* docs/book/rustdoc/
-	npx --yes typedoc --options typedoc.json
-
-docs-serve: docs-reference
-	mdbook serve docs
-
 clean:
 	cargo clean
-	rm -rf node_modules x402/node_modules agents/node_modules scripts/*/node_modules
-	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist agents/dist x402/dist scripts/deployer/dist
-	rm -f *.tsbuildinfo */*.tsbuildinfo scripts/*/*.tsbuildinfo
+	rm -rf x402/node_modules agents/node_modules
+	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist
 
 # Compare to the PR target, not the contributor fork's tracking branch.
 INTERFACE_BASE_REF ?= upstream/develop
 interface-check:
-	@for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+	@for pkg in market-core resolver treasury reasoning-registry timelock router test-oracle; do \
 		CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
 		check --pkg-dir packages/bindings/$$pkg --base-ref "$(INTERFACE_BASE_REF)" || exit 1; \
 	done

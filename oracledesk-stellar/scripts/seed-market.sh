@@ -33,37 +33,60 @@ NETWORK=${NETWORK:-testnet}
 case "$NETWORK" in
   testnet) NETWORK_PASSPHRASE="Test SDF Network ; September 2015" ;;
   local) NETWORK_PASSPHRASE="Standalone Network ; February 2017" ;;
-  *) echo "error: NETWORK must be testnet or local (never mainnet)" >&2; exit 1 ;;
+  *)
+    echo "error: NETWORK must be testnet or local (never mainnet)" >&2
+    exit 1
+    ;;
 esac
 
 IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
-DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
 AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
 DEPLOYMENTS=${DEPLOYMENTS:-deployments/$NETWORK.json}
 SPECS_DIR=${SPECS_DIR:-deployments/specs-$NETWORK}
 ATOMIC=true
-MODE=signer
+MODE=${MODE:-signer}
 
 # Allow flags anywhere among the positional arguments.
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --commit-only) ATOMIC=false; shift ;;
+    --commit-only)
+      ATOMIC=false
+      shift
+      ;;
     --mode)
-      [ "$#" -ge 2 ] || { echo "error: --mode needs signer or price" >&2; exit 2; }
-      MODE=$2; shift 2 ;;
-    --mode=*) MODE=${1#--mode=}; shift ;;
-    *) ARGS+=("$1"); shift ;;
+      if [ "$#" -lt 2 ]; then
+        echo "error: --mode needs signer or price" >&2
+        exit 2
+      fi
+      MODE=$2
+      shift 2
+      ;;
+    --mode=*)
+      MODE=${1#--mode=}
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
   esac
 done
 case "$MODE" in
-  signer|price) ;;
-  *) echo "error: --mode must be signer or price" >&2; exit 2 ;;
+  signer | price) ;;
+  *)
+    echo "error: --mode must be signer or price" >&2
+    exit 2
+    ;;
 esac
-set -- "${ARGS[@]:-}"
+if [ "${#ARGS[@]}" -gt 0 ]; then
+  set -- "${ARGS[@]}"
+else
+  set --
+fi
 
-SEED_AMOUNT=${1:-1500000000}   # 150 USDC, comfortably above the 100 USDC MIN_SEED
-INITIAL_YES_BPS=${2:-5000}     # 50/50
+SEED_AMOUNT=${1:-1500000000} # 150 USDC, comfortably above the 100 USDC MIN_SEED
+INITIAL_YES_BPS=${2:-5000}   # 50/50
 if [ "$NETWORK" = "local" ]; then
   DEFAULT_CLOSE_IN=10
   DEFAULT_DISPUTE=3
@@ -75,19 +98,30 @@ CLOSE_IN_SECONDS=${3:-$DEFAULT_CLOSE_IN}
 DISPUTE_WINDOW=${4:-$DEFAULT_DISPUTE}
 QUESTION_TEXT=${5:-"Demo market seeded by scripts/seed-market.sh"}
 
-[ -f "$DEPLOYMENTS" ] || { echo "error: $DEPLOYMENTS not found — run NETWORK=$NETWORK scripts/deploy-testnet.sh first" >&2; exit 1; }
+if [ ! -f "$DEPLOYMENTS" ]; then
+  echo "error: $DEPLOYMENTS not found — run NETWORK=$NETWORK scripts/deploy-testnet.sh first" >&2
+  exit 1
+fi
 
-TREASURY=$(jq -r .contracts.treasury "$DEPLOYMENTS")
-RESOLVER=$(jq -r .contracts.resolver "$DEPLOYMENTS")
-MARKET_CORE=$(jq -r .contracts.market_core "$DEPLOYMENTS")
-AGENT=$(jq -r .agent "$DEPLOYMENTS")
-for addr in "$TREASURY" "$MARKET_CORE"; do
-  [ -n "$addr" ] && [ "$addr" != "null" ] || { echo "error: no treasury/market_core address in $DEPLOYMENTS" >&2; exit 1; }
-done
+TREASURY=$(jq -r '.contracts.treasury // empty' "$DEPLOYMENTS")
+RESOLVER=$(jq -r '.contracts.resolver // empty' "$DEPLOYMENTS")
+MARKET_CORE=$(jq -r '.contracts.market_core // empty' "$DEPLOYMENTS")
+AGENT=$(jq -r '.agent // empty' "$DEPLOYMENTS")
+if [ -z "$TREASURY" ] || [ -z "$MARKET_CORE" ]; then
+  echo "error: no treasury/market_core address in $DEPLOYMENTS" >&2
+  exit 1
+fi
+if [ -z "$RESOLVER" ]; then
+  echo "error: no resolver address in $DEPLOYMENTS" >&2
+  exit 1
+fi
 
 if [ "$MODE" = "price" ]; then
   ORACLE=$(jq -r '.contracts.test_oracle // empty' "$DEPLOYMENTS")
-  [ -n "$ORACLE" ] || { echo "error: price mode requires contracts.test_oracle in $DEPLOYMENTS" >&2; exit 1; }
+  if [ -z "$ORACLE" ]; then
+    echo "error: price mode requires contracts.test_oracle in $DEPLOYMENTS" >&2
+    exit 1
+  fi
   PRICE_ASSET=${PRICE_ASSET:-other:XLM}
   PRICE_THRESHOLD=${PRICE_THRESHOLD:-2000}
   PRICE_DIRECTION=${PRICE_DIRECTION:-above}
@@ -95,19 +129,31 @@ if [ "$MODE" = "price" ]; then
   case "$PRICE_ASSET" in
     other:*) PRICE_ASSET_JSON=$(jq -nc --arg s "${PRICE_ASSET#other:}" '{Other:$s}') ;;
     stellar:*) PRICE_ASSET_JSON=$(jq -nc --arg a "${PRICE_ASSET#stellar:}" '{Stellar:$a}') ;;
-    *) echo "error: PRICE_ASSET must be other:<symbol> or stellar:<address>" >&2; exit 2 ;;
+    *)
+      echo "error: PRICE_ASSET must be other:<symbol> or stellar:<address>" >&2
+      exit 2
+      ;;
   esac
   case "$PRICE_DIRECTION" in
     above) PRICE_DIRECTION_ENUM=Above ;;
     at-or-above) PRICE_DIRECTION_ENUM=AtOrAbove ;;
     below) PRICE_DIRECTION_ENUM=Below ;;
     at-or-below) PRICE_DIRECTION_ENUM=AtOrBelow ;;
-    *) echo "error: unknown PRICE_DIRECTION '$PRICE_DIRECTION'" >&2; exit 2 ;;
+    *)
+      echo "error: unknown PRICE_DIRECTION '$PRICE_DIRECTION'" >&2
+      exit 2
+      ;;
   esac
 fi
 
 sha256_hex() {
-  python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else
+    python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$1"
+  fi
 }
 
 spec_hash() {
@@ -172,7 +218,8 @@ mapfile -t V2_FLAGS < <(v2_flags "$(jq -r .salt "$SPEC_FILE")")
 spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" "${RULE_HASH_ARGS[@]}" >/dev/null
 
 QUESTION_HASH=$(sha256_hex "$QUESTION_TEXT")
-CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))
+CLOSE_TIME=$(($(date +%s) + CLOSE_IN_SECONDS))
+META_URI_JSON=$(jq -Rn --arg q "$QUESTION_TEXT" '"ipfs://" + ($q | gsub(" "; "-"))')
 
 if [ "$ATOMIC" = "true" ]; then
   echo "==> creating AND revealing market atomically (seed=$SEED_AMOUNT, close_time=$CLOSE_TIME)" >&2
@@ -181,7 +228,7 @@ if [ "$ATOMIC" = "true" ]; then
     --agent "$AGENT" \
     --resolver "$RESOLVER" \
     --question_hash "$QUESTION_HASH" \
-    --meta_uri "\"ipfs://$(echo -n "$QUESTION_TEXT" | tr ' ' '-')\"" \
+    --meta_uri "$META_URI_JSON" \
     --category Macro \
     --close_time "$CLOSE_TIME" \
     --seed_amount "$SEED_AMOUNT" \
@@ -194,7 +241,7 @@ else
     --agent "$AGENT" \
     --question_hash "$QUESTION_HASH" \
     --resolution_hash "$RESOLUTION_HASH" \
-    --meta_uri "\"ipfs://$(echo -n "$QUESTION_TEXT" | tr ' ' '-')\"" \
+    --meta_uri "$META_URI_JSON" \
     --category Macro \
     --close_time "$CLOSE_TIME" \
     --seed_amount "$SEED_AMOUNT" \

@@ -9,6 +9,7 @@ members = [
     "contracts/timelock",
     "contracts/router",
     "contracts/test-oracle",
+    "contracts/adversarial-mocks",
     "contracts/integration-tests",
 ]
 resolver = "2"

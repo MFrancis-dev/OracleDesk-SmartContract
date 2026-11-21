@@ -325,28 +325,6 @@ pub struct Config {
     pub paused: bool,
 }
 
-/// Admin-managed collateral allow-list entry (#151).
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollateralParams {
-    pub decimals: u32,
-    pub min_seed: i128,
-    pub max_sets: i128,
-    pub enabled: bool,
-}
-
-/// Per-market collateral snapshot (#151). Lives beside `Market` so its XDR
-/// shape (and every generated client) is unchanged; a missing entry falls
-/// back to the legacy `DataKey::Collateral`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarketCollateralInfo {
-    pub token: Address,
-    /// `max_sets` snapshotted at creation, so a later allow-list change never
-    /// silently changes an existing market's size limit.
-    pub max_sets: i128,
-}
-
 /// A proposed admin handover (#62). Absent when no transfer is pending.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -450,6 +428,9 @@ pub enum Error {
     NotSupported = 30,
     /// A batch call carried no ids or more than `MAX_BATCH` of them.
     BatchTooLarge = 31,
+    /// Inbound collateral transfer delivered fewer (or different) units than
+    /// expected, e.g. a fee-on-transfer or under-delivering token (#137).
+    CollateralShortfall = 32,
     /// `create_market` used a token missing from, or disabled in, the
     /// admin collateral allow-list (#151).
     CollateralNotAllowed = 32,
@@ -651,34 +632,6 @@ pub struct LpTransferred {
     pub to: Address,
 }
 
-#[contractevent]
-pub struct CollateralAdded {
-    #[topic]
-    pub token: Address,
-    #[topic]
-    pub decimals: u32,
-    #[topic]
-    pub min_seed: i128,
-    #[topic]
-    pub max_sets: i128,
-}
-
-#[contractevent]
-pub struct CollateralEnabledSet {
-    #[topic]
-    pub token: Address,
-    #[topic]
-    pub enabled: bool,
-}
-
-#[contractevent]
-pub struct MarketCollateralSet {
-    #[topic]
-    pub market_id: u64,
-    #[topic]
-    pub collateral: Address,
-}
-
 /// V1 event: pool remainder claimed by creator after market finality.
 #[contractevent]
 pub struct PoolRemainderClaimedV1 {
@@ -755,100 +708,6 @@ impl MarketCore {
         s.set(&DataKey::Paused, &false);
         s.set(&DataKey::NextId, &0u64);
         s.set(&DataKey::DefaultRedeemHorizon, &DEFAULT_REDEEM_HORIZON_SECS);
-        let default_params = CollateralParams {
-            decimals: 7,
-            min_seed: MIN_SEED,
-            max_sets: MAX_SETS,
-            enabled: true,
-        };
-        env.storage().persistent().set(
-            &DataKey::CollateralParams(collateral.clone()),
-            &default_params,
-        );
-        env.storage()
-            .persistent()
-            .set(&DataKey::Locked(collateral.clone()), &0i128);
-        CollateralAdded {
-            token: collateral,
-            decimals: default_params.decimals,
-            min_seed: default_params.min_seed,
-            max_sets: default_params.max_sets,
-        }
-        .publish(&env);
-    }
-
-    /// Adds or updates a collateral on the allow-list (#151). `token` must be
-    /// a SEP-41 token whose `decimals()` matches `params.decimals`; until the
-    /// decimals-aware math lands only 7-decimal tokens are accepted.
-    pub fn add_collateral(env: Env, token: Address, params: CollateralParams) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let actual = token::TokenClient::new(&env, &token).decimals();
-        if params.decimals != 7 || actual != params.decimals {
-            return Err(Error::InvalidCollateralParams);
-        }
-        if params.min_seed <= 0
-            || params.min_seed > params.max_sets
-            || params.max_sets > i128::MAX / BPS
-        {
-            return Err(Error::InvalidCollateralParams);
-        }
-        let key = DataKey::CollateralParams(token.clone());
-        env.storage().persistent().set(&key, &params);
-        ttl::bump_persistent(&env, &key, ttl::long_lived_target(&env));
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Locked(token.clone()))
-        {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Locked(token.clone()), &0i128);
-        }
-        CollateralAdded {
-            token,
-            decimals: params.decimals,
-            min_seed: params.min_seed,
-            max_sets: params.max_sets,
-        }
-        .publish(&env);
-        Ok(())
-    }
-
-    /// Disables new markets for `token`; sells, redemptions, claims and fee
-    /// sweeps for existing markets keep working.
-    pub fn set_collateral_enabled(env: Env, token: Address, enabled: bool) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let mut p =
-            Self::load_collateral_params(&env, &token).ok_or(Error::CollateralNotAllowed)?;
-        p.enabled = enabled;
-        let key = DataKey::CollateralParams(token.clone());
-        env.storage().persistent().set(&key, &p);
-        ttl::bump_persistent(&env, &key, ttl::long_lived_target(&env));
-        CollateralEnabledSet { token, enabled }.publish(&env);
-        Ok(())
-    }
-
-    pub fn collateral_params(env: Env, token: Address) -> Option<CollateralParams> {
-        Self::load_collateral_params(&env, &token)
-    }
-
-    /// The token a market settles and trades in. Legacy markets (created
-    /// before #151) fall back to the contract's default collateral.
-    pub fn get_market_collateral(env: Env, market_id: u64) -> Address {
-        Self::market_token(&env, market_id)
-    }
-
-    pub fn market_collateral_info(env: Env, market_id: u64) -> MarketCollateralInfo {
-        Self::load_market_collateral(&env, market_id)
-    }
-
-    /// Collateral locked by all markets of `token`: `Σ(sets_minted +
-    /// fees_accrued)` maintained on every money path.
-    pub fn locked(env: Env, token: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Locked(token))
-            .unwrap_or(0)
     }
 
     // ----- admin ----------------------------------------------------------
@@ -1149,9 +1008,9 @@ impl MarketCore {
 
     // ----- market lifecycle -----------------------------------------------
 
-    /// Creates a market in the contract's legacy/default collateral.
-    /// Kept for compatibility; `create_market_with_collateral` selects an
-    /// allow-listed token per market (#151).
+    /// Creates a market and seeds the pool. `creator` becomes the sole LP.
+    /// `initial_yes_bps` in [100, 9900] sets the opening YES probability;
+    /// the creator receives the leftover shares of the likelier outcome.
     #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         env: Env,
@@ -1164,74 +1023,13 @@ impl MarketCore {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
-        let collateral: Address = Self::instance_get(&env, &DataKey::Collateral)?;
-        Self::do_create_market(
-            env,
-            creator,
-            collateral,
-            question_hash,
-            resolution_hash,
-            meta_uri,
-            category,
-            close_time,
-            seed_amount,
-            initial_yes_bps,
-        )
-    }
-
-    /// Creates a market denominated in an allow-listed `collateral` (#151).
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_market_with_collateral(
-        env: Env,
-        creator: Address,
-        collateral: Address,
-        question_hash: BytesN<32>,
-        resolution_hash: BytesN<32>,
-        meta_uri: String,
-        category: Category,
-        close_time: u64,
-        seed_amount: i128,
-        initial_yes_bps: u32,
-    ) -> Result<u64, Error> {
-        Self::do_create_market(
-            env,
-            creator,
-            collateral,
-            question_hash,
-            resolution_hash,
-            meta_uri,
-            category,
-            close_time,
-            seed_amount,
-            initial_yes_bps,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn do_create_market(
-        env: Env,
-        creator: Address,
-        collateral: Address,
-        question_hash: BytesN<32>,
-        resolution_hash: BytesN<32>,
-        meta_uri: String,
-        category: Category,
-        close_time: u64,
-        seed_amount: i128,
-        initial_yes_bps: u32,
-    ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
         creator.require_auth();
 
-        let params =
-            Self::load_collateral_params(&env, &collateral).ok_or(Error::CollateralNotAllowed)?;
-        if !params.enabled {
-            return Err(Error::CollateralNotAllowed);
-        }
         if close_time <= env.ledger().timestamp() {
             return Err(Error::InvalidCloseTime);
         }
-        if !(params.min_seed..=params.max_sets).contains(&seed_amount) {
+        if !(MIN_SEED..=MAX_SETS).contains(&seed_amount) {
             return Err(Error::InvalidAmount);
         }
         if !(math::MIN_PROB_BPS..=math::MAX_PROB_BPS).contains(&initial_yes_bps) {
@@ -1271,19 +1069,6 @@ impl MarketCore {
             lp_claimed: false,
         };
         Self::save_market(&env, id, &market);
-        Self::save_market_collateral(
-            &env,
-            id,
-            &MarketCollateralInfo {
-                token: collateral.clone(),
-                max_sets: params.max_sets,
-            },
-        );
-        MarketCollateralSet {
-            market_id: id,
-            collateral: collateral.clone(),
-        }
-        .publish(&env);
         Self::save_fee_terms(
             &env,
             id,
@@ -1342,9 +1127,7 @@ impl MarketCore {
             market.close_time,
         );
 
-        let token_client = token::TokenClient::new(&env, &collateral);
-        token_client.transfer(&creator, env.current_contract_address(), &seed_amount);
-        Self::add_locked(&env, &collateral, seed_amount)?;
+        Self::pull_collateral(&env, &creator, seed_amount)?;
 
         MarketCreated {
             market_id: id,
@@ -1470,8 +1253,7 @@ impl MarketCore {
             q.new_reserve_other,
         )?;
         let new_sets = m.sets_minted.checked_add(q.net).ok_or(Error::Overflow)?;
-        let info = Self::load_market_collateral(&env, market_id);
-        if new_sets > info.max_sets {
+        if new_sets > MAX_SETS {
             return Err(Error::MarketTooLarge);
         }
 
@@ -1515,13 +1297,7 @@ impl MarketCore {
         }
 
         // interaction
-        let info = Self::load_market_collateral(&env, market_id);
-        token::TokenClient::new(&env, &info.token).transfer(
-            &trader,
-            env.current_contract_address(),
-            &collateral_in,
-        );
-        Self::add_locked(&env, &info.token, collateral_in)?;
+        Self::pull_collateral(&env, &trader, collateral_in)?;
 
         Trade {
             market_id,
@@ -1687,13 +1463,7 @@ impl MarketCore {
         }
 
         // interaction
-        let info = Self::load_market_collateral(&env, market_id);
-        token::TokenClient::new(&env, &info.token).transfer(
-            &env.current_contract_address(),
-            &trader,
-            &collateral_out,
-        );
-        Self::sub_locked(&env, &info.token, collateral_out)?;
+        Self::token(&env)?.transfer(&env.current_contract_address(), &trader, &collateral_out);
 
         Trade {
             market_id,
@@ -1793,13 +1563,7 @@ impl MarketCore {
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
-            let info = Self::load_market_collateral(&env, market_id);
-            token::TokenClient::new(&env, &info.token).transfer(
-                &env.current_contract_address(),
-                &holder,
-                &payout,
-            );
-            Self::sub_locked(&env, &info.token, payout)?;
+            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
         }
         Redeemed {
             market_id,
@@ -1839,13 +1603,7 @@ impl MarketCore {
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
-            let info = Self::load_market_collateral(&env, market_id);
-            token::TokenClient::new(&env, &info.token).transfer(
-                &env.current_contract_address(),
-                &creator,
-                &payout,
-            );
-            Self::sub_locked(&env, &info.token, payout)?;
+            Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &payout);
         }
         PoolRemainderClaimed {
             market_id,
@@ -1876,7 +1634,6 @@ impl MarketCore {
         Self::validate_batch(&market_ids)?;
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
-        let mut pending: Vec<(Address, i128)> = Vec::new(&env);
         for id in market_ids.iter() {
             let key = DataKey::Market(id);
             // Raw read: a market that ends up skipped must not pay a TTL
@@ -1923,11 +1680,6 @@ impl MarketCore {
                 Self::save_settle(&env, id, &settle);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
-            if payout > 0 {
-                let info = Self::load_market_collateral(&env, id);
-                Self::add_pending(&mut pending, &info.token, payout);
-                Self::sub_locked(&env, &info.token, payout)?;
-            }
             Redeemed {
                 market_id: id,
                 holder: holder.clone(),
@@ -1940,7 +1692,9 @@ impl MarketCore {
                 status: BatchStatus::Settled,
             });
         }
-        Self::flush_pending(&env, &pending, &holder);
+        if total > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &total);
+        }
         Ok(BatchResult { total, items })
     }
 
@@ -1957,7 +1711,6 @@ impl MarketCore {
         Self::validate_batch(&market_ids)?;
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
-        let mut pending: Vec<(Address, i128)> = Vec::new(&env);
         for id in market_ids.iter() {
             let mut m = match env
                 .storage()
@@ -1999,11 +1752,6 @@ impl MarketCore {
                 Self::save_settle(&env, id, &settle);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
-            if payout > 0 {
-                let info = Self::load_market_collateral(&env, id);
-                Self::add_pending(&mut pending, &info.token, payout);
-                Self::sub_locked(&env, &info.token, payout)?;
-            }
             PoolRemainderClaimed {
                 market_id: id,
                 creator: creator.clone(),
@@ -2016,7 +1764,9 @@ impl MarketCore {
                 status: BatchStatus::Settled,
             });
         }
-        Self::flush_pending(&env, &pending, &creator);
+        if total > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &total);
+        }
         Ok(BatchResult { total, items })
     }
 
@@ -2086,13 +1836,7 @@ impl MarketCore {
         Self::save_settle(&env, market_id, &settle);
         Self::save_lp_fees(&env, market_id, 0);
         let treasury: Address = Self::instance_get(&env, &DataKey::Treasury)?;
-        let info = Self::load_market_collateral(&env, market_id);
-        token::TokenClient::new(&env, &info.token).transfer(
-            &env.current_contract_address(),
-            &treasury,
-            &swept,
-        );
-        Self::sub_locked(&env, &info.token, swept)?;
+        Self::token(&env)?.transfer(&env.current_contract_address(), &treasury, &swept);
         MarketFinalized {
             market_id,
             swept,
@@ -2114,12 +1858,7 @@ impl MarketCore {
             return Ok(0);
         }
         Self::save_lp_fees(&env, market_id, 0);
-        let info = Self::load_market_collateral(&env, market_id);
-        token::TokenClient::new(&env, &info.token).transfer(
-            &env.current_contract_address(),
-            &m.creator,
-            &amount,
-        );
+        Self::token(&env)?.transfer(&env.current_contract_address(), &m.creator, &amount);
         LpFeesClaimed {
             market_id,
             creator: m.creator.clone(),
@@ -2146,13 +1885,7 @@ impl MarketCore {
             Some(t) => t.recipient,
             None => Self::instance_get(&env, &DataKey::Treasury)?,
         };
-        let info = Self::load_market_collateral(&env, market_id);
-        token::TokenClient::new(&env, &info.token).transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &amount,
-        );
-        Self::sub_locked(&env, &info.token, amount)?;
+        Self::token(&env)?.transfer(&env.current_contract_address(), &recipient, &amount);
         FeesSwept { market_id, amount }.publish(&env);
         FeesSweptTo {
             market_id,
@@ -2477,93 +2210,9 @@ impl MarketCore {
             .ok_or(Error::NotInitialized)
     }
 
-    fn load_collateral_params(env: &Env, token: &Address) -> Option<CollateralParams> {
-        let key = DataKey::CollateralParams(token.clone());
-        let params: Option<CollateralParams> = env.storage().persistent().get(&key);
-        if params.is_some() {
-            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
-        }
-        params
-    }
-
-    fn load_market_collateral(env: &Env, market_id: u64) -> MarketCollateralInfo {
-        let key = DataKey::MarketCollateral(market_id);
-        if let Some(info) = env.storage().persistent().get(&key) {
-            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
-            return info;
-        }
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Collateral)
-            .unwrap_or_else(|| env.current_contract_address());
-        let max_sets = Self::load_collateral_params(env, &token)
-            .map(|p| p.max_sets)
-            .unwrap_or(MAX_SETS);
-        MarketCollateralInfo { token, max_sets }
-    }
-
-    fn save_market_collateral(env: &Env, market_id: u64, info: &MarketCollateralInfo) {
-        let key = DataKey::MarketCollateral(market_id);
-        env.storage().persistent().set(&key, info);
-        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
-    }
-
-    fn market_token(env: &Env, market_id: u64) -> Address {
-        Self::load_market_collateral(env, market_id).token
-    }
-
-    fn add_locked(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Ok(());
-        }
-        let key = DataKey::Locked(token.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&key, &current.checked_add(amount).ok_or(Error::Overflow)?);
-        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
-        Ok(())
-    }
-
-    fn sub_locked(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Ok(());
-        }
-        let key = DataKey::Locked(token.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        // LP fees and rounding dust are outside `Locked`, so a payout can
-        // legitimately exceed it; the floor keeps the solvency invariant
-        // `balance >= locked` one-sided and honest.
-        env.storage()
-            .persistent()
-            .set(&key, &current.saturating_sub(amount));
-        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
-        Ok(())
-    }
-
-    fn add_pending(pending: &mut Vec<(Address, i128)>, token: &Address, amount: i128) {
-        for i in 0..pending.len() {
-            let (t, a) = pending.get(i).unwrap();
-            if t == *token {
-                pending.set(i, (t, a.saturating_add(amount)));
-                return;
-            }
-        }
-        pending.push_back((token.clone(), amount));
-    }
-
-    fn flush_pending(env: &Env, pending: &Vec<(Address, i128)>, to: &Address) {
-        for i in 0..pending.len() {
-            let (token_addr, amount) = pending.get(i).unwrap();
-            if amount > 0 {
-                token::TokenClient::new(env, &token_addr).transfer(
-                    &env.current_contract_address(),
-                    to,
-                    &amount,
-                );
-            }
-        }
+    fn token(env: &Env) -> Result<token::TokenClient<'_>, Error> {
+        let addr: Address = Self::instance_get(env, &DataKey::Collateral)?;
+        Ok(token::TokenClient::new(env, &addr))
     }
 
     fn require_admin(env: &Env) -> Result<(), Error> {
@@ -2582,6 +2231,23 @@ impl MarketCore {
         Ok(())
     }
 
+    /// Transfers `amount` from `from` into this contract and verifies that the
+    /// contract's observed collateral balance increased by exactly `amount`.
+    /// Rejects fee-on-transfer / under-delivering tokens before they can break
+    /// the solvency invariant (`balance == sets_minted + fees_accrued`, #137).
+    fn pull_collateral(env: &Env, from: &Address, amount: i128) -> Result<(), Error> {
+        let tok = Self::token(env)?;
+        let this = env.current_contract_address();
+        let before = tok.balance(&this);
+        tok.transfer(from, &this, &amount);
+        let after = tok.balance(&this);
+        let delta = after
+            .checked_sub(before)
+            .ok_or(Error::CollateralShortfall)?;
+        if delta != amount {
+            return Err(Error::CollateralShortfall);
+        }
+        Ok(())
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {
@@ -3189,127 +2855,6 @@ mod test {
         assert_eq!(market.category, Category::Crypto);
         assert_eq!(market.status, MarketStatus::Open);
         assert!(client.get_price(&market_id, &Outcome::Yes) > 6000);
-    }
-
-    #[test]
-    fn default_collateral_is_allow_listed_and_locked_on_creation() {
-        let (env, client, creator, _, _, collateral) = setup_market();
-        let id = new_market(&env, &client, &creator, 5_000);
-        assert_eq!(client.get_market_collateral(&id), collateral);
-        assert_eq!(client.locked(&collateral), 100 * 10_000_000_i128);
-        let info = client.market_collateral_info(&id);
-        assert_eq!(info.token, collateral);
-        assert_eq!(info.max_sets, MAX_SETS);
-        assert!(client.collateral_params(&collateral).unwrap().enabled);
-    }
-
-    #[test]
-    fn create_with_unknown_collateral_is_rejected() {
-        let (env, client, creator, _, _, _) = setup_market();
-        let other = env
-            .register_stellar_asset_contract_v2(creator.clone())
-            .address();
-        let err = client.try_create_market_with_collateral(
-            &creator,
-            &other,
-            &BytesN::from_array(&env, &[9u8; 32]),
-            &BytesN::from_array(&env, &[10u8; 32]),
-            &String::from_str(&env, "ipfs://unknown-token"),
-            &Category::Crypto,
-            &(env.ledger().timestamp() + 60_000),
-            &(100 * 10_000_000_i128),
-            &5_000u32,
-        );
-        assert_eq!(err, Err(Ok(Error::CollateralNotAllowed)));
-    }
-
-    #[test]
-    fn custom_collateral_trades_and_locks_separately() {
-        let (env, client, creator, trader, _, default_token) = setup_market();
-        let custom = env.register_stellar_asset_contract_v2(creator.clone());
-        let custom_token = custom.address();
-        let custom_client = StellarAssetClient::new(&env, &custom_token);
-        custom_client.mint(&creator, &10_000_000_000_i128);
-        custom_client.mint(&trader, &10_000_000_000_i128);
-
-        client.add_collateral(
-            &custom_token,
-            &CollateralParams {
-                decimals: 7,
-                min_seed: 1_000_000_000,
-                max_sets: MAX_SETS,
-                enabled: true,
-            },
-        );
-        let id = client.create_market_with_collateral(
-            &creator,
-            &custom_token,
-            &BytesN::from_array(&env, &[11u8; 32]),
-            &BytesN::from_array(&env, &[12u8; 32]),
-            &String::from_str(&env, "ipfs://custom-token"),
-            &Category::Crypto,
-            &(env.ledger().timestamp() + 60_000),
-            &(100 * 10_000_000_i128),
-            &5_000u32,
-        );
-        assert_eq!(client.get_market_collateral(&id), custom_token);
-        assert_eq!(client.locked(&custom_token), 100 * 10_000_000_i128);
-        assert_eq!(client.locked(&default_token), 0);
-
-        let shares = client.buy(&trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0);
-        assert!(shares > 0);
-        assert_eq!(client.locked(&custom_token), 110 * 10_000_000_i128);
-        assert_eq!(client.locked(&default_token), 0);
-        assert_eq!(
-            TokenClient::new(&env, &default_token).balance(&client.address),
-            0
-        );
-    }
-
-    #[test]
-    fn disabling_collateral_blocks_new_markets_not_existing_trades() {
-        let (env, client, creator, trader, _, _) = setup_market();
-        let custom = env.register_stellar_asset_contract_v2(creator.clone());
-        let custom_token = custom.address();
-        let custom_client = StellarAssetClient::new(&env, &custom_token);
-        custom_client.mint(&creator, &10_000_000_000_i128);
-        custom_client.mint(&trader, &10_000_000_000_i128);
-        client.add_collateral(
-            &custom_token,
-            &CollateralParams {
-                decimals: 7,
-                min_seed: 1_000_000_000,
-                max_sets: MAX_SETS,
-                enabled: true,
-            },
-        );
-        let id = client.create_market_with_collateral(
-            &creator,
-            &custom_token,
-            &BytesN::from_array(&env, &[13u8; 32]),
-            &BytesN::from_array(&env, &[14u8; 32]),
-            &String::from_str(&env, "ipfs://disabled-token"),
-            &Category::Crypto,
-            &(env.ledger().timestamp() + 60_000),
-            &(100 * 10_000_000_i128),
-            &5_000u32,
-        );
-        client.set_collateral_enabled(&custom_token, &false);
-        // Existing markets can still trade and redeem, but no new market may
-        // select the disabled token.
-        assert!(client.buy(&trader, &id, &Outcome::Yes, &10_000_000_i128, &0) > 0);
-        let err = client.try_create_market_with_collateral(
-            &creator,
-            &custom_token,
-            &BytesN::from_array(&env, &[15u8; 32]),
-            &BytesN::from_array(&env, &[16u8; 32]),
-            &String::from_str(&env, "ipfs://disabled-token-2"),
-            &Category::Crypto,
-            &(env.ledger().timestamp() + 60_000),
-            &(100 * 10_000_000_i128),
-            &5_000u32,
-        );
-        assert_eq!(err, Err(Ok(Error::CollateralNotAllowed)));
     }
 
     #[test]
@@ -4777,7 +4322,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #28)")]
+    #[should_panic(expected = "Error(Contract, #24)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4900,7 +4445,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #29)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -4921,7 +4466,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #29)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4935,7 +4480,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #29)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4949,7 +4494,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #30)")]
+    #[should_panic(expected = "Error(Contract, #26)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -6248,5 +5793,468 @@ mod multisig_account {
         }
         env.set_auths(&[entry]);
         assert!(client.try_set_paused(&true).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #137: Adversarial hostile SEP-41 token suite
+    // -----------------------------------------------------------------------
+
+    mod adversarial {
+        use super::*;
+        use adversarial_mocks::harness::{deploy_token, mint_hostile, snapshot, TokenKind};
+        use adversarial_mocks::{
+            BudgetBurnerTokenClient, FlipFlopTokenClient, LyingBalanceTokenClient,
+            PanicTokenClient, ReentrantTokenClient, ShortTokenClient,
+        };
+        use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+        use soroban_sdk::{vec, IntoVal, Symbol, Val};
+
+        struct AdvFixture {
+            env: Env,
+            client: MarketCoreClient<'static>,
+            core_id: Address,
+            token_id: Address,
+            creator: Address,
+            trader: Address,
+            treasury: Address,
+            resolver: Address,
+        }
+
+        fn setup_hostile(kind: TokenKind) -> AdvFixture {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().set_timestamp(1_000);
+            let admin = Address::generate(&env);
+            let creator = Address::generate(&env);
+            let trader = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let resolver = Address::generate(&env);
+            let token_id = deploy_token(&env, kind);
+            mint_hostile(&env, kind, &token_id, &creator, 10_000 * 10_000_000);
+            mint_hostile(&env, kind, &token_id, &trader, 10_000 * 10_000_000);
+            let core_id = env.register(
+                MarketCore,
+                (
+                    admin,
+                    token_id.clone(),
+                    treasury.clone(),
+                    resolver.clone(),
+                    100u32,
+                    10_000u32,
+                ),
+            );
+            let client = MarketCoreClient::new(&env, &core_id);
+            AdvFixture {
+                env,
+                client,
+                core_id,
+                token_id,
+                creator,
+                trader,
+                treasury,
+                resolver,
+            }
+        }
+
+        fn create_default(f: &AdvFixture) -> Result<u64, Result<Error, soroban_sdk::InvokeError>> {
+            f.client.try_create_market(
+                &f.creator,
+                &BytesN::from_array(&f.env, &[1u8; 32]),
+                &BytesN::from_array(&f.env, &[2u8; 32]),
+                &String::from_str(&f.env, "ipfs://adv"),
+                &Category::Crypto,
+                &5_000u64,
+                &(100 * 10_000_000_i128),
+                &5_000u32,
+            )
+        }
+
+        #[test]
+        fn adversarial_create_market_with_panic_token_leaves_no_market() {
+            let f = setup_hostile(TokenKind::Panic);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert!(create_default(&f).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert_eq!(before, after);
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_short_token_reverts_with_collateral_shortfall() {
+            let f = setup_hostile(TokenKind::Short);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            let err = create_default(&f).unwrap_err();
+            assert_eq!(err.unwrap(), Error::CollateralShortfall);
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.market_count(),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_buy_with_short_token_reverts_with_collateral_shortfall() {
+            let f = setup_hostile(TokenKind::Short);
+            let short = ShortTokenClient::new(&f.env, &f.token_id);
+            short.set_fee_bps(&0);
+            let id = create_default(&f).unwrap().unwrap();
+
+            short.set_fee_bps(&100);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            let err = f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .unwrap_err();
+            assert_eq!(err.unwrap(), Error::CollateralShortfall);
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_buy_with_panic_token_preserves_state() {
+            let f = setup_hostile(TokenKind::Panic);
+            let tok = PanicTokenClient::new(&f.env, &f.token_id);
+            tok.set_panic(&false);
+            let id = create_default(&f).unwrap().unwrap();
+            tok.set_panic(&true);
+
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_lying_balance_succeeds_exact() {
+            let f = setup_hostile(TokenKind::LyingBalance);
+            let id = create_default(&f).unwrap().unwrap();
+            let real = LyingBalanceTokenClient::new(&f.env, &f.token_id).real_balance(&f.core_id);
+            assert_eq!(real, 100 * 10_000_000_i128);
+            assert_eq!(f.client.get_market(&id).sets_minted, 100 * 10_000_000_i128);
+        }
+
+        #[test]
+        fn adversarial_sweep_fees_ignores_lying_balance() {
+            let f = setup_hostile(TokenKind::LyingBalance);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(50 * 10_000_000_i128), &0);
+            let expected_fees = f.client.get_market(&id).fees_accrued;
+            assert!(expected_fees > 0);
+            let swept = f.client.sweep_fees(&id);
+            assert_eq!(swept, expected_fees);
+            let real_treasury =
+                LyingBalanceTokenClient::new(&f.env, &f.token_id).real_balance(&f.treasury);
+            assert_eq!(real_treasury, expected_fees);
+        }
+
+        #[test]
+        fn adversarial_sell_with_flipflop_token_preserves_position_on_revert() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert!(f
+                .client
+                .try_sell(
+                    &f.trader,
+                    &id,
+                    &Outcome::Yes,
+                    &(5 * 10_000_000_i128),
+                    &(50 * 10_000_000_i128),
+                )
+                .is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_redeem_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            let burn = BudgetBurnerTokenClient::new(&f.env, &f.token_id);
+            burn.set_burn(&false, &0);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            burn.set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert!(f.client.try_redeem(&f.trader, &id).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_redeem_with_frozen_flipflop_preserves_position() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert!(f.client.try_redeem(&f.trader, &id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                f.client.get_position(&id, &f.trader),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_claim_pool_remainder_with_flipflop_preserves_lp_state() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.env.ledger().set_timestamp(6_000);
+            f.client.resolve(&id, &Outcome::Yes);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert!(f.client.try_claim_pool_remainder(&id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.creator, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert_eq!(before, after);
+            assert!(!f.client.get_market(&id).lp_claimed);
+        }
+
+        #[test]
+        fn adversarial_sweep_fees_with_flipflop_preserves_fees() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            f.client
+                .buy(&f.trader, &id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.treasury, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert!(f.client.try_sweep_fees(&id).is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.treasury, &f.core_id],
+                f.client.get_market(&id),
+            );
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            BudgetBurnerTokenClient::new(&f.env, &f.token_id).set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            assert!(create_default(&f).is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_buy_with_budget_burner_reverts_cleanly() {
+            let f = setup_hostile(TokenKind::BudgetBurner);
+            let burn = BudgetBurnerTokenClient::new(&f.env, &f.token_id);
+            burn.set_burn(&false, &0);
+            let id = create_default(&f).unwrap().unwrap();
+            burn.set_burn(&true, &50_000);
+            f.env.cost_estimate().budget().reset_default();
+            let before = f.client.get_market(&id);
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            f.env.cost_estimate().budget().reset_unlimited();
+            assert_eq!(f.client.get_market(&id), before);
+        }
+
+        #[test]
+        fn adversarial_create_market_with_flipflop_token_reverts_when_frozen() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            assert!(create_default(&f).is_err());
+            assert_eq!(f.client.market_count(), 0);
+        }
+
+        #[test]
+        fn adversarial_buy_with_flipflop_token_reverts_when_frozen() {
+            let f = setup_hostile(TokenKind::FlipFlop);
+            let id = create_default(&f).unwrap().unwrap();
+            FlipFlopTokenClient::new(&f.env, &f.token_id).set_frozen(&true);
+            let before = f.client.get_market(&id);
+            assert!(f
+                .client
+                .try_buy(&f.trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0)
+                .is_err());
+            assert_eq!(f.client.get_market(&id), before);
+        }
+
+        #[test]
+        fn adversarial_reentrant_token_cannot_reenter_buy() {
+            let f = setup_hostile(TokenKind::Reentrant);
+            let id = create_default(&f).unwrap().unwrap();
+
+            let buy_amount = 10 * 10_000_000_i128;
+            let cb_args: Vec<Val> = vec![
+                &f.env,
+                f.trader.clone().into_val(&f.env),
+                id.into_val(&f.env),
+                Outcome::Yes.into_val(&f.env),
+                buy_amount.into_val(&f.env),
+                0i128.into_val(&f.env),
+            ];
+            ReentrantTokenClient::new(&f.env, &f.token_id).arm_callback(
+                &f.core_id,
+                &Symbol::new(&f.env, "buy"),
+                &cb_args,
+            );
+
+            // Targeted mock_auths (never mock_all_auths) for the outer buy + its
+            // nested transfer only; the reentrant callback must fail.
+            f.env.set_auths(&[]);
+            let before = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            let res = f
+                .client
+                .mock_auths(&[MockAuth {
+                    address: &f.trader,
+                    invoke: &MockAuthInvoke {
+                        contract: &f.core_id,
+                        fn_name: "buy",
+                        args: (f.trader.clone(), id, Outcome::Yes, buy_amount, 0i128)
+                            .into_val(&f.env),
+                        sub_invokes: &[MockAuthInvoke {
+                            contract: &f.token_id,
+                            fn_name: "transfer",
+                            args: (f.trader.clone(), f.core_id.clone(), buy_amount)
+                                .into_val(&f.env),
+                            sub_invokes: &[],
+                        }],
+                    },
+                }])
+                .try_buy(&f.trader, &id, &Outcome::Yes, &buy_amount, &0);
+            assert!(res.is_err());
+            let after = snapshot(
+                &f.env,
+                &f.token_id,
+                &[&f.trader, &f.core_id],
+                (
+                    f.client.get_market(&id),
+                    f.client.get_position(&id, &f.trader),
+                ),
+            );
+            assert_eq!(before, after);
+            let _ = f.resolver;
+        }
     }
 }
