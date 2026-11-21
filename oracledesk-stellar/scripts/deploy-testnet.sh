@@ -550,6 +550,14 @@ if [ "$NETWORK" = "local" ]; then
   fi
 fi
 
+# Record SHA-256 hashes of the deployed contract WASM files (additive, #127).
+for contract_name in market_core resolver treasury reasoning_registry; do
+  if [ -f "$WASM_DIR/${contract_name}.wasm" ]; then
+    wasm_hash=$(sha256sum "$WASM_DIR/${contract_name}.wasm" | awk '{print $1}')
+    json_set --arg k "$contract_name" --arg h "$wasm_hash" '.wasm_sha256[$k] = $h'
+  fi
+done
+
 json_set --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_deployed_at = $ts'
 
 log "done. Deployment record: $OUT"
