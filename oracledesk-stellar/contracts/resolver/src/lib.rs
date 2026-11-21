@@ -97,9 +97,9 @@ fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
 // them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
 // keep working.
 pub use oracledesk_types::{
-    CommitteeRef, DisputableSignerConfig, Escalation, HybridConfig, OracleAsset, Outcome,
-    PriceConfig, PriceData, PriceDirection, ResolutionSpec, ResolutionSpecV2, SignerConfig,
-    WeightedKey, WeightedKeyConfig,
+    CommitteeRef, DisputableSignerConfig, Escalation, FallbackAuthority, HybridConfig,
+    HybridConfigV2, OracleAsset, Outcome, PriceConfig, PriceData, PriceDirection, ResolutionSpec,
+    ResolutionSpecV2, SignerConfig, WeightedKey, WeightedKeyConfig,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -195,6 +195,8 @@ pub enum SpecKind {
     Committee,
     /// A hybrid price-then-signers market, before and after its fallback opens.
     Hybrid,
+    /// Extended hybrid with committee or weighted-key fallback (issue #314).
+    HybridV2,
 }
 
 /// Everything the treasury's pre-trade resolvability check needs, in one
@@ -686,6 +688,9 @@ pub enum DataKey {
     /// Absent until pinned, so pre-attestation views compute the would-be pin
     /// without writing.
     MarketEpoch(u64),
+    /// #314: extended hybrid spec with richer fallback authority.
+    /// Appended last to preserve existing discriminant positions.
+    HybridV2(u64),
 }
 
 /// #297: A committee member set snapshotted at a specific epoch. Loaded from
@@ -711,6 +716,8 @@ enum SignerAuthority {
     /// the snapshot is computed from the would-be pin without writing.
     Committee(CommitteeRef, CommitteeSnapshot),
     Hybrid(HybridConfig),
+    /// #314: extended hybrid with richer fallback authority.
+    HybridV2(HybridConfigV2, Option<CommitteeSnapshot>),
 }
 
 impl SignerAuthority {
@@ -721,6 +728,11 @@ impl SignerAuthority {
             Self::Disputable(cfg) => cfg.dispute_window,
             Self::Committee(r, _) => r.dispute_window,
             Self::Hybrid(cfg) => cfg.fallback.dispute_window,
+            Self::HybridV2(cfg, _) => match &cfg.fallback {
+                FallbackAuthority::Signers(s) => s.dispute_window,
+                FallbackAuthority::Committee(r) => r.dispute_window,
+                FallbackAuthority::WeightedKeys(w) => w.dispute_window,
+            },
         }
     }
 }
@@ -1147,8 +1159,9 @@ impl Resolver {
     ) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
         Self::validate_scaled_rule(&spec)?;
-        Self::assert_matches_commitment(&env, market_id, &scaled_spec_hash(&env, &spec))?;
-        Self::store_scaled_rule(&env, market_id, &spec);
+        let close_time = Self::assert_matches_commitment(&env, market_id, &scaled_spec_hash(&env, &spec))?;
+        Self::store_scaled_rule(&env, market_id, &spec, close_time);
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -1168,8 +1181,9 @@ impl Resolver {
     pub fn register_twap_spec(env: Env, market_id: u64, spec: TwapConfig) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
         Self::validate_twap_rule(&env, &spec)?;
-        Self::assert_matches_commitment(&env, market_id, &twap_spec_hash(&env, &spec))?;
-        Self::store_twap_rule(&env, market_id, &spec);
+        let close_time = Self::assert_matches_commitment(&env, market_id, &twap_spec_hash(&env, &spec))?;
+        Self::store_twap_rule(&env, market_id, &spec, close_time);
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -1228,14 +1242,28 @@ impl Resolver {
         Self::assert_unconfigured(&env, market_id)?;
         Self::validate_committee_ref(&env, &spec)?;
         let rule = ResolutionSpec::Committee(spec);
-        Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
-        Self::store_rule(&env, market_id, &rule);
+        let close_time = Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
+        Self::store_rule(&env, market_id, &rule, close_time);
         Ok(())
     }
 
     /// Registers a hybrid resolution specification (price feed with attested fallback).
     pub fn register_hybrid_spec(env: Env, market_id: u64, spec: HybridConfig) -> Result<(), Error> {
         let rule = ResolutionSpec::Hybrid(spec);
+        Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
+    }
+
+    /// Registers a hybrid V2 resolution specification (price feed with richer fallback).
+    ///
+    /// Unlike `register_hybrid_spec`, the fallback can be a committee or a
+    /// weighted-key group, not only bare signers (issue #314).
+    pub fn register_hybrid_v2_spec(
+        env: Env,
+        market_id: u64,
+        spec: HybridConfigV2,
+    ) -> Result<(), Error> {
+        Self::validate_hybrid_v2(&env, &spec)?;
+        let rule = ResolutionSpec::HybridV2(spec);
         Self::reveal(&env, market_id, &rule, &legacy_spec_hash(&env, &rule))
     }
 
@@ -1723,6 +1751,8 @@ impl Resolver {
             (cfg, false)
         } else if let Ok(hybrid) = Self::load::<HybridConfig>(&env, DataKey::Hybrid(market_id)) {
             (hybrid.price, true)
+        } else if let Ok(hybrid) = Self::load::<HybridConfigV2>(&env, DataKey::HybridV2(market_id)) {
+            (hybrid.price, true)
         } else {
             return Err(Error::WrongMode);
         };
@@ -1998,6 +2028,9 @@ impl Resolver {
             return Self::price_outcome(env, market_id, &cfg, close_time);
         }
         if let Some(h) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
+            return Self::price_outcome(env, market_id, &h.price, close_time);
+        }
+        if let Some(h) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
             return Self::price_outcome(env, market_id, &h.price, close_time);
         }
         if let Some(s) = storage.get::<_, ScaledPriceConfig>(&DataKey::PriceScaled(market_id)) {
@@ -2552,6 +2585,8 @@ impl Resolver {
             SpecKind::Committee
         } else if storage.has(&DataKey::Hybrid(market_id)) {
             SpecKind::Hybrid
+        } else if storage.has(&DataKey::HybridV2(market_id)) {
+            SpecKind::HybridV2
         } else {
             SpecKind::None
         }
@@ -2618,12 +2653,17 @@ impl Resolver {
             .unwrap_or(ResolutionState::Unconfigured)
     }
 
-    /// Writes the per-market state and extends its TTL. An archived entry is
-    /// not lost (it must be restored before any transaction can touch it),
-    /// but keeping terminal state live spares every later call the restore.
+    /// Writes the per-market state and extends its TTL to the market's
+    /// close-time-aware target. An archived entry is not lost (it must be
+    /// restored before any transaction can touch it), but keeping terminal
+    /// state live spares every later call the restore.
     fn set_state(env: &Env, market_id: u64, state: ResolutionState) {
         let key = DataKey::State(market_id);
         env.storage().persistent().set(&key, &state);
+        if let Ok(close_time) = Self::market_close_time(env, market_id) {
+            let target = ttl::market_target(env, close_time);
+            ttl::bump_persistent(env, &key, target);
+        }
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -2820,6 +2860,15 @@ impl Resolver {
         if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(SignerAuthority::Hybrid(cfg));
         }
+        if let Some(cfg) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            let snapshot = if let FallbackAuthority::Committee(ref ref_spec) = cfg.fallback {
+                let close_time = Self::market_close_time(env, market_id)?;
+                Some(Self::committee_snapshot(env, market_id, ref_spec, close_time)?)
+            } else {
+                None
+            };
+            return Ok(SignerAuthority::HybridV2(cfg, snapshot));
+        }
         Err(Error::MarketNotConfigured)
     }
 
@@ -2857,6 +2906,29 @@ impl Resolver {
             SignerAuthority::Hybrid(cfg) => {
                 Self::attestation_count(env, market_id, outcome) >= cfg.fallback.threshold
             }
+            SignerAuthority::HybridV2(cfg, snapshot) => match &cfg.fallback {
+                FallbackAuthority::Signers(s) => {
+                    Self::attestation_count(env, market_id, outcome) >= s.threshold
+                }
+                FallbackAuthority::WeightedKeys(w) => outcome.to_market().is_some_and(|o| {
+                    let round = Self::round(env, market_id);
+                    Self::round_weight(env, market_id, round, &o) >= w.weight_threshold
+                }),
+                FallbackAuthority::Committee(ref_spec) => {
+                    let _ = ref_spec;
+                    if let Some(snap) = snapshot {
+                        let mut votes: u32 = 0;
+                        for member in snap.members.iter() {
+                            if Self::has_attested(env, market_id, outcome, &member) {
+                                votes += 1;
+                            }
+                        }
+                        votes >= snap.threshold
+                    } else {
+                        false
+                    }
+                }
+            },
         }
     }
 
@@ -3134,6 +3206,9 @@ impl Resolver {
         if let Some(hybrid) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(hybrid.price);
         }
+        if let Some(hybrid) = storage.get::<_, HybridConfigV2>(&DataKey::HybridV2(market_id)) {
+            return Ok(hybrid.price);
+        }
         if storage.has(&DataKey::PriceScaled(market_id))
             || storage.has(&DataKey::PriceTwap(market_id))
         {
@@ -3195,6 +3270,7 @@ impl Resolver {
             || storage.has(&DataKey::Disputable(market_id))
             || storage.has(&DataKey::CommitteeSpec(market_id))
             || storage.has(&DataKey::Hybrid(market_id))
+            || storage.has(&DataKey::HybridV2(market_id))
         {
             return Err(Error::MarketAlreadyConfigured);
         }
@@ -3211,7 +3287,7 @@ impl Resolver {
         Self::assert_unconfigured(env, market_id)?;
         Self::validate_rule(env, rule)?;
         let close_time = Self::assert_matches_commitment(env, market_id, commitment)?;
-        Self::store_rule(env, market_id, rule);
+        Self::store_rule(env, market_id, rule, close_time);
         Self::bump_market_entries(env, market_id, close_time);
         Ok(())
     }
@@ -3244,6 +3320,9 @@ impl Resolver {
                     && cfg.fallback_after > 0
                     && cfg.fallback_after >= cfg.price.max_staleness
             }
+            ResolutionSpec::HybridV2(cfg) => {
+                Self::validate_hybrid_v2(env, cfg).is_ok()
+            }
         };
         if valid {
             Ok(())
@@ -3252,45 +3331,141 @@ impl Resolver {
         }
     }
 
-    fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
-        let storage = env.storage().persistent();
+    fn validate_hybrid_v2(env: &Env, cfg: &HybridConfigV2) -> Result<(), Error> {
+        let price_ok = cfg.price.threshold >= 0
+            && cfg.price.max_staleness != 0
+            && cfg.fallback_after > 0
+            && cfg.fallback_after >= cfg.price.max_staleness;
+        if !price_ok {
+            return Err(Error::InvalidConfig);
+        }
+        match &cfg.fallback {
+            FallbackAuthority::Signers(s) => {
+                if s.signers.is_empty()
+                    || s.threshold == 0
+                    || s.threshold > s.signers.len()
+                    || s.dispute_window == 0
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            FallbackAuthority::WeightedKeys(w) => {
+                if !Self::weighted_config_is_valid(w) {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            FallbackAuthority::Committee(r) => {
+                Self::validate_committee_ref(env, r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a per-market key with the market's close-time-aware TTL.
+    /// Unlike the flat `persist`, this guarantees the entry outlives the
+    /// market's settlement horizon rather than just 60 days from write.
+    fn persist_market<K, V>(env: &Env, key: &K, value: &V, close_time: u64)
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val> + Clone,
+        V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+    {
+        let target = ttl::market_target(env, close_time);
+        env.storage().persistent().set(key, value);
+        ttl::bump_persistent(env, key, target);
+    }
+
+    /// Compile-time exhaustiveness check: every `DataKey` variant must be classified
+    /// here, or the match won't compile. Market-scoped entries use `market_target`;
+    /// instance/global entries use `long_lived_target` or `bump_instance`.
+    #[allow(dead_code)]
+    fn ttl_class(key: &DataKey) -> &'static str {
+        match key {
+            // Non-market (instance/global) — bumped by bump_instance or long_lived_target
+            DataKey::Admin => "global",
+            DataKey::PendingAdmin => "global",
+            DataKey::MarketCore => "global",
+            DataKey::EvidenceConfig => "global",
+            DataKey::NextCommitteeId => "global",
+            // Committee registry — long-lived, not market-scoped
+            DataKey::Committee(_) => "long-lived",
+            DataKey::Rotation(_) => "long-lived",
+            DataKey::MemberAt(_, _) => "long-lived",
+            DataKey::EpochStart(_, _) => "long-lived",
+            // Market-scoped — bumped via persist_market / bump_market_entries
+            DataKey::Price(_) => "market",
+            DataKey::PriceScaled(_) => "market",
+            DataKey::PriceTwap(_) => "market",
+            DataKey::Hybrid(_) => "market",
+            DataKey::Signers(_) => "market",
+            DataKey::WeightedKeys(_) => "market",
+            DataKey::Disputable(_) => "market",
+            DataKey::CommitteeSpec(_) => "market",
+            DataKey::State(_) => "market",
+            DataKey::ProposalV2(_) => "market",
+            DataKey::Proposal(_) => "market",
+            DataKey::AttestationV2(_, _, _) => "market",
+            DataKey::Attestation(_, _, _) => "market",
+            DataKey::CountV2(_, _) => "market",
+            DataKey::Count(_, _) => "market",
+            DataKey::EvidencePolicy(_) => "market",
+            DataKey::EvidenceCount(_) => "market",
+            DataKey::EvidenceUsed(_) => "market",
+            DataKey::Evidence(_, _) => "market",
+            DataKey::Cancels(_) => "market",
+            DataKey::EscalationCount(_, _) => "market",
+            DataKey::EscalationVote(_, _) => "market",
+            DataKey::Dispute(_) => "market",
+            DataKey::Snapshot(_) => "market",
+            DataKey::Round(_) => "market",
+            DataKey::SigSeen(_, _, _) => "market",
+            DataKey::Weight(_, _, _) => "market",
+            DataKey::AttestEpoch(_, _) => "market",
+            DataKey::MarketEpoch(_) => "market",
+            DataKey::HybridV2(_) => "market",
+        }
+    }
+
+    fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec, close_time: u64) {
         let (key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::Unconfigured)
             }
             ResolutionSpec::Signers(cfg) => {
                 let key = DataKey::Signers(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::WeightedKeys(cfg) => {
                 let key = DataKey::WeightedKeys(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::SignersDisputable(cfg) => {
                 let key = DataKey::Disputable(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::Committee(cfg) => {
                 let key = DataKey::CommitteeSpec(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::SignersPending)
             }
             ResolutionSpec::Hybrid(cfg) => {
                 let key = DataKey::Hybrid(market_id);
-                storage.set(&key, cfg);
+                Self::persist_market(env, &key, cfg, close_time);
+                (key, ResolutionState::HybridPricePending)
+            }
+            ResolutionSpec::HybridV2(cfg) => {
+                let key = DataKey::HybridV2(market_id);
+                Self::persist_market(env, &key, cfg, close_time);
                 (key, ResolutionState::HybridPricePending)
             }
         };
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
-            storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::persist_market(env, &p_key, &policy, close_time);
         }
         Self::set_state(env, market_id, state);
     }
@@ -3311,15 +3486,13 @@ impl Resolver {
 
     /// Issue #26 counterpart of [`store_rule`] for the scaled mode: same
     /// key + TTL + evidence-policy + state bookkeeping, different payload.
-    fn store_scaled_rule(env: &Env, market_id: u64, cfg: &ScaledPriceConfig) {
-        let storage = env.storage().persistent();
+    /// Takes `close_time` so the spec key gets the market-aware TTL (#309).
+    fn store_scaled_rule(env: &Env, market_id: u64, cfg: &ScaledPriceConfig, close_time: u64) {
         let key = DataKey::PriceScaled(market_id);
-        storage.set(&key, cfg);
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Self::persist_market(env, &key, cfg, close_time);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
-            storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::persist_market(env, &p_key, &policy, close_time);
         }
         Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
@@ -3358,15 +3531,13 @@ impl Resolver {
     }
 
     /// Issue #27 counterpart of [`store_scaled_rule`] for the TWAP mode.
-    fn store_twap_rule(env: &Env, market_id: u64, cfg: &TwapConfig) {
-        let storage = env.storage().persistent();
+    /// Takes `close_time` so the spec key gets the market-aware TTL (#309).
+    fn store_twap_rule(env: &Env, market_id: u64, cfg: &TwapConfig, close_time: u64) {
         let key = DataKey::PriceTwap(market_id);
-        storage.set(&key, cfg);
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Self::persist_market(env, &key, cfg, close_time);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
-            storage.set(&p_key, &policy);
-            storage.extend_ttl(&p_key, BUMP_THRESHOLD, BUMP_TO);
+            Self::persist_market(env, &p_key, &policy, close_time);
         }
         Self::set_state(env, market_id, ResolutionState::Unconfigured);
     }
@@ -3770,13 +3941,18 @@ impl Resolver {
 
     /// Extends every per-market entry to the market's close-time-aware target.
     /// Called after each mutating entrypoint so an in-progress vote or a
-    /// finalized market cannot archive mid-settlement. `Attestation` entries
-    /// are not enumerable — each is extended where it is written, plus the
-    /// configured signers' in `finalize_signers` — so they are handled
-    /// separately. Absent keys are skipped: `extend_ttl` panics on them.
+    /// finalized market cannot archive mid-settlement.
+    ///
+    /// Per-signer and per-round keys (`AttestationV2`, `EscalationVote`,
+    /// `SigSeen`, `Weight`, `AttestEpoch`, `Evidence`) are not enumerable here
+    /// — they are bumped at write time (see `record_attestation`,
+    /// `persist_market_signer`) and by the permissionless `keep_alive`
+    /// entrypoint for long-idle markets.  Absent keys are skipped: `extend_ttl`
+    /// panics on a missing key.
     fn bump_market_entries(env: &Env, market_id: u64, close_time: u64) {
         let target = ttl::market_target(env, close_time);
-        let keys = [
+        let storage = env.storage().persistent();
+        let scalar_keys = [
             DataKey::Price(market_id),
             DataKey::Signers(market_id),
             DataKey::WeightedKeys(market_id),
@@ -3800,28 +3976,86 @@ impl Resolver {
             // market's other entries so they survive until finalization.
             DataKey::CommitteeSpec(market_id),
             DataKey::MarketEpoch(market_id),
+            // #309: spec keys added after the original bump_market_entries list.
+            // A PriceScaled / PriceTwap / Hybrid market written with the old
+            // flat 60-day TTL would archive before its close_time for markets
+            // more than 60 days out.
+            DataKey::PriceScaled(market_id),
+            DataKey::PriceTwap(market_id),
+            DataKey::Hybrid(market_id),
+            // #309: evidence and cancel tracking keys.
+            DataKey::EvidencePolicy(market_id),
+            DataKey::EvidenceCount(market_id),
+            DataKey::EvidenceUsed(market_id),
+            DataKey::Cancels(market_id),
+            // #309: escalation aggregate keys (per-verdict, not per-signer).
+            DataKey::EscalationCount(market_id, Verdict::Valid),
+            DataKey::EscalationCount(market_id, Verdict::Invalid),
+            // #314: HybridV2 spec key.
+            DataKey::HybridV2(market_id),
         ];
-        for key in keys {
-            if env.storage().persistent().has(&key) {
+        for key in scalar_keys {
+            if storage.has(&key) {
                 ttl::bump_persistent(env, &key, target);
             }
         }
         // #297: also bump the pinned snapshot's MemberAt and EpochStart entries.
         // These are shared across markets; each market bumping them is idempotent.
-        if let Some((committee_id, epoch)) = env
-            .storage()
-            .persistent()
-            .get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
-        {
+        if let Some((committee_id, epoch)) = storage.get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id)) {
             let member_key = DataKey::MemberAt(committee_id, epoch);
-            if env.storage().persistent().has(&member_key) {
+            if storage.has(&member_key) {
                 ttl::bump_persistent(env, &member_key, target);
             }
             let epoch_start_key = DataKey::EpochStart(committee_id, epoch);
-            if env.storage().persistent().has(&epoch_start_key) {
+            if storage.has(&epoch_start_key) {
                 ttl::bump_persistent(env, &epoch_start_key, target);
             }
         }
+    }
+
+    /// Bump per-signer keys for a market from an external cursor, up to
+    /// `limit` signers per call (capped at 16 to bound the footprint).
+    ///
+    /// Returns the next cursor position; 0 when the full signer list has been
+    /// covered.  Callers (off-chain keepers or anyone) may paginate by calling
+    /// repeatedly until the return value is 0.  This is the permissionless
+    /// keep-alive path for long-idle markets that would otherwise let their
+    /// per-signer entries archive before resolution.
+    pub fn keep_alive(env: Env, market_id: u64, cursor: u32, limit: u32) -> Result<u32, Error> {
+        ttl::bump_instance(&env);
+        let close_time = Self::market_close_time(&env, market_id)?;
+        let target = ttl::market_target(&env, close_time);
+        let limit = limit.min(16);
+        let storage = env.storage().persistent();
+
+        // Walk the signer list from `cursor`, bumping per-signer attestation
+        // and epoch keys for each address that has them.
+        let signers_opt: Option<SignerConfig> = storage.get(&DataKey::Signers(market_id));
+        let next_cursor = if let Some(cfg) = signers_opt {
+            let signers = &cfg.signers;
+            let total = signers.len();
+            let mut i = cursor;
+            let end = (cursor + limit).min(total);
+            while i < end {
+                if let Some(signer) = signers.get(i) {
+                    for outcome in [AttestedOutcome::Yes, AttestedOutcome::No, AttestedOutcome::Invalid] {
+                        let key = DataKey::AttestationV2(market_id, outcome, signer.clone());
+                        if storage.has(&key) {
+                            ttl::bump_persistent(&env, &key, target);
+                        }
+                    }
+                    let attest_epoch_key = DataKey::AttestEpoch(market_id, signer.clone());
+                    if storage.has(&attest_epoch_key) {
+                        ttl::bump_persistent(&env, &attest_epoch_key, target);
+                    }
+                }
+                i += 1;
+            }
+            if end >= total { 0 } else { end }
+        } else {
+            0
+        };
+        Ok(next_cursor)
     }
 }
 

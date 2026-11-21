@@ -556,6 +556,13 @@ pub enum DataKey {
     Registry,
     TracePolicy,
     PendingTracePolicy,
+    /// #318: on-chain cap on agents' paid-signal (data-feed) budget.
+    DataBudget(Address),
+    PendingDataBudget(Address),
+    /// #318: global ceiling for all data budgets combined.
+    DataGlobalCap,
+    /// #318: sliding 25-bucket daily window for data spend, per agent.
+    DataBudgetWindow(Address),
 }
 
 #[contracttype]
@@ -578,6 +585,28 @@ pub struct TracePolicyConfig {
 pub struct PendingTracePolicy {
     pub config: TracePolicyConfig,
     pub registry: Option<Address>,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+/// Per-agent paid-signal budget enforced on-chain (issue #318).
+/// `max_daily` is in stroops (1 XLM = 10_000_000 stroops).
+/// The agent's spend is tracked via the same 25-bucket sliding window
+/// as trade volume; only `fund_data_spend` deducts against this cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataBudget {
+    pub max_daily: i128,
+    pub account: Address,
+    pub active: bool,
+}
+
+/// Two-step proposal for updating a `DataBudget` (mirrors `AgentPolicy`'s
+/// pending mechanism so changes cannot be front-run).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDataBudget {
+    pub budget: DataBudget,
     pub proposed_at: u64,
     pub executable_at: u64,
 }
@@ -1407,6 +1436,131 @@ impl Treasury {
         Self::put_persistent(&env, &DataKey::Agent(agent.clone()), &policy);
         Self::ensure_settler(&env)?;
         AgentRemoved { agent }.publish(&env);
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #318: paid-signal data budget
+    // -------------------------------------------------------------------------
+
+    /// Proposes a new `DataBudget` for `agent`, subject to the config timelock.
+    /// Admin only. The budget takes effect once `execute_data_budget` is called.
+    pub fn set_data_budget(
+        env: Env,
+        agent: Address,
+        max_daily: i128,
+        account: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if max_daily <= 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let config_delay: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ConfigDelay)
+            .ok_or(Error::NotInitialized)?;
+        let now = env.ledger().timestamp();
+        let budget = DataBudget {
+            max_daily,
+            account: account.clone(),
+            active: true,
+        };
+        let pending = PendingDataBudget {
+            budget,
+            proposed_at: now,
+            executable_at: now.saturating_add(config_delay),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDataBudget(agent), &pending);
+        Ok(())
+    }
+
+    /// Executes a proposed `DataBudget` once the timelock has elapsed.
+    pub fn execute_data_budget(env: Env, agent: Address) -> Result<(), Error> {
+        let key = DataKey::PendingDataBudget(agent.clone());
+        let pending: PendingDataBudget = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoPendingConfig)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockActive);
+        }
+        // Validate against global cap if set.
+        if let Some(global_cap) = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::DataGlobalCap)
+        {
+            if pending.budget.max_daily > global_cap {
+                return Err(Error::DailyCapExceeded);
+            }
+        }
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DataBudget(agent), &pending.budget);
+        Ok(())
+    }
+
+    /// Cancels a pending `DataBudget` proposal. Admin only.
+    pub fn cancel_data_budget(env: Env, agent: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::PendingDataBudget(agent);
+        if !env.storage().persistent().has(&key) {
+            return Err(Error::NoPendingConfig);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Sets the network-wide global ceiling for all data budgets. Admin only.
+    /// Setting `cap` to 0 removes the ceiling.
+    pub fn set_data_global_cap(env: Env, cap: i128) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if cap < 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if cap == 0 {
+            env.storage().persistent().remove(&DataKey::DataGlobalCap);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DataGlobalCap, &cap);
+        }
+        Ok(())
+    }
+
+    /// Records a data-spend of `amount` stroops for `agent`.
+    /// The agent must be active, its `DataBudget` must be active, and the
+    /// deduction must not exceed the per-agent daily cap.
+    /// Only the budget's registered `account` may call this.
+    pub fn fund_data_spend(env: Env, agent: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let budget: DataBudget = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DataBudget(agent.clone()))
+            .ok_or(Error::Unauthorized)?;
+        if !budget.active {
+            return Err(Error::Unauthorized);
+        }
+        budget.account.require_auth();
+        let now = env.ledger().timestamp();
+        let mut data_window: UsageWindow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DataBudgetWindow(agent.clone()))
+            .unwrap_or_else(|| Self::empty_window(&env, now / BUCKET_SECONDS));
+        Self::consume_window(&mut data_window, now, amount, budget.max_daily)
+            .map_err(|_| Error::AgentDailyCapExceeded)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::DataBudgetWindow(agent), &data_window);
         Ok(())
     }
 

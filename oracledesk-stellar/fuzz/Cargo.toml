@@ -17,7 +17,7 @@ path = "src/lib.rs"
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 market-core = { path = "../contracts/market-core" }
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
 
 [[bin]]
 name = "fuzz_calc_buy"
