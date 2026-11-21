@@ -34,6 +34,7 @@ import {
 } from "./fees.js";
 import { feeChargedOf, submitSorobanTransaction, type ReplacementPolicy } from "./submit.js";
 import type { StellarSigner } from "./signers/types.js";
+import type { FencedLease } from "../runtime/lease.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -96,7 +97,8 @@ interface CommonAdapterOptions {
   agentAddress?: string;
   deployments: Deployments;
   /** Checked before dry-run descriptions and immediately before live broadcasts. */
-  beforeSend?: () => void | Promise<void>;
+  beforeSend?: (hash?: string, attempt?: number) => void | Promise<void>;
+  fence?: FencedLease;
   feePolicy?: FeePolicy;
   journal?: TransactionJournal;
   task?: string;
@@ -109,6 +111,7 @@ interface AssembledCall<T = unknown> {
   signed?: Transaction;
   simulation?: { error?: string };
   result?: T | unknown;
+  sign(): Promise<void>;
   signAndSend(): Promise<{ result: T | unknown; sendTransactionResponse?: { hash?: string } }>;
 }
 
@@ -294,6 +297,17 @@ export class StellarAdapter {
     return this.opts.deployments;
   }
 
+  private async fenceGuard(hash?: string, attempt?: number): Promise<void> {
+    await this.opts.beforeSend?.(hash, attempt);
+    if (this.opts.fence) {
+      const fence = this.opts.fence.current();
+      if (fence) {
+        await this.opts.fence.assertHeld(fence);
+        if (hash) await this.opts.fence.noteInflight(fence, hash);
+      }
+    }
+  }
+
   private get taskName(): string {
     return this.opts.task ?? "agent";
   }
@@ -413,7 +427,7 @@ export class StellarAdapter {
     const contractId = this.opts.deployments.contracts[pkg];
     switch (this.opts.mode) {
       case "dry-run":
-        await this.opts.beforeSend?.();
+        await this.fenceGuard();
         return { dryRun: true, contractId, method: methodName, args };
       case "live":
         break;
@@ -444,7 +458,7 @@ export class StellarAdapter {
       const stats = await this.feeStats();
       const decisionId = this.decisionId(methodName);
       const counter = { count: 0 };
-      const result = await submitSorobanTransaction({
+      await submitSorobanTransaction({
         id: decisionId,
         transaction: prepared,
         server: this.rpcServer(),
@@ -452,7 +466,7 @@ export class StellarAdapter {
         maxAttempts: 4 + rule.maxBumps,
         maxPollsPerAttempt: Math.max(5, 2 * rule.maxBumps + 3),
         retryDelayMs: 250,
-        beforeSend: this.opts.beforeSend,
+        beforeSend: (hash, attempt) => this.fenceGuard(hash, attempt),
         replacement: this.replacementFor(
           prepared,
           rule,
@@ -473,15 +487,31 @@ export class StellarAdapter {
       return { dryRun: false, value: unwrapContractResult(methodName, assembled.result as T), fee, ...((result as { txHash?: string }).txHash ? { txHash: (result as { txHash?: string }).txHash } : {}) };
     }
 
+    if (!this.opts.journal) {
+      throw new NotSubmittedError(`${methodName}: live submission requires a transaction journal`);
+    }
     try {
-      await this.opts.beforeSend?.();
+      await assembled.sign();
     } catch (error) {
       await this.journalCancelled(methodName, assembled, error);
       throw error;
     }
-    const sent = await assembled.signAndSend();
-    const txHash = sent.sendTransactionResponse?.hash;
-    return { dryRun: false, value: unwrapContractResult(methodName, sent.result as T), ...(txHash ? { txHash } : {}) };
+    const tx = assembled.signed;
+    if (!tx) throw new NotSubmittedError(`${methodName}: signing did not produce an envelope`);
+    const decisionId = this.decisionId(methodName);
+    const result = await submitSorobanTransaction({
+      id: decisionId,
+      transaction: tx,
+      server: this.rpcServer(),
+      journal: this.opts.journal,
+      beforeSend: (hash, attempt) => this.fenceGuard(hash, attempt),
+    });
+    const txHash = tx.hash().toString("hex");
+    return {
+      dryRun: false,
+      value: unwrapContractResult(methodName, assembled.result as T),
+      ...(txHash ? { txHash } : {}),
+    };
   }
 
   private async journalCancelled(methodName: string, assembled: unknown, error: unknown): Promise<void> {

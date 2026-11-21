@@ -31,6 +31,12 @@ build:
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/timelock.wasm contracts/integration-tests/wasm/
 
+.PHONY: build-local-short
+build-local-short:
+	stellar contract build --package market-core --features local-short-windows --out-dir target/local-short
+	stellar contract build --package treasury --features local-short-windows --out-dir target/local-short
+	stellar contract build --package timelock --features local-short-windows --out-dir target/local-short
+
 # Proves the contract build is bit-for-bit reproducible and that the vendored
 # wasm matches a clean build (issue #58). Slow: it compiles the workspace
 # twice into separate target directories.

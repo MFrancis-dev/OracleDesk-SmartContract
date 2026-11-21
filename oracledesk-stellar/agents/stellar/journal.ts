@@ -1,7 +1,7 @@
 import { open, readFile, mkdir, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled";
+export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled" | "fenced";
 
 export interface TransactionJournalRecord {
   version: 1 | 2;
@@ -16,6 +16,7 @@ export interface TransactionJournalRecord {
   outerHash?: string;
   feeOffered?: string;
   feeCharged?: string;
+  fence?: { name: string; epoch: string };
 }
 
 export interface TransactionJournalOptions {
@@ -32,6 +33,7 @@ const stages = new Set<JournalStage>([
   "failed",
   "uncertain",
   "cancelled",
+  "fenced",
 ]);
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 
@@ -56,7 +58,11 @@ function isJournalRecord(value: unknown): value is TransactionJournalRecord {
     (record.innerHash === undefined || typeof record.innerHash === "string") &&
     (record.outerHash === undefined || typeof record.outerHash === "string") &&
     optionalDecimal(record.feeOffered) &&
-    optionalDecimal(record.feeCharged)
+    optionalDecimal(record.feeCharged) &&
+    (record.fence === undefined ||
+      (typeof record.fence === "object" &&
+        typeof record.fence.name === "string" &&
+        typeof record.fence.epoch === "string"))
   );
 }
 
