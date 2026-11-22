@@ -500,6 +500,7 @@
         ]
       }
     },
+<<<<<<< HEAD
     "get_market_view": {
       "kind": "function_v0",
       "spec": {
@@ -526,6 +527,8 @@
         ]
       }
     },
+=======
+>>>>>>> upstream/develop
     "get_position": {
       "kind": "function_v0",
       "spec": {
@@ -583,6 +586,7 @@
         ]
       }
     },
+<<<<<<< HEAD
     "is_closed": {
       "kind": "function_v0",
       "spec": {
@@ -600,6 +604,8 @@
         ]
       }
     },
+=======
+>>>>>>> upstream/develop
     "market_count": {
       "kind": "function_v0",
       "spec": {
@@ -2709,6 +2715,14 @@
             "value": 31
           },
           {
+<<<<<<< HEAD
+=======
+            "doc": "Inbound collateral transfer delivered fewer (or different) units than expected, e.g. a fee-on-transfer or under-delivering token (#137).",
+            "name": "CollateralShortfall",
+            "value": 32
+          },
+          {
+>>>>>>> upstream/develop
             "doc": "`buy_v2` / `sell_v2` called with `env.ledger().timestamp() > deadline`.",
             "name": "DeadlineExpired",
             "value": 19

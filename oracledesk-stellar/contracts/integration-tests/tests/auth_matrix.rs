@@ -791,6 +791,73 @@ fn auth_resolver_snapshot_price_signs_as_caller() {
 }
 
 #[test]
+fn auth_resolver_create_committee_requires_admin_auth() {
+    // #304: create_committee must require the named admin's auth.
+    let w = World::new();
+    let committee_admin = w.admin.clone();
+    let member_a = w.signer_a.clone();
+    let member_b = w.signer_b.clone();
+    let mut members = Vec::new(&w.env);
+    members.push_back(member_a.clone());
+    members.push_back(member_b.clone());
+    let threshold = 1u32;
+    let rotation_delay = 86_400u64; // MIN_ROTATION_DELAY = 1 day
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (
+        committee_admin.clone(),
+        members.clone(),
+        threshold,
+        rotation_delay,
+    )
+        .into_val(&w.env);
+    let id = w
+        .resolver
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &committee_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.resolver_id,
+                fn_name: "create_committee",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .create_committee(&committee_admin, &members, &threshold, &rotation_delay);
+    assert_eq!(id, 0, "first committee id is 0");
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &committee_admin,
+            &w.resolver_id,
+            "create_committee",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    // A wrong caller cannot create a committee in someone else's name.
+    w.env.set_auths(&[]);
+    let attacker = w.random.clone();
+    let result = w
+        .resolver
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.resolver_id,
+                fn_name: "create_committee",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_committee(&committee_admin, &members, &threshold, &rotation_delay);
+    assert!(
+        result.is_err(),
+        "attacker must not create a committee for a different admin"
+    );
+}
+
+#[test]
 fn resolver_contract_is_only_address_that_can_resolve() {
     let w = World::new();
     w.set_time(MARKET_CLOSE + 1);
@@ -1483,6 +1550,7 @@ const MATRIX: &[(&str, &[&str])] = &[
             "register_price_spec",
             "register_signer_spec",
             "snapshot_price",
+            "create_committee",
         ],
     ),
     (
@@ -1575,7 +1643,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "evidence_config",
             "set_evidence_config",
             "get_committee",
-            "create_committee",
             "propose_rotation",
             "execute_rotation",
             "cancel_rotation",

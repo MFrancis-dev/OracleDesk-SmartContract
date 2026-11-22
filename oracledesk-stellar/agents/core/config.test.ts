@@ -326,3 +326,43 @@ test("parseTunables validates the same fields without a deployment", () => {
   assert.throws(() => parseTunables({ KELLY_FRACTION: "0" }), AgentConfigError);
   assert.throws(() => parseTunables({ KELLY_FRACTION: "1.1" }), AgentConfigError);
 });
+
+// ─── Proposal watcher (#275) ─────────────────────────────────────────────────
+
+const WATCHER = keypair(7);
+
+test("the watcher is off by default and its limits have conservative defaults", () => {
+  const w = parseTunables({}).watcher;
+  assert.equal(w.enabled, false);
+  assert.deepEqual([w.minConfidenceBps, w.minLeadSecs, w.maxDisputesPerDay], [9_500, 60, 5]);
+  assert.equal(w.maxBondStroops <= w.budgetStroops, true, "one bond fits in the budget");
+});
+
+test("watcher settings parse and invalid ones are reported", () => {
+  const w = parseTunables({ WATCHER_ENABLED: "1", WATCHER_MIN_CONFIDENCE_BPS: "9800", WATCHER_MAX_BOND_STROOPS: "250000000", WATCHER_BUDGET_STROOPS: "750000000" }).watcher;
+  assert.deepEqual([w.enabled, w.minConfidenceBps, w.maxBondStroops, w.budgetStroops], [true, 9_800, 250_000_000n, 750_000_000n]);
+  assert.throws(() => parseTunables({ WATCHER_MIN_CONFIDENCE_BPS: "10001" }), AgentConfigError);
+  assert.throws(() => parseTunables({ WATCHER_MAX_BOND_STROOPS: "-1" }), AgentConfigError);
+  assert.throws(() => parseTunables({ WATCHER_ENABLED: "yes" }), AgentConfigError);
+});
+
+test("the watcher signs with WATCHER_SECRET_KEY and never falls back to the treasury agent's key", async () => {
+  const live = { AGENT_MODE: "live", WATCHER_ENABLED: "1" };
+  const cfg = await load({ ...live, WATCHER_SECRET_KEY: WATCHER.secret() }, { role: "watcher" }).run();
+  assert.equal(cfg.agentAddress, WATCHER.publicKey());
+  assert.equal(cfg.agentSecret, WATCHER.secret());
+
+  const issues = await issuesOf(load({ ...live, AGENT_SECRET_KEY: AGENT.secret() }, { role: "watcher" }).run());
+  assert.ok(issues.some((i) => /WATCHER_SECRET_KEY/.test(i)), issues.join(" | "));
+});
+
+test("the watcher key must be dedicated: a treasury agent's key is refused", async () => {
+  const issues = await issuesOf(load({ AGENT_MODE: "live", WATCHER_SECRET_KEY: AGENT.secret() }, { role: "watcher" }).run());
+  assert.ok(issues.some((i) => /dedicated/.test(i)), issues.join(" | "));
+});
+
+test("watcher settings are printable without any secret", async () => {
+  const cfg = await load({ WATCHER_ENABLED: "1" }, { role: "watcher" }).run();
+  const described = JSON.stringify(describeConfig(cfg), (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  assert.match(described, /"watcher":\{"enabled":true/);
+});

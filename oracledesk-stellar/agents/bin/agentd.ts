@@ -8,7 +8,8 @@
  *   npm run agentd -- rearm --operator alice
  *
  * --once     run each enabled task exactly once and exit (the old CLIs)
- * --tasks    comma-separated subset of: maker, trader, guard (default all)
+ * --tasks    comma-separated subset of: maker, trader, guard, watcher (default maker,trader,guard;
+ *            the watcher also needs WATCHER_ENABLED=1 and its own WATCHER_SECRET_KEY)
  * --config   JSON object of env-style overrides, e.g. {"TRADER_INTERVAL_MS": "30000"}
  * kill       write the persistent kill marker and signal the daemon's PID
  * rearm      remove the marker after operator approval
@@ -42,8 +43,9 @@ import { makerTask } from "../runtime/tasks/maker.js";
 import { traderTask } from "../runtime/tasks/trader.js";
 import { inventoryTask } from "../runtime/tasks/inventory.js";
 import type { StellarAdapter } from "../stellar/adapter.js";
+import { watcherTask } from "../runtime/tasks/watcher.js";
 import { loadAgentConfig } from "../core/config.js";
-import { buildAdapter, createLease, createStateStore, inventoryDeps, makerDeps, runtimeOptions, traderDeps, traderRiskCheck } from "../runtime/wiring.js";
+import { buildAdapter, createLease, createStateStore, inventoryDeps, makerDeps, runtimeOptions, traderDeps, traderRiskCheck, watcherDeps } from "../runtime/wiring.js";
 
 export interface AgentdArgs {
   once: boolean;
@@ -139,6 +141,13 @@ function defaultFactories(
         intervalMs: intEnv(env, "INVENTORY_INTERVAL_MS", 60_000),
         jitterMs: intEnv(env, "INVENTORY_JITTER_MS", 5_000),
       });
+    },
+    // The proposal watcher (#275): a dedicated key, off unless WATCHER_ENABLED.
+    watcher: async (env) => {
+      const cfg = await loadAgentConfig({ role: "watcher", env, argv: [] });
+      if (!cfg.watcher.enabled) throw new ConfigError("the watcher task needs WATCHER_ENABLED=1");
+      scope.treasury ??= cfg.deployments.contracts.treasury;
+      return watcherTask(watcherDeps(cfg, buildAdapter(cfg)), { intervalMs: cfg.watcher.intervalMs, jitterMs: 1_000 });
     },
     guard: async (env) => {
       const cfg = await loadAgentConfig({ role: "trader", env, argv: [] });

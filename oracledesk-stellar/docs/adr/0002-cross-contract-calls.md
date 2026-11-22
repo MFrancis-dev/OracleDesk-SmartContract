@@ -75,9 +75,14 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
 
 - **Trade-off accepted**: `market_core.wasm` is a checked-in binary build
   artifact in two places (`contracts/resolver/` and `contracts/treasury/`), and
-  `reasoning_registry.wasm` in `contracts/resolver/`. `contractimport!` reads
-  the file at the dependent crate's own compile time, so a stale copy would
-  otherwise silently keep the old interface.
+  `reasoning_registry.wasm` in `contracts/resolver/`, and (since #273)
+  `resolver.wasm` in `contracts/treasury/`, from which the treasury's resolver
+  client (`register_spec_v2`, `trade_status`) is generated. `contractimport!`
+  reads the file at the dependent crate's own compile time, so a stale copy
+  would otherwise silently keep the old interface. The treasury's copy was
+  previously unpinned; it now has a `resolver.wasm.sha256` like the others, and
+  `sync-vendored-wasm.sh resolver` (run by `make build` after the resolver is
+  built against the already-synced market-core and registry) refreshes it.
 - **A stale copy is now a compile error (#58).** Each dependent crate has a
   `build.rs` that hashes the vendored wasm and compares it to a committed
   `<name>.wasm.sha256`; a mismatch aborts the build with a contributor-facing

@@ -296,7 +296,17 @@ Independent resolution modes, all ultimately calling
   reusable committee registry rather than raw addresses. The admin can propose
   membership and threshold rotations with a mandatory delay (`rotation_delay >= 86_400`).
   Markets commit to `(committee_id, min_epoch, max_rotation_delta, dispute_window)`.
-  Votes are checked and recounted against the committee members active at the current epoch.
+  Votes are checked and recounted against the committee member set snapshotted at
+  the epoch in force at the market's `close_time` (#297). `epoch_at` walks back
+  from the current epoch through `EpochStart` timestamps to find the epoch whose
+  start is ≤ `close_time`, at most `max_rotation_delta + 1` reads. The pin is
+  written on the first attestation after close or through the permissionless
+  `pin_committee_epoch(market_id)` entrypoint. Rotations after `close_time` have
+  no effect on in-flight markets: members rotated out keep their counted votes,
+  members rotated in cannot attest, and the threshold from the pinned snapshot
+  is used. `max_rotation_delta` is capped at 16 to bound the walk-back footprint.
+  Legacy committees without `EpochStart` entries pin to epoch 1 (treated as
+  started at creation).
 - **Hybrid (price feed with attested fallback)** (#36): commits to a Reflector
   price rule and a fallback signer set. If the oracle feed fails or is unavailable
   after `close_time + fallback_delay`, anyone can call `open_fallback(market_id)` to
@@ -612,9 +622,10 @@ donation-based share inflation; deposits must be at least `MIN_DEPOSIT`
 collateral allows and queues the remainder as a FIFO ticket;
 `claim_withdraw(ticket)` (permissionless, pays the owner) settles the head
 ticket as capital returns, and agents can never spend `queue_reserved()`.
-While paused, `emergency_withdraw` pays shareholders their pro-rata part of
-free idle collateral without touching market-core. See
-[ADR 0005](adr/0005-treasury-vault.md).
+In `Mode::Emergency` (declared by the admin, only from an admin pause),
+`emergency_withdraw` pays shareholders their pro-rata part of free idle
+collateral without touching market-core; a drawdown halt or an ordinary pause
+never opens it. See [ADR 0005](adr/0005-treasury-vault.md), "Operating modes".
 
 **Migration to a successor treasury.** The treasury has no upgrade path, so
 redeploying it (a bug fix, or anything the timelocked setters above do not
@@ -674,8 +685,8 @@ any, claims the LP remainder if the treasury created the market, marks market ex
 closed (`open = false`), and records realized proceeds under `Realized(market_id)`.
 Calls to `market-core` use generated `try_` client methods so expected core errors
 (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`) map cleanly to 0 or distinct treasury
-errors without unhandled transaction aborts. Settlement operates even when the treasury
-is paused (stopping trading, not fund recovery).
+errors without unhandled transaction aborts. Settlement operates in every operating mode
+(stopping trading, not fund recovery).
 
 **Realized PnL & auto-pause on drawdown (#46).** Cumulative losses across markets
 are bounded by an automated drawdown guard. The treasury tracks collateral cost
@@ -683,9 +694,11 @@ are bounded by an automated drawdown guard. The treasury tracks collateral cost
 (`MarketPnl`). PnL is realized once a market is final and all positions/LP claims are settled
 (or via permissionless `realize(market_id)` for pre-close exits). A rolling window of daily
 buckets advances lazily, summing net realized PnL across `window_days`. If `window_pnl < -max_drawdown`,
-the contract trips into drawdown pause (`DrawdownTripped` instance flag, emitting `DrawdownPause`).
-In this mode, buys and creations are blocked, but `agent_sell` remains open (reduce-only) to avoid
-trapping positions. Resuming requires admin `acknowledge_drawdown()` before unpausing. Third parties
+the contract records a drawdown halt in `ModeState` (emitting `DrawdownPause` and `ModeChanged`).
+In `Mode::AgentsHalted`, buys and creations are blocked, but `agent_sell` and `close_trade` remain
+open (reduce-only) to avoid trapping positions, and depositors keep their normal exit; the halt does
+**not** open `emergency_withdraw`. Resuming is `resume_agents()` (admin), allowed only once the window PnL
+has recovered or after `reset_pnl_window`, and it leaves any admin pause standing. Third parties
 triggering settlements cannot manipulate loss magnitude, only realization timing. Protocol fees and
 external donations are strictly excluded from PnL accounting.
 
@@ -733,7 +746,7 @@ behaviour is covered by each contract's own tests.
 | I2 per market | Cumulative agent spend into one market, seed included, is at most `max_market`, for the market's whole life: it is never freed by sells or `close_trade`. `MarketExposure.amount` equals the observed sum of spends. |
 | I3 daily | The treasury's reported window (`daily_usage`) never exceeds `max_daily` and equals the spends observed since its reported start. |
 | I4 sliding 24h | In **any** interval `[t, t + 86_400)` the agent spends at most `max_daily`. The window is hourly buckets summed over the trade's hour and the 24 hours before it: effectively 24-25h, conservative and never permissive. |
-| I5 pause | While the admin has paused, `agent_buy`, `agent_create_market` and `agent_sell` all fail with `Paused`. `close_trade`, `redeem` and `claim_pool_remainder` stay callable: they spend nothing and return capital. (An automatic drawdown pause differs: reduce-only sells stay allowed; not part of this search.) |
+| I5 pause | While the admin has paused, `agent_buy`, `agent_create_market`, `agent_sell` and `close_trade` all fail with `Paused`. `redeem` and `claim_pool_remainder` stay callable: they spend nothing and return capital. (A drawdown halt differs: reduce-only sells and `close_trade` stay allowed; not part of this search.) |
 | I6 accounting | Treasury token balance = initial - Σ spends + Σ returns (sells, redeems, claims), from the operations' own parameters. |
 | I7 sell neutrality | `agent_sell` changes neither the daily window nor any `MarketExposure`. |
 | I8 | Net exposure stays within `max_net_exposure`. |
@@ -1212,6 +1225,21 @@ logged and the plan closes as `unwind-failed`). The relation file is
 trusted: a wrong relation produces confident, wrong trades, which is why
 compatibility must be declared and is checked against the chain.
 
+### Dispute economics and the proposal watcher (agents, #275)
+
+On a `SignersDisputable` market a dispute escrows `dispute_bond` of the
+collateral token. The contract pays **no reward**: a bond is *refunded* to the
+disputer if the ruling overturns the proposal (or the escalation timeout
+lapses, which voids the market), and *forfeited* to market-core's treasury if
+the proposal is upheld. A challenger therefore cannot profit from disputing; it
+can only protect a position it already holds. That is why the `watcher` task
+(`runtime/tasks/watcher.ts`, see [agent-runtime.md](agent-runtime.md#proposal-watcher))
+runs on a dedicated key with a capped bond budget and disputes only when the
+exposure it protects, weighted by its confidence, outweighs the bond it
+risks; with no treasury position on the right side, it never disputes. It does
+not attest, does not act as an escalation committee member, and is a
+safety net for the treasury's own capital, not a general-purpose oracle.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
@@ -1256,13 +1284,44 @@ asset and requirement settings before verification. Concurrent duplicates get
 409 with `Retry-After: 2`; cross-resource or changed-price reuse gets 409.
 
 States are `verifying → settling → settled → delivered`, with `failed` for
-known failures and `indeterminate` for timeouts or interrupted settlement.
-The durable transition runs outside SDK hooks because 2.26.0 logs thrown hook
-errors and can continue. No ledger write means no settlement attempt. Startup
-marks interrupted verifying/settling rows indeterminate; it never retries them.
-Operators must inspect/reconcile these against the chain before taking action.
+known pre-submission failures, `failed_unconfirmed` for facilitator failures
+after submission (reconcilable), `failed_final` for confirmed on-chain
+non-settlement, `needs_operator` for retention gaps, and `indeterminate` for
+timeouts or interrupted settlement. The durable transition runs outside SDK
+hooks because 2.26.0 logs thrown hook errors and can continue. No ledger write
+means no settlement attempt. Startup no longer clobbers in-flight payments
+(`reconcileStuck(0)` removed); instead, an age-based reconciliation interval
+(`X402_RECONCILE_MS`, default 30s) selects only entries older than the
+settlement bound (`maxTimeoutSeconds + facilitatorTimeoutMs`), so live
+requests owned by another replica are never touched.
 A settlement timeout returns 502 without content. Other SDK failures retain
 standard HTTP instructions and payment challenge headers.
+
+### On-chain reconciliation (#300)
+
+At claim time the ledger persists the auth nonces, payer address, expiration
+ledger, and inner transaction hash for each Soroban address credential. The
+facilitator's transaction hash is persisted on both success and failure paths.
+A reconciler (`x402/settlement-reconciler.ts`) runs on a timer and, for each
+`indeterminate` and `failed_unconfirmed` entry, decides its fate from chain
+state:
+
+1. If any auth nonce is consumed (Soroban temporary ledger entry exists) →
+   `settled` (reason: `chain:nonce`).
+2. If the facilitator's transaction hash resolves to `SUCCESS` → `settled`
+   (reason: `chain:tx`).
+3. If all nonces are not consumed and `latestLedger > maxLedger + 10` →
+   `failed_final` (reason: `chain:expired_unconsumed`). The buyer can pay again.
+4. If a nonce is `unknown` (temp entry evicted after expiry), fall back to
+   `getTransaction` for the facilitator tx, then to SEP-41 transfer events
+   matching `amount` and `payTo` in `[claimLedger, maxLedger]`. If none found
+   and RPC retention covers the window → `failed_final`; otherwise
+   `needs_operator`, surfaced through `GET /admin/payments/:paymentId`.
+
+All transitions are CAS-guarded (`ledger.transition(id, [from], to, patch)`),
+so concurrent reconcilers racing produce one winner. `settled` entries
+reached through reconciliation are replayable — the stored response body and
+trace bytes are delivered on the next request.
 
 Settled/delivered retries return the original stored body and PAYMENT-RESPONSE
 without another facilitator call or gateway fetch. The original raw bytes are

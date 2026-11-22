@@ -20,6 +20,7 @@ import {
 } from "../../core/due-diligence.js";
 import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { Task, TaskContext } from "../runtime.js";
+import { openingsAllowed } from "./mode.js";
 import { publishPendingTraces, recordPendingTrace } from "./traces.js";
 
 export interface TraderRiskInput {
@@ -51,7 +52,7 @@ export interface TraderCandidate {
 
 export interface TraderDeps {
   adapter: Pick<StellarAdapter, "mode" | "agent" | "quoteBuy" | "agentBuyV2" | "publishTrace" | "publishDecisionTrace" | "agentBuyTraced">
-    & Partial<Pick<StellarAdapter, "riskCaps" | "marketExposure" | "treasuryPosition">>;
+    & Partial<Pick<StellarAdapter, "riskCaps" | "marketExposure" | "treasuryPosition" | "treasuryMode">>;
   traceStore: TraceStore;
   candidates: () => Promise<TraderCandidate[]>;
   /** This deployment's treasury contract id (creator of our own markets). */
@@ -91,6 +92,8 @@ export async function fixtureCandidates(nowSecs: number): Promise<TraderCandidat
 export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<void> {
   const live = deps.adapter.mode === "live";
   if (live) await publishPendingTraces(deps.adapter, ctx);
+  // The trader only opens exposure: skip the whole tick unless the treasury is Normal.
+  if (!(await openingsAllowed(deps.adapter, ctx, "TRADER"))) return;
   const candidates = await deps.candidates();
   if (candidates.length === 0) ctx.log.info("TRADER_NO_MARKETS");
   for (const c of candidates) {

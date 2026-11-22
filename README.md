@@ -60,7 +60,7 @@ The active implementation is [`oracledesk-stellar/`](oracledesk-stellar/):
 
 ```
 oracledesk-stellar/
-├── contracts/            market-core, resolver, treasury, reasoning-registry
+├── contracts/            market-core, resolver, treasury, reasoning-registry, test-oracle
 ├── model/fpmm_model.py   Python mirror of the FPMM math, property-tested
 ├── x402/                 the paid trace API (Express + @x402/*)
 ├── agents/               core/ (strategy + trace building), stellar/ (adapter), bin/ (CLIs)
@@ -159,13 +159,25 @@ Current live deployment — see
 for the source of truth (`scripts/deploy-testnet.sh` is idempotent and may
 redeploy fresh addresses at any time).
 
+<!-- BEGIN:DEPLOYED_ADDRESSES -->
 | Contract | Address | Explorer |
 |---|---|---|
 | market-core | `CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O` | [View](https://stellar.expert/explorer/testnet/contract/CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O) |
 | resolver | `CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR` | [View](https://stellar.expert/explorer/testnet/contract/CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR) |
 | treasury | `CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB` | [View](https://stellar.expert/explorer/testnet/contract/CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB) |
 | reasoning-registry | `CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M` | [View](https://stellar.expert/explorer/testnet/contract/CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M) |
+| USDC (`self-issued` default; configurable via `COLLATERAL_MODE=existing`) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
+
+The deployment above uses `COLLATERAL_MODE=self-issued` (a self-issued 7-decimal
+SEP-41 Stellar Asset Contract). To deploy against Circle's official Stellar
+testnet USDC (or another 7-decimal classic asset SAC), pass
+`COLLATERAL_MODE=existing` and `COLLATERAL_ASSET=USDC:<issuer>` to
+`scripts/deploy-testnet.sh` — see
+[`oracledesk-stellar/docs/collateral.md`](oracledesk-stellar/docs/collateral.md)
+for the verified Circle issuer citation, issuer-flag checks, trustlines and
+faucet funding steps.
 | USDC (self-issued test asset) | `CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH` | [View](https://stellar.expert/explorer/testnet/contract/CA2WQQJ4OHQCLHQW6XN4BCLILGRV6V4YDYDT3GVIWXB53BTOO7EMREQH) |
+<!-- END:DEPLOYED_ADDRESSES -->
 
 The USDC above is a **self-issued testnet asset** (a real SEP-41 Stellar
 Asset Contract, 7 decimals) — not Circle's testnet USDC. No real USDC
@@ -178,11 +190,19 @@ issuer address is hardcoded anywhere in this repo; see
 
 ### Prerequisites
 
-- Rust (stable) with the `wasm32v1-none` target
-- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), v27+
-- Node.js 22+ and npm
-- Python 3.10+
-- `jq`
+The recommended way to develop with byte-identical contract builds is via the
+pinned **Dev Container** (`.devcontainer/`) or **Nix Flake** (`flake.nix`), both
+driven by [`oracledesk-stellar/toolchain.env`](oracledesk-stellar/toolchain.env).
+See [`oracledesk-stellar/docs/dev-environment.md`](oracledesk-stellar/docs/dev-environment.md)
+for full devcontainer, Codespaces, Nix, and manual setup instructions.
+
+For manual local setups, verify exact versions with `make doctor`:
+
+- Rust `1.93.1` with the `wasm32v1-none` target (`rustfmt`, `clippy`)
+- The [Stellar CLI](https://developers.stellar.org/docs/tools/cli) (`stellar`), `27.1.0`
+- Node.js `24.13.1` and npm
+- Python 3.10+ (pinned `3.12`)
+- `jq` `1.7.1`
 
 ### Install and build
 

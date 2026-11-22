@@ -79,7 +79,7 @@
     "acknowledge_drawdown": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Deprecated no-op, kept so existing callers and bindings keep working: acknowledging is no longer a separate step. Use `resume_agents`.",
         "inputs": [],
         "name": "acknowledge_drawdown",
         "outputs": [
@@ -149,6 +149,67 @@
           }
         ],
         "name": "agent_buy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_buy_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Buys with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_buy_traced",
         "outputs": [
           {
             "result": {
@@ -470,6 +531,75 @@
         ]
       }
     },
+    "agent_create_market_reveal_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "agent_create_market_reveal_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "agent_daily_usage": {
       "kind": "function_v0",
       "spec": {
@@ -491,6 +621,33 @@
                   "name": "DailyUsage"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "agent_halt": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_halt",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -532,6 +689,67 @@
           }
         ],
         "name": "agent_sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_sell_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sells with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_sell_traced",
         "outputs": [
           {
             "result": {
@@ -615,6 +833,57 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "allowed": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Whether `op` is permitted in the current mode: the gate's answer, for agents and frontends to pre-check.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "op",
+            "type_": {
+              "udt": {
+                "name": "Op"
+              }
+            }
+          }
+        ],
+        "name": "allowed",
+        "outputs": [
+          "bool"
+        ]
+      }
+    },
+    "audit_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "audit_mark",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "MarkRecord"
+                }
+              }
             }
           }
         ]
@@ -734,6 +1003,22 @@
         ]
       }
     },
+    "cancel_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "cancel_op": {
       "kind": "function_v0",
       "spec": {
@@ -762,6 +1047,38 @@
         "doc": "",
         "inputs": [],
         "name": "cancel_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_resolvability_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_trace_policy",
         "outputs": [
           {
             "result": {
@@ -1079,6 +1396,28 @@
         ]
       }
     },
+    "declare_emergency": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Declares an emergency: opens `emergency_withdraw` (the idle-only, position-forfeiting exit) and closes new withdrawal requests. Only from `AdminPaused`, so one admin call cannot flip straight into the forfeiting exit; with the timelock as admin the extra step is delayed too.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "declare_emergency",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "deposit": {
       "kind": "function_v0",
       "spec": {
@@ -1177,7 +1516,7 @@
     "emergency_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "`Mode::Emergency` only (`declare_emergency`, itself only from an admin pause): burns `shares` for their pro-rata part of the free idle collateral, without reading market-core (for when it is the thing that broke). The owner forfeits their part of open positions, which stays with the remaining shareholders. A drawdown halt or an ordinary admin pause never opens it: the normal queued exit pays at NAV (ADR 0005).",
         "inputs": [
           {
             "doc": "",
@@ -1196,6 +1535,22 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "end_emergency": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Ends the emergency. The admin pause stands (`AdminPaused`); `unpause` then resumes. In production route it through `timelock.schedule`.",
+        "inputs": [],
+        "name": "end_emergency",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -1255,6 +1610,22 @@
         ]
       }
     },
+    "execute_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "execute_op": {
       "kind": "function_v0",
       "spec": {
@@ -1283,6 +1654,38 @@
         "doc": "",
         "inputs": [],
         "name": "execute_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Applies the pending resolvability policy once its delay has passed. Permissionless.",
+        "inputs": [],
+        "name": "execute_resolvability_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_trace_policy",
         "outputs": [
           {
             "result": {
@@ -1426,6 +1829,21 @@
         ]
       }
     },
+    "get_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "get_resolvability_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ResolvabilityPolicy"
+            }
+          }
+        ]
+      }
+    },
     "legacy_claim_pool_remainder": {
       "kind": "function_v0",
       "spec": {
@@ -1553,6 +1971,17 @@
         ]
       }
     },
+    "max_mark_age_ledgers": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "max_mark_age_ledgers",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
     "migrate_markets": {
       "kind": "function_v0",
       "spec": {
@@ -1579,16 +2008,58 @@
         ]
       }
     },
-    "mode": {
+    "migrate_marks": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "migrate_marks",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
+    "mode": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The effective operating mode.",
         "inputs": [],
         "name": "mode",
         "outputs": [
           {
             "udt": {
               "name": "Mode"
+            }
+          }
+        ]
+      }
+    },
+    "mode_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Each stored reason (drawdown halt, admin pause, emergency) with when it began and, for the admin's, why.",
+        "inputs": [],
+        "name": "mode_state",
+        "outputs": [
+          {
+            "udt": {
+              "name": "ModeState"
             }
           }
         ]
@@ -1605,6 +2076,21 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "nav_detail": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "nav_detail",
+        "outputs": [
+          {
+            "udt": {
+              "name": "NavDetail"
             }
           }
         ]
@@ -1683,6 +2169,28 @@
         ]
       }
     },
+    "pause": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin pause: no deposits and no agent trading (settlement, queued withdrawals and recalls stay open). Idempotent.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "symbol"
+          }
+        ],
+        "name": "pause",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "pending_agent": {
       "kind": "function_v0",
       "spec": {
@@ -1746,6 +2254,25 @@
         ]
       }
     },
+    "pending_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_max_mark_age",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingMarkAge"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "pending_op": {
       "kind": "function_v0",
       "spec": {
@@ -1783,6 +2310,25 @@
               "value_type": {
                 "udt": {
                   "name": "PendingPricePolicy"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "pending_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_resolvability_policy",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingResolvability"
                 }
               }
             }
@@ -1863,6 +2409,46 @@
             "result": {
               "error_type": "error",
               "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "propose_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "propose_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -1965,7 +2551,7 @@
     "redeem": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Redeems the treasury's position in a resolved/voided market (`ROLE_SETTLE`).",
         "inputs": [
           {
             "doc": "",
@@ -2019,6 +2605,32 @@
                   "name": "BatchResult"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "refresh_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "refresh_mark",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -2096,6 +2708,22 @@
         ]
       }
     },
+    "resume_agents": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Clears a drawdown halt. Allowed only once the realized window PnL is back above `-max_drawdown` (waiting for old losses to leave the window, or an explicit `reset_pnl_window`), so an admin cannot simply wave a real loss through. Leaves any admin pause or emergency untouched. Replaces `acknowledge_drawdown` + `set_paused(false)`.",
+        "inputs": [],
+        "name": "resume_agents",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_agent": {
       "kind": "function_v0",
       "spec": {
@@ -2130,7 +2758,7 @@
     "set_config_delay": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "Lengthens the timelock. Shortening is refused outright: it would itself have to wait out the old delay to be safe, and a lengthening can always be undone by redeploying.",
         "inputs": [
           {
             "doc": "",
@@ -2251,10 +2879,32 @@
         ]
       }
     },
-    "set_mode": {
+    "set_max_mark_age": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_mode": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin mode transition kept from #150: `Normal` clears an admin pause and an unwind (a drawdown halt stands: `resume_agents`), `Paused` is `pause`, `Unwinding` replaces an admin pause with an orderly wind-down. `Emergency` and `AgentsHalted` have their own entrypoints (`declare_emergency`, the drawdown trip) and are refused here.",
         "inputs": [
           {
             "doc": "",
@@ -2280,7 +2930,7 @@
     "set_paused": {
       "kind": "function_v0",
       "spec": {
-        "doc": "",
+        "doc": "`set_paused(true)` is `pause(admin)`, `set_paused(false)` is `unpause()`. Kept for the timelock's emergency path (ADR 0008), which calls `set_paused(true)`.",
         "inputs": [
           {
             "doc": "",
@@ -2315,6 +2965,32 @@
           }
         ],
         "name": "set_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_resolvability_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Admin only. Tightening (a flag to `true`, a larger `min_secs_to_close`, fewer `allowed_specs` bits) applies at once; anything that loosens a knob waits `config_delay` (`execute_resolvability_policy`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          }
+        ],
+        "name": "set_resolvability_policy",
         "outputs": [
           {
             "result": {
@@ -2513,6 +3189,37 @@
         "name": "total_shares",
         "outputs": [
           "i128"
+        ]
+      }
+    },
+    "trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "trace_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "TracePolicyConfig"
+            }
+          }
+        ]
+      }
+    },
+    "unpause": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Clears the admin pause only. A drawdown halt, if any, stands, so the agents stay halted; clear it with `resume_agents`. Refused while an emergency is declared (`end_emergency` first).",
+        "inputs": [],
+        "name": "unpause",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
         ]
       }
     },
@@ -3166,6 +3873,66 @@
         "name": "HybridConfig"
       }
     },
+    "MarkRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "contribution",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "lp",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "lp_floor",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "pos_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "pos_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "refreshed_ledger",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "status_final",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "MarkRecord"
+      }
+    },
     "MarketPnl": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -3197,26 +3964,127 @@
         "cases": [
           {
             "void_v0": {
-              "doc": "",
+              "doc": "A drawdown tripped: agents may not open or add exposure, but may reduce it. Depositors keep their normal exit (queued withdrawals at NAV).",
+              "name": "AgentsHalted"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "The admin declared an emergency (only from `Paused`): the in-kind/idle `emergency_withdraw` exit opens, and queueing new withdrawals closes.",
+              "name": "Emergency"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "Everything runs.",
               "name": "Normal"
             }
           },
           {
             "void_v0": {
-              "doc": "",
+              "doc": "The admin paused the treasury: no deposits and no agent trading.",
               "name": "Paused"
             }
           },
           {
             "void_v0": {
-              "doc": "",
+              "doc": "The admin chose an orderly wind-down (`set_mode(Unwinding)`, #150): agents may not open or add exposure, but may sell (see `unwind_sell` and the per-market exit floors), and everything else runs as in `Normal`.",
               "name": "Unwinding"
             }
           }
         ],
-        "doc": "",
+        "doc": "What the treasury is doing right now, derived from [`ModeState`] with the priority `Emergency > Paused > AgentsHalted > Unwinding > Normal`.",
         "lib": "",
         "name": "Mode"
+      }
+    },
+    "ModeState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Why the treasury is not in `Normal`. Each reason is stored independently, so clearing one never clears another.",
+        "fields": [
+          {
+            "doc": "Ledger time of the admin pause. Cleared by `unpause` / `set_paused(false)`.",
+            "name": "admin_pause_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "The reason the admin gave (`admin` for `set_paused(true)`; `legacy` for a pause read from the pre-#272 flags). Set with `admin_pause_at`.",
+            "name": "admin_pause_reason",
+            "type_": {
+              "option": {
+                "value_type": "symbol"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time a drawdown halted the agents. Cleared by `resume_agents`.",
+            "name": "drawdown_halt",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time the admin declared an emergency. Cleared by `end_emergency`.",
+            "name": "emergency_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          },
+          {
+            "doc": "The reason the admin gave. Set with `emergency_at`.",
+            "name": "emergency_reason",
+            "type_": {
+              "option": {
+                "value_type": "symbol"
+              }
+            }
+          },
+          {
+            "doc": "Ledger time the admin set `Unwinding`. Cleared by `set_mode(Normal)`.",
+            "name": "unwinding_at",
+            "type_": {
+              "option": {
+                "value_type": "u64"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "ModeState"
+      }
+    },
+    "NavDetail": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "holdings",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "oldest_refresh",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "stale_lp_markets",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "NavDetail"
       }
     },
     "NetPosition": {
@@ -3237,6 +4105,82 @@
         ],
         "lib": "",
         "name": "NetPosition"
+      }
+    },
+    "Op": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "`agent_create_market`, `agent_create_market_and_reveal`, `agent_buy`, `agent_buy_v2`: anything that opens or adds exposure.",
+              "name": "AgentOpen"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`agent_sell`, `agent_sell_v2`, `close_trade`: anything that reduces it.",
+              "name": "AgentReduce"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`redeem`, `claim_pool_remainder`, the batch variants and `agent_claim_lp_fees`: bringing collateral home after resolution.",
+              "name": "AgentSettle"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`claim_withdraw` (pays a ticket that already exists).",
+              "name": "ClaimWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`deposit`.",
+              "name": "Deposit"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`emergency_withdraw`.",
+              "name": "EmergencyWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`migrate_market`.",
+              "name": "Migrate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`settle_market`, `realize`, `collect_market_fees`: permissionless settlement.",
+              "name": "PermissionlessSettle"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`request_withdraw`.",
+              "name": "RequestWithdraw"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`allocate_to_yield`.",
+              "name": "YieldAllocate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "`recall_from_yield`.",
+              "name": "YieldRecall"
+            }
+          }
+        ],
+        "doc": "A class of state-changing entrypoint. Every one the treasury exposes maps to exactly one `Op` (or is pure admin configuration, which is never gated; see the `matrix` test in `lib.rs`).",
+        "lib": "",
+        "name": "Op"
       }
     },
     "OpenMarket": {
@@ -3430,6 +4374,26 @@
         "name": "PendingCorrelation"
       }
     },
+    "PendingMarkAge": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "PendingMarkAge"
+      }
+    },
     "PendingPricePolicy": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -3457,6 +4421,35 @@
         ],
         "lib": "",
         "name": "PendingPricePolicy"
+      }
+    },
+    "PendingResolvability": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "proposed_at",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "PendingResolvability"
       }
     },
     "PriceConfig": {
@@ -3726,6 +4719,41 @@
         "name": "ResolutionSpecV2"
       }
     },
+    "ResolvabilityPolicy": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Pre-trade resolvability policy for `agent_buy` / `agent_buy_v2` (#273): the treasury will not put depositor capital into a market that cannot be resolved, whatever the agent believes. Sells, redemptions and settlement are never gated by it (the treasury must always be able to exit or settle). Tightening is immediate (a flag set to `true`, a larger `min_secs_to_close`, fewer `allowed_specs` bits); everything else waits `config_delay`, like the other policies. The default is fully permissive, so an upgraded deployment behaves as before until the admin tightens it.",
+        "fields": [
+          {
+            "doc": "Bitmask over `resolver::SpecKind`: kinds that may be bought into.",
+            "name": "allowed_specs",
+            "type_": "u32"
+          },
+          {
+            "doc": "No buys while the resolver reports `Disputed` (finalization frozen).",
+            "name": "block_when_disputed",
+            "type_": "bool"
+          },
+          {
+            "doc": "No buys while a signer proposal is pending. Off by default: opening a proposal needs a signer, but a quorum can still use it to freeze buys.",
+            "name": "block_with_open_proposal",
+            "type_": "bool"
+          },
+          {
+            "doc": "Minimum seconds between now and `close_time` for a buy (0 = none). Does not apply to seed-and-reveal creation, which happens far from close.",
+            "name": "min_secs_to_close",
+            "type_": "u64"
+          },
+          {
+            "doc": "The market's resolution spec must have been revealed to its resolver.",
+            "name": "require_revealed",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "ResolvabilityPolicy"
+      }
+    },
     "RiskConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -3891,6 +4919,58 @@
         "name": "TokenCaps"
       }
     },
+    "TracePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Off"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TracePolicy"
+      }
+    },
+    "TracePolicyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TracePolicyConfig"
+      }
+    },
     "UsageWindow": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -4010,7 +5090,7 @@
     "WithdrawTicket": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "",
+        "doc": "Collateral still owed to `owner` for shares already burned.",
         "fields": [
           {
             "doc": "",
@@ -4046,7 +5126,7 @@
           {
             "doc": "",
             "name": "BelowExitFloor",
-            "value": 67
+            "value": 80
           },
           {
             "doc": "",
@@ -4081,7 +5161,7 @@
           {
             "doc": "",
             "name": "CollateralNotAllowed",
-            "value": 69
+            "value": 82
           },
           {
             "doc": "",
@@ -4102,6 +5182,11 @@
             "doc": "",
             "name": "DrawdownTripped",
             "value": 46
+          },
+          {
+            "doc": "The treasury is in `Mode::Emergency`: only settlement, claiming existing withdrawal tickets and `emergency_withdraw` are open (#272).",
+            "name": "EmergencyMode",
+            "value": 83
           },
           {
             "doc": "",
@@ -4131,7 +5216,7 @@
           {
             "doc": "",
             "name": "InvalidExitFloor",
-            "value": 68
+            "value": 81
           },
           {
             "doc": "",
@@ -4147,6 +5232,11 @@
             "doc": "",
             "name": "LegacyCoreUnknown",
             "value": 17
+          },
+          {
+            "doc": "",
+            "name": "MarkBatchTooLarge",
+            "value": 76
           },
           {
             "doc": "",
@@ -4219,6 +5309,11 @@
             "value": 39
           },
           {
+            "doc": "The market is `Disputed`: finalization is frozen (#273).",
+            "name": "MarketDisputed",
+            "value": 88
+          },
+          {
             "doc": "",
             "name": "MarketNotFinal",
             "value": 44
@@ -4246,7 +5341,7 @@
           {
             "doc": "",
             "name": "NoPendingOp",
-            "value": 66
+            "value": 79
           },
           {
             "doc": "",
@@ -4269,6 +5364,11 @@
             "value": 28
           },
           {
+            "doc": "`resume_agents`: the realized window PnL has not recovered above `-max_drawdown` (reset the window or wait for old losses to expire) (#272).",
+            "name": "NotRecovered",
+            "value": 84
+          },
+          {
             "doc": "",
             "name": "NothingToPay",
             "value": 23
@@ -4276,12 +5376,17 @@
           {
             "doc": "",
             "name": "OpExpired",
-            "value": 65
+            "value": 78
           },
           {
             "doc": "",
             "name": "OpNotReady",
-            "value": 64
+            "value": 77
+          },
+          {
+            "doc": "Past `close_time + RESOLUTION_GRACE_SECS`: the market can already be voided (#273).",
+            "name": "PastResolutionDeadline",
+            "value": 90
           },
           {
             "doc": "",
@@ -4309,9 +5414,19 @@
             "value": 24
           },
           {
+            "doc": "A signer proposal is pending and the policy blocks buys then (#273).",
+            "name": "ProposalOpen",
+            "value": 89
+          },
+          {
             "doc": "",
             "name": "ProposalPending",
             "value": 14
+          },
+          {
+            "doc": "A call to the resolver failed (#273).",
+            "name": "ResolverCallFailed",
+            "value": 92
           },
           {
             "doc": "",
@@ -4324,6 +5439,21 @@
             "value": 27
           },
           {
+            "doc": "The market's spec kind is not in `allowed_specs` (#273).",
+            "name": "SpecKindNotAllowed",
+            "value": 87
+          },
+          {
+            "doc": "The market's resolution spec was never revealed to its resolver, or a resolver accepted `register_spec_v2` and stored nothing (#273).",
+            "name": "SpecNotRevealed",
+            "value": 86
+          },
+          {
+            "doc": "",
+            "name": "StaleMarks",
+            "value": 75
+          },
+          {
             "doc": "",
             "name": "TicketNotFound",
             "value": 22
@@ -4334,9 +5464,69 @@
             "value": 15
           },
           {
+            "doc": "Closer to `close_time` than `min_secs_to_close` (#273).",
+            "name": "TooCloseToClose",
+            "value": 91
+          },
+          {
             "doc": "",
             "name": "TooManyOpenMarkets",
             "value": 18
+          },
+          {
+            "doc": "",
+            "name": "TraceAgentMismatch",
+            "value": 67
+          },
+          {
+            "doc": "",
+            "name": "TraceConsumed",
+            "value": 70
+          },
+          {
+            "doc": "",
+            "name": "TraceDecisionMismatch",
+            "value": 65
+          },
+          {
+            "doc": "",
+            "name": "TraceFlagged",
+            "value": 68
+          },
+          {
+            "doc": "",
+            "name": "TraceMismatch",
+            "value": 66
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyNotPending",
+            "value": 73
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyPending",
+            "value": 72
+          },
+          {
+            "doc": "",
+            "name": "TraceRegistryCallFailed",
+            "value": 71
+          },
+          {
+            "doc": "",
+            "name": "TraceRequired",
+            "value": 64
+          },
+          {
+            "doc": "",
+            "name": "TraceStale",
+            "value": 69
+          },
+          {
+            "doc": "",
+            "name": "TraceTimelockActive",
+            "value": 74
           },
           {
             "doc": "",
@@ -4459,6 +5649,38 @@
         ],
         "prefix_topics": [
           "admin_op_proposed"
+        ]
+      }
+    },
+    "AgentHalted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentHalted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "roles_after",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "agent_halted"
         ]
       }
     },
@@ -5155,14 +6377,14 @@
       "kind": "event_v0",
       "spec": {
         "data_format": "map",
-        "doc": "",
+        "doc": "Every change to the operating mode's reasons (#272). `from`/`to` are the effective modes; they are equal when a reason was added or cleared under a higher-priority one (e.g. a drawdown trips while the admin pause stands).",
         "lib": "",
         "name": "ModeChanged",
         "params": [
           {
             "doc": "",
             "location": "data",
-            "name": "old",
+            "name": "from",
             "type_": {
               "udt": {
                 "name": "Mode"
@@ -5172,12 +6394,24 @@
           {
             "doc": "",
             "location": "data",
-            "name": "new",
+            "name": "to",
             "type_": {
               "udt": {
                 "name": "Mode"
               }
             }
+          },
+          {
+            "doc": "`drawdown`, `resume`, `admin`, `unpause`, `legacy`, `emergency`, `end_emerg`, or the admin's own reason for `pause` / `declare_emergency`.",
+            "location": "data",
+            "name": "reason",
+            "type_": "symbol"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "at",
+            "type_": "u64"
           }
         ],
         "prefix_topics": [
@@ -5402,6 +6636,110 @@
         ],
         "prefix_topics": [
           "price_policy_set"
+        ]
+      }
+    },
+    "ResolvabilityPolicyCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicyCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_cancelled"
+        ]
+      }
+    },
+    "ResolvabilityPolicyProposed": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicyProposed",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "executable_at",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_proposed"
+        ]
+      }
+    },
+    "ResolvabilityPolicySet": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "ResolvabilityPolicySet",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "old",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "new",
+            "type_": {
+              "udt": {
+                "name": "ResolvabilityPolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "immediate",
+            "type_": "bool"
+          }
+        ],
+        "prefix_topics": [
+          "resolvability_policy_set"
         ]
       }
     },

@@ -35,7 +35,7 @@ fi
 WASM_DIR=target/wasm32v1-none/release
 OUT_DIR=packages/bindings
 
-for f in market_core resolver reasoning_registry treasury timelock router; do
+for f in market_core resolver reasoning_registry treasury timelock router test_oracle; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     echo "==> $WASM_DIR/$f.wasm missing — building all contracts first" >&2
     stellar contract build
@@ -52,6 +52,7 @@ CONTRACTS=(
   "treasury:treasury"
   "timelock:timelock"
   "router:router"
+  "test_oracle:test-oracle"
 )
 
 mkdir -p "$OUT_DIR"
@@ -63,7 +64,7 @@ for entry in "${CONTRACTS[@]}"; do
   # package-lock.json — which would make CI's "bindings are stale" diff fail on
   # every run. Stash the lockfile around the call so regeneration touches only
   # the generated files.
-  old_version=$(jq -r .version "$OUT_DIR/$pkg_name/package.json" 2>/dev/null || echo 0.0.0)
+  old_version=$(jq -r .version "$OUT_DIR/$pkg_name/package.json" 2>/dev/null || echo 0.1.0)
   changelog=""
   if [ -f "$OUT_DIR/$pkg_name/CHANGELOG.md" ]; then
     changelog=$(mktemp)
@@ -94,7 +95,7 @@ for entry in "${CONTRACTS[@]}"; do
     "$OUT_DIR/$pkg_name/package.json" >"$tmp"
   mv "$tmp" "$OUT_DIR/$pkg_name/package.json"
   CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
-    extract --wasm "$WASM_DIR/$wasm_name.wasm" --contract "$pkg_name" > "$OUT_DIR/$pkg_name/interface.json"
+    extract --wasm "$WASM_DIR/$wasm_name.wasm" --contract "$pkg_name" >"$OUT_DIR/$pkg_name/interface.json"
 done
 
 echo "==> done. See $OUT_DIR/*/README.md for per-package usage." >&2

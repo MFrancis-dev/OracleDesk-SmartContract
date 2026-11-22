@@ -119,7 +119,7 @@ market-creation risk controls (#47), and Blend lending integration with JIT liqu
 are implemented on `feat/issues-45-46-47-48`.
 Key additions:
 - **Permissionless settlement (#45)**: `settle_market(caller, market_id)` allows anyone to settle resolved markets, recovering positions and LP remainders without hot agent keys. Graceful error handling for `market_core` errors (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`). Emits `MarketSettled`.
-- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
+- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and an automatic drawdown halt when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Since #272 a halt (`Mode::AgentsHalted`) stops agent openings only and is cleared by `resume_agents()`; see the operating-mode state machine below.
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
@@ -293,18 +293,23 @@ anywhere under `oracledesk-stellar/`.
 
 ## Blocked / not attempted
 
-- **Reflector (SEP-40) price-mode resolution on live testnet**: `resolver`'s
-  `PriceThreshold` mode is implemented and unit-tested (with a mock
-  reflector), but no real testnet Reflector contract address was used
-  anywhere — there was no way to look one up and verify it against
-  Reflector's own current docs in this session (no browsing tool was
-  used for this). The demo uses **signer mode** instead, which needs no
-  external oracle. See `docs/wave-issues/05-reflector-feed-discovery.md`.
-- **A real testnet USDC issuer** (e.g. Circle's): not used. `scripts/
-  deploy-testnet.sh` deploys a **self-issued** test "USDC" (a real SEP-41
-  Stellar Asset Contract, 7 decimals, matching the design doc) rather than
-  guessing at a real issuer's address. This is called out as a
-  `TODO(maintainer)` in `scripts/deploy-testnet.sh` and `.env.example`.
+- **Reflector (SEP-40) price-mode resolution on live testnet**: `contracts/test-oracle`
+  is now a workspace member implementing the full SEP-40 read interface with
+  resolution-slot alignment and retention pruning (see `docs/test-oracle.md`).
+  `resolver` price-mode tests execute against the real `test-oracle` contract,
+  `deploy-testnet.sh` deploys `test-oracle` on testnet/local only, and
+  `MODE=price ./scripts/demo.sh` exercises the full commit -> reveal -> aligned
+  `set_price` -> `resolve_price` -> trace flow. Production Reflector testnet
+  feed discovery remains tracked in `docs/wave-issues/05-reflector-feed-discovery.md`.
+- **A real testnet USDC issuer** (Circle's): `scripts/deploy-testnet.sh` now
+  supports `COLLATERAL_MODE=existing` with
+  `COLLATERAL_ASSET=USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+  (verified against Circle's official testnet docs — see `docs/collateral.md`),
+  including pre-deploy SAC verification (`decimals == 7`), Horizon issuer flag
+  checks, idempotent G-account trustlines, `deposit`-based treasury funding and
+  `FORCE_REDEPLOY=1` switch protection. Default remains `COLLATERAL_MODE=self-issued`
+  so zero-faucet local/demo runs still work; live Circle faucet `make demo`
+  execution requires interactive faucet funding.
 - **Actually buying a trace through x402** (payment settlement via a real
   facilitator): not attempted. No x402-on-Stellar facilitator URL is known
   or hardcoded anywhere in this repo; finding and verifying one needs
@@ -359,9 +364,11 @@ markers in the files themselves:
 - `CODE_OF_CONDUCT.md` — a direct contact channel alongside GitHub's
   security-advisory reporting path, if wanted.
 - `CONTRIBUTING.md` — an expected PR review turnaround.
-- `scripts/deploy-testnet.sh` / `.env.example` — whether to switch the
-  testnet collateral token from the self-issued test USDC to Circle's real
-  testnet USDC issuer (needs verifying their current testnet address).
+- `scripts/deploy-testnet.sh` / `.env.example` — Circle's official Stellar
+  testnet USDC issuer (`GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`,
+  verified 2026-11-19) is now supported via `COLLATERAL_MODE=existing` (see
+  `docs/collateral.md`); switching the default testnet deployment remains a
+  maintainer decision (requires faucet funding and `FORCE_REDEPLOY=1`).
 - `.env.example` — the x402-on-Stellar facilitator URL to use for real
   payment settlement (none is hardcoded or guessed anywhere in this repo).
 
@@ -506,6 +513,26 @@ The pinned x402 Stellar package declares Node >=22, so CI and the documented
 minimum now use Node 22. An additional isolated Node 20 smoke run passed the
 HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
 runtime target.
+
+## Treasury operating modes (#272)
+
+The treasury's four pause/drawdown booleans are replaced by an explicit state
+machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `Paused`,
+`Emergency`, plus the admin-set `Unwinding` from #150) and one gate table (`mode::allowed`), documented cell by cell in
+[ADR 0005](adr/0005-treasury-vault.md). What changed for operators:
+
+- A drawdown halt no longer opens `emergency_withdraw`. That exit needs an
+  explicit `declare_emergency`, which only works from an admin pause.
+- Admin pause and drawdown halt are independent: `unpause()` never clears a
+  halt, `resume_agents()` never clears a pause.
+- `resume_agents()` replaces `acknowledge_drawdown()` (now a no-op) plus the
+  unpause, and requires the window PnL to have recovered.
+- `close_trade` is refused while admin-paused (it is an agent reduction).
+- New events: `ModeChanged`. New views: `mode`, `mode_state`, `allowed`. New
+  errors: `EmergencyMode` (83), `NotRecovered` (84). `set_mode` and
+  `set_paused` stay as compatibility entrypoints over the same state.
+- The mode x entrypoint matrix is an in-crate test (`mode_by_entrypoint_matrix`)
+  that fails when a new entrypoint has no row.
 
 ## Contributor addendum: declarative testnet deployer (#128)
 
