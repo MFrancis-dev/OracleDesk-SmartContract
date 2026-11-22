@@ -6,6 +6,9 @@
 
 pub mod inverse;
 pub mod resolver_harness;
+pub mod registry_model;
+pub mod timelock_model;
+pub mod timelock_targets;
 
 /// Widen a fuzz-generated `u64` into the i128 domain the contracts use.
 ///

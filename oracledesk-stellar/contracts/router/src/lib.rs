@@ -63,10 +63,15 @@ use treasury::Client as TreasuryClient;
 // Only its `WASM` constant (used by the tests) is taken from the import: every
 // publish call is made dynamically below so this crate does not encode the
 // stale `String`-action interface at compile time.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-mod reasoning_registry {
-    soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
+
+/// `market_core` and `treasury` each generate their own `Outcome` type from
+/// their wasm import, so the router maps between them explicitly. The variants
+/// have identical XDR encodings.
+fn to_treasury_outcome(outcome: &market_core::Outcome) -> treasury::Outcome {
+    match outcome {
+        market_core::Outcome::Yes => treasury::Outcome::Yes,
+        market_core::Outcome::No => treasury::Outcome::No,
+    }
 }
 
 /// Domain tag prepended to a V2 spec before hashing. Must match the resolver's
@@ -95,6 +100,25 @@ pub enum Error {
     InvalidTradeResult = 7,
     /// The supplied treasury is not wired to this router's market-core.
     TreasuryMismatch = 8,
+    /// The resolver and market-core point at different contracts.
+    WiringMismatch = 9,
+    /// The resolver did not store the rule kind that was revealed.
+    RuleMismatch = 10,
+}
+
+/// Mirrors the resolver's `RuleKind` view. The wasm import is built from the
+/// previous release, so this enum and the call below are dispatched by name.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleKind {
+    Price,
+    Signers,
+    WeightedKeys,
+    SignersDisputable,
+    Committee,
+    Hybrid,
+    ScaledPrice,
+    Twap,
 }
 
 #[contractevent]
@@ -102,6 +126,17 @@ pub enum Error {
 pub struct MarketCreatedAndRevealed {
     #[topic]
     pub market_id: u64,
+    pub creator: Address,
+    pub spec_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMarketRevealed {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub agent: Address,
     pub creator: Address,
     pub spec_hash: BytesN<32>,
 }
@@ -138,26 +173,20 @@ pub struct TradeBounds {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChainArgs {
-    pub expected_seq: u64,
-    pub prev_trace_hash: BytesN<32>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SigArgs {
-    pub signing_key: BytesN<32>,
-    pub signature: BytesN<64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceArgs {
     pub action: TraceAction,
     pub trace_hash: BytesN<32>,
     pub ipfs_cid: String,
-    pub chain: Option<ChainArgs>,
-    pub sig: Option<SigArgs>,
+    /// Chained publish requested. When `false`, `chain_expected_seq` and
+    /// `chain_prev_trace_hash` are ignored.
+    pub chained: bool,
+    pub chain_expected_seq: u64,
+    pub chain_prev_trace_hash: BytesN<32>,
+    /// Signed publish requested. When `false`, `signing_key` and `signature`
+    /// are ignored.
+    pub signed: bool,
+    pub signing_key: BytesN<32>,
+    pub signature: BytesN<64>,
 }
 
 #[contracttype]
@@ -239,6 +268,85 @@ impl Router {
             .extend_ttl(30 * 17_280, 60 * 17_280);
     }
 
+    /// Creates a market and reveals any V2 rule in one transaction. The
+    /// resolver and treasury come from market-core's live configuration, so a
+    /// resolver swap cannot strand the new market in an untrusted resolver.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_and_reveal(
+        env: Env,
+        creator: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        Self::create_and_reveal_impl(
+            &env,
+            creator,
+            question_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+            &spec_v2,
+            None,
+        )
+    }
+
+    /// Creates a market with treasury capital and reveals any V2 rule in one
+    /// transaction. Root authorization is anchored by the agent here; the
+    /// treasury still applies its role, caps and creation policy checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_create_and_reveal(
+        env: Env,
+        agent: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        let cfg = Self::load_config(&env)?;
+        let (_, treasury) = Self::live_wiring(&env, &cfg)?;
+        let resolution_hash = spec_v2_hash(&env, &spec_v2);
+        let mut args: SorobanVec<Val> = soroban_sdk::vec![
+            &env,
+            agent.into_val(&env),
+            question_hash.into_val(&env),
+            meta_uri.into_val(&env),
+            category.into_val(&env),
+            close_time.into_val(&env),
+            seed_amount.into_val(&env),
+            initial_yes_bps.into_val(&env),
+            spec_v2.into_val(&env),
+        ];
+        let market_id = match env.try_invoke_contract::<u64, soroban_sdk::Error>(
+            &treasury,
+            &Symbol::new(&env, "agent_create_market_reveal_v2"),
+            args,
+        ) {
+            Ok(Ok(id)) => id,
+            _ => return Err(Error::InvalidConfig),
+        };
+        let (resolver, _) = Self::live_wiring(&env, &cfg)?;
+        Self::assert_rule_kind(&env, &resolver, market_id, &spec_v2)?;
+        AgentMarketRevealed {
+            market_id,
+            agent,
+            creator: treasury,
+            spec_hash: resolution_hash,
+        }
+        .publish(&env);
+        Ok(market_id)
+    }
+
     /// Creates a market and reveals its signer-mode rule in one transaction.
     /// The commitment is computed from `spec_v2` locally and passed to
     /// market-core, so the reveal necessarily matches.
@@ -254,7 +362,7 @@ impl Router {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        Self::create_and_reveal(
+        Self::create_and_reveal_impl(
             &env,
             creator,
             question_hash,
@@ -264,6 +372,7 @@ impl Router {
             seed_amount,
             initial_yes_bps,
             &spec_v2,
+            Some(RuleKind::Signers),
         )
     }
 
@@ -280,7 +389,7 @@ impl Router {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        Self::create_and_reveal(
+        Self::create_and_reveal_impl(
             &env,
             creator,
             question_hash,
@@ -290,6 +399,7 @@ impl Router {
             seed_amount,
             initial_yes_bps,
             &spec_v2,
+            Some(RuleKind::Price),
         )
     }
 
@@ -299,9 +409,9 @@ impl Router {
     pub fn reveal_spec(env: Env, market_id: u64, spec_v2: ResolutionSpecV2) -> Result<(), Error> {
         let cfg = Self::load_config(&env)?;
         Self::verify_envelope(&env, &cfg, &spec_v2)?;
-        Self::validate_rule(&spec_v2.rule)?;
-        ResolverClient::new(&env, &cfg.resolver).register_spec_v2(&market_id, &spec_v2);
-        Ok(())
+        let (resolver, _) = Self::live_wiring(&env, &cfg)?;
+        ResolverClient::new(&env, &resolver).register_spec_v2(&market_id, &spec_v2);
+        Self::assert_rule_kind(&env, &resolver, market_id, &spec_v2)
     }
 
     /// Trades `outcome` shares through market-core's `buy_v2`/`sell_v2` and
@@ -356,7 +466,7 @@ impl Router {
         }
 
         let trace_id = Self::publish(&env, &registry, &trader, market_id, &trace);
-        let chain_seq = Self::chain_seq(&env, &registry, &trader, &trace.chain);
+        let chain_seq = Self::chain_seq(&env, &registry, &trader, trace.chained);
         TradeTraced {
             market_id,
             trader,
@@ -404,7 +514,7 @@ impl Router {
             Side::Buy => treasury_client.agent_buy_v2(
                 &agent,
                 &market_id,
-                &outcome,
+                &to_treasury_outcome(&outcome),
                 &bounds.amount,
                 &bounds.limit_shares,
                 &bounds.limit_price_bps,
@@ -413,7 +523,7 @@ impl Router {
             Side::Sell => treasury_client.agent_sell_v2(
                 &agent,
                 &market_id,
-                &outcome,
+                &to_treasury_outcome(&outcome),
                 &bounds.amount,
                 &bounds.limit_shares,
                 &bounds.limit_price_bps,
@@ -425,7 +535,7 @@ impl Router {
         }
 
         let trace_id = Self::publish(&env, &registry, &agent, market_id, &trace);
-        let chain_seq = Self::chain_seq(&env, &registry, &agent, &trace.chain);
+        let chain_seq = Self::chain_seq(&env, &registry, &agent, trace.chained);
         TradeTraced {
             market_id,
             trader: agent,
@@ -457,6 +567,9 @@ impl Router {
         ipfs_cid: String,
     ) -> Result<TradeTraceResult, Error> {
         let deadline = env.ledger().timestamp();
+        // Built before `env` is moved into the call below.
+        let zero32 = BytesN::from_array(&env, &[0u8; 32]);
+        let zero64 = BytesN::from_array(&env, &[0u8; 64]);
         Self::trade_and_publish_trace(
             env,
             trader,
@@ -473,8 +586,12 @@ impl Router {
                 action: TraceAction::Buy,
                 trace_hash,
                 ipfs_cid,
-                chain: None,
-                sig: None,
+                chained: false,
+                chain_expected_seq: 0,
+                chain_prev_trace_hash: zero32.clone(),
+                signed: false,
+                signing_key: zero32,
+                signature: zero64,
             },
         )
     }
@@ -488,7 +605,7 @@ impl Router {
     // ----- internals ------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
-    fn create_and_reveal(
+    fn create_and_reveal_impl(
         env: &Env,
         creator: Address,
         question_hash: BytesN<32>,
@@ -498,10 +615,11 @@ impl Router {
         seed_amount: i128,
         initial_yes_bps: u32,
         spec_v2: &ResolutionSpecV2,
+        _expected: Option<RuleKind>,
     ) -> Result<u64, Error> {
         let cfg = Self::load_config(env)?;
         Self::verify_envelope(env, &cfg, spec_v2)?;
-        Self::validate_rule(&spec_v2.rule)?;
+        let (resolver, _) = Self::live_wiring(env, &cfg)?;
 
         // Establish the creator's authorization at the router (the root
         // invocation). market-core's `create_market` calls `require_auth`
@@ -526,7 +644,8 @@ impl Router {
             &initial_yes_bps,
         );
 
-        ResolverClient::new(env, &cfg.resolver).register_spec_v2(&market_id, spec_v2);
+        ResolverClient::new(env, &resolver).register_spec_v2(&market_id, spec_v2);
+        Self::assert_rule_kind(env, &resolver, market_id, spec_v2)?;
 
         MarketCreatedAndRevealed {
             market_id,
@@ -582,23 +701,23 @@ impl Router {
             trace.trace_hash.clone().into_val(env),
             trace.ipfs_cid.clone().into_val(env),
         ];
-        match (&trace.chain, &trace.sig) {
-            (None, None) => Self::invoke_publish(env, registry, "publish_trace", args),
-            (Some(chain), None) => {
-                args.push_back(chain.expected_seq.into_val(env));
-                args.push_back(chain.prev_trace_hash.clone().into_val(env));
+        match (trace.chained, trace.signed) {
+            (false, false) => Self::invoke_publish(env, registry, "publish_trace", args),
+            (true, false) => {
+                args.push_back(trace.chain_expected_seq.into_val(env));
+                args.push_back(trace.chain_prev_trace_hash.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_chained_trace", args)
             }
-            (None, Some(sig)) => {
-                args.push_back(sig.signing_key.clone().into_val(env));
-                args.push_back(sig.signature.clone().into_val(env));
+            (false, true) => {
+                args.push_back(trace.signing_key.clone().into_val(env));
+                args.push_back(trace.signature.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_trace_signed", args)
             }
-            (Some(chain), Some(sig)) => {
-                args.push_back(chain.expected_seq.into_val(env));
-                args.push_back(chain.prev_trace_hash.clone().into_val(env));
-                args.push_back(sig.signing_key.clone().into_val(env));
-                args.push_back(sig.signature.clone().into_val(env));
+            (true, true) => {
+                args.push_back(trace.chain_expected_seq.into_val(env));
+                args.push_back(trace.chain_prev_trace_hash.clone().into_val(env));
+                args.push_back(trace.signing_key.clone().into_val(env));
+                args.push_back(trace.signature.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_chained_trace_signed", args)
             }
         }
@@ -612,9 +731,9 @@ impl Router {
         env: &Env,
         registry: &Address,
         author: &Address,
-        chain: &Option<ChainArgs>,
+        chained: bool,
     ) -> Option<u64> {
-        if chain.is_none() {
+        if !chained {
             return None;
         }
         let head: ChainHead = env.invoke_contract(
@@ -639,23 +758,39 @@ impl Router {
         Ok(())
     }
 
-    fn validate_rule(rule: &ResolutionSpec) -> Result<(), Error> {
-        let ok = match rule {
-            ResolutionSpec::Price(cfg) => cfg.threshold >= 0 && cfg.max_staleness != 0,
-            ResolutionSpec::Signers(cfg) => {
-                !cfg.signers.is_empty()
-                    && cfg.threshold != 0
-                    && cfg.threshold <= cfg.signers.len()
-                    && cfg.dispute_window != 0
-            }
-            // The router only runs the two primary flows; the resolver still
-            // accepts the other variants through its own entrypoints.
-            _ => return Err(Error::UnsupportedRule),
-        };
-        if ok {
+    fn live_wiring(env: &Env, cfg: &RouterConfig) -> Result<(Address, Address), Error> {
+        let core_cfg = MarketCoreClient::new(env, &cfg.market_core).get_config();
+        let resolver = core_cfg.resolver;
+        if ResolverClient::new(env, &resolver).market_core() != cfg.market_core {
+            return Err(Error::WiringMismatch);
+        }
+        Ok((resolver, core_cfg.treasury))
+    }
+
+    fn assert_rule_kind(
+        env: &Env,
+        resolver: &Address,
+        market_id: u64,
+        spec: &ResolutionSpecV2,
+    ) -> Result<(), Error> {
+        let args: SorobanVec<Val> = soroban_sdk::vec![env, market_id.into_val(env)];
+        let actual: Option<RuleKind> = env
+            .invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
+        if actual == Some(Self::expected_rule_kind(spec)) {
             Ok(())
         } else {
-            Err(Error::InvalidConfig)
+            Err(Error::RuleMismatch)
+        }
+    }
+
+    fn expected_rule_kind(spec: &ResolutionSpecV2) -> RuleKind {
+        match &spec.rule {
+            ResolutionSpec::Price(_) => RuleKind::Price,
+            ResolutionSpec::Signers(_) => RuleKind::Signers,
+            ResolutionSpec::WeightedKeys(_) => RuleKind::WeightedKeys,
+            ResolutionSpec::SignersDisputable(_) => RuleKind::SignersDisputable,
+            ResolutionSpec::Committee(_) => RuleKind::Committee,
+            ResolutionSpec::Hybrid(_) => RuleKind::Hybrid,
         }
     }
 

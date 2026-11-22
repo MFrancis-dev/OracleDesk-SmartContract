@@ -25,6 +25,7 @@ export interface SorobanSubmitOptions {
   maxPollsPerAttempt?: number;
   retryDelayMs?: number;
   sleep?: (milliseconds: number) => Promise<void>;
+  beforeSend?: (hash: string, attempt: number) => void | Promise<void>;
   replacement?: ReplacementPolicy;
   nowUnix?: () => number;
 }
@@ -78,6 +79,7 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
     maxPollsPerAttempt = 4,
     retryDelayMs = 250,
     sleep = defaultSleep,
+    beforeSend,
     replacement,
     nowUnix = () => Math.floor(Date.now() / 1000),
   } = options;
@@ -170,6 +172,20 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
   await log("signed");
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await beforeSend?.(active.hash, attempt);
+    } catch (error) {
+      const fenced = error instanceof Error && error.name === "FenceLostError";
+      if (fenced) {
+        const fence = (error as Error & { fence?: { name: string; epoch: bigint } }).fence;
+        await log("fenced", attempt, errorMessage(error), fence
+          ? { fence: { name: fence.name, epoch: fence.epoch.toString() } }
+          : {});
+      } else {
+        await log("cancelled", attempt, errorMessage(error));
+      }
+      throw error;
+    }
     await log("submitting", attempt);
     let sendResponse: Awaited<ReturnType<typeof server.sendTransaction>> | undefined;
     try {

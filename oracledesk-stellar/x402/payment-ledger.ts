@@ -14,6 +14,9 @@ export type PaymentState =
   | "settled"
   | "delivered"
   | "failed"
+  | "failed_unconfirmed"
+  | "failed_final"
+  | "needs_operator"
   | "indeterminate"
   // Refund pipeline (refunds.ts): settled-but-undelivered payments past the
   // redelivery window. Every step is a ledger CAS.
@@ -21,6 +24,13 @@ export type PaymentState =
   | "refunding"
   | "refunded"
   | "refund_failed";
+
+export interface AuthCredential {
+  address: string;
+  nonce: string;
+  expirationLedger: number;
+}
+
 export interface PaymentEntry {
   paymentId: string;
   traceId: string;
@@ -32,6 +42,10 @@ export interface PaymentEntry {
   payer?: string;
   state: PaymentState;
   settlementTx?: string;
+  facilitatorTx?: string;
+  innerTxHash?: string;
+  maxLedger?: number;
+  auths?: AuthCredential[];
   paymentResponseHeader?: string;
   responseBody?: string;
   traceBytes?: string;
@@ -46,6 +60,8 @@ export interface PaymentEntry {
   refundLastError?: string;
   /** Above the auto-approve threshold or the window cap: waits for an operator. */
   refundReview?: boolean;
+  reconciledAt?: number;
+  reconcileReason?: string;
   expiresAt: number;
   createdAt: number;
   updatedAt: number;
@@ -123,9 +139,15 @@ function updated(
   const {
     payer,
     settlementTx,
+    facilitatorTx,
+    innerTxHash,
+    maxLedger,
+    auths,
     paymentResponseHeader,
     responseBody,
     error,
+    reconciledAt,
+    reconcileReason,
     settledAt,
     refundId,
     refundTx,
@@ -139,9 +161,15 @@ function updated(
       Object.entries({
         payer,
         settlementTx,
+        facilitatorTx,
+        innerTxHash,
+        maxLedger,
+        auths,
         paymentResponseHeader,
         responseBody,
         error,
+        reconciledAt,
+        reconcileReason,
         settledAt,
         refundId,
         refundTx,
@@ -464,7 +492,13 @@ class SqliteRefundStore implements RefundStore {
 export function paymentIdentity(
   payload: Pick<PaymentPayload, "accepted" | "payload">,
   now = Date.now(),
-): { paymentId: string; expiresAt: number; maxLedger?: number } {
+): {
+  paymentId: string;
+  expiresAt: number;
+  maxLedger?: number;
+  innerTxHash: string;
+  auths: AuthCredential[];
+} {
   const network = payload.accepted.network;
   if (network !== "stellar:testnet" && network !== "stellar:pubnet")
     throw new Error("Unsupported payment network");
@@ -490,14 +524,23 @@ export function paymentIdentity(
     tx.ledgerBounds && Number(tx.ledgerBounds.maxLedger) > 0
       ? Number(tx.ledgerBounds.maxLedger)
       : undefined;
-  // Soroban address authorizations can expire before the transaction itself.
+  const auths: AuthCredential[] = [];
   for (const op of tx.toEnvelope().v1().tx().operations()) {
     if (op.body().switch().name !== "invokeHostFunction") continue;
     for (const auth of op.body().invokeHostFunctionOp().auth()) {
       if (auth.credentials().switch().name !== "sorobanCredentialsAddress")
         continue;
-      const expiry = auth.credentials().address().signatureExpirationLedger();
+      const addrCreds = auth.credentials().address();
+      const expiry = addrCreds.signatureExpirationLedger();
       maxLedger = Math.min(maxLedger ?? expiry, expiry);
+      // #300: extract the payer address and auth nonce for chain reconciliation.
+      const addrVal = addrCreds.address();
+      const nonceVal = addrCreds.nonce();
+      auths.push({
+        address: addrVal.toString(),
+        nonce: nonceVal.toString(),
+        expirationLedger: expiry,
+      });
     }
   }
   return {
@@ -506,5 +549,7 @@ export function paymentIdentity(
       .digest("hex"),
     expiresAt,
     maxLedger,
+    innerTxHash: tx.hash().toString("hex"),
+    auths,
   };
 }

@@ -292,25 +292,16 @@ pub fn calc_sell_shares(
         .ok_or(MathError::Overflow)?
         .checked_mul(4)
         .ok_or(MathError::Overflow)?;
-    let d = b2
-        .checked_sub(four_r_shares)
-        .ok_or(MathError::Overflow)?;
+    let d = b2.checked_sub(four_r_shares).ok_or(MathError::Overflow)?;
     let sqrt_d = isqrt(d);
     let mut x = ((b as u128) - sqrt_d) / 2;
     // Pool-favouring correction: decrement while the invariant would drop.
     // The products are at most 1e30 and fit in i128.
     while x > 0 {
-        let new_sold = r_sold
-            .checked_add(shares_in)
-            .ok_or(MathError::Overflow)?
-            - x as i128;
+        let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x as i128;
         let new_other = r_other - x as i128;
-        let left = new_sold
-            .checked_mul(new_other)
-            .ok_or(MathError::Overflow)?;
-        let right = r_sold
-            .checked_mul(r_other)
-            .ok_or(MathError::Overflow)?;
+        let left = new_sold.checked_mul(new_other).ok_or(MathError::Overflow)?;
+        let right = r_sold.checked_mul(r_other).ok_or(MathError::Overflow)?;
         if left >= right {
             break;
         }
@@ -326,10 +317,7 @@ pub fn calc_sell_shares(
     if collateral_out <= 0 {
         return Err(MathError::InvalidInput);
     }
-    let new_sold = r_sold
-        .checked_add(shares_in)
-        .ok_or(MathError::Overflow)?
-        - x;
+    let new_sold = r_sold.checked_add(shares_in).ok_or(MathError::Overflow)? - x;
     let new_other = r_other - x;
     Ok(SellSharesQuote {
         collateral_out,
@@ -682,7 +670,8 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0
+            self.0 = self
+                .0
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(144269);
             self.0

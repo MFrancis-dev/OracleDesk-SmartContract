@@ -79,3 +79,36 @@ policy: SignerPolicy }`. `StellarSigner` aliases SDK 16's `contract.Signer`.
 `TransactionSigningProvider` exposes `address` and
 `signTransaction(transactionXdr, options?)`; `AuthEntrySigningProvider`
 exposes `address` and `signAuthEntry(preimageXdr, options?)`.
+
+## Key compromise and retroactive revocation (#299)
+
+When a signing key leaks (from a policy server, remote signer host, or CI
+secret), two tools are available:
+
+- **`retire_signing_key`** stops future use of the key but does not taint
+  traces already published. Every trace the key signed between the compromise
+  and the retirement keeps `verify_trace_signature == true` and
+  `TraceVerdict::Valid`.
+- **`revoke_signing_key(key, compromised_since, reason)`** retroactively
+  taints exactly the traces that key signed at or after `compromised_since`.
+  The verdict flips to `KeyCompromised(since)` for those traces, and
+  `verify_trace_signature` returns `false` for them. Traces signed by the
+  agent's other keys are unaffected.
+
+`revoke_signing_key` is callable by the agent or the registry admin,
+including for retired or revoked agents. Revocation is permanent:
+`compromised_since` can only move earlier on a subsequent call (widening the
+taint window). Picking `compromised_since` too late leaves tainted traces
+looking valid; too early taints honest traces. Use the earliest timestamp the
+key could have been exposed.
+
+The `signature_verdict` view returns a `SignatureVerdict` (NotSigned,
+WrongAgent, Valid, or KeyCompromised) independent of hash/flag/agent checks.
+`trace_verdict` precedence is: HashMismatch > Flagged > AgentRevokedAfter >
+KeyCompromised > Valid.
+
+Auditors can page through a key's signed traces with `key_traces` and
+`key_trace_count`, and binary-search for the first affected trace with
+`key_affected_from`. The per-key index is built by `publish_trace_signed`
+and `publish_chained_trace_signed`; traces published before the index existed
+or published unsigned have no entries and are not covered.

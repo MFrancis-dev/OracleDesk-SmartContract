@@ -67,3 +67,13 @@ do not fail the suite:
   key includes the trace hash, which changes every tick).
 - The maker leaves an ambiguous create as `intent` for an operator; it is
   never retried, but also never reconciled.
+
+## Watcher chaos (#275)
+
+`test/chaos/watcher.chaos.test.ts` does not use `FakeNetwork`: the fake RPC models
+market-core, treasury and the registry, not the resolver. It runs the real
+`createWatcher` (ticked directly, without the Runtime loop) against a seeded resolver model injected at the
+adapter boundary (per-call ledger-time latency, read timeouts, ambiguous
+submissions, transient rejections) and checks the invariants listed in the file.
+Serving the resolver WASM, its ledger entries and a SEP-41 balance from the fake
+HTTP RPC is the natural next step once the resolver compiles on `develop`.

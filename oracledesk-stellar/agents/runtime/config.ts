@@ -9,8 +9,9 @@ export class ConfigError extends Error {
   }
 }
 
-/** Exit codes: 2 = bad configuration, 75 = EX_TEMPFAIL (lease held elsewhere). */
+/** Exit codes: 2 = bad configuration, 3 = killed, 75 = EX_TEMPFAIL (lease held elsewhere). */
 export const EXIT_CONFIG = 2;
+export const EXIT_KILLED = 3;
 export const EXIT_TEMPFAIL = 75;
 
 /**

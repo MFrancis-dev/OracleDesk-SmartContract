@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "adversarial-mocks"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,6 +1094,7 @@ version = "0.1.0"
 dependencies = [
  "market-core",
  "proptest",
+ "reasoning-registry",
  "resolver",
  "serde",
  "serde_json",
@@ -1236,6 +1244,7 @@ dependencies = [
 name = "market-core"
 version = "0.1.0"
 dependencies = [
+ "adversarial-mocks",
  "ed25519-dalek",
  "oracledesk-types",
  "soroban-sdk",
@@ -1540,10 +1549,12 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 name = "resolver"
 version = "0.1.0"
 dependencies = [
+ "adversarial-mocks",
  "ed25519-dalek",
  "market-core",
  "oracledesk-types",
  "soroban-sdk",
+ "test-oracle",
 ]
 
 [[package]]
@@ -2100,6 +2111,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-oracle"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2193,9 +2211,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.19+spec-1.1.0"
+version = "0.25.20+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
+checksum = "e76360e201d6dbd6583e17795ba71a88f47365a9139c8450a7979c32303b8e73"
 dependencies = [
  "indexmap 2.14.2",
  "toml_datetime",
@@ -2205,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]
@@ -2216,6 +2234,7 @@ dependencies = [
 name = "treasury"
 version = "0.1.0"
 dependencies = [
+ "adversarial-mocks",
  "market-core",
  "soroban-sdk",
 ]

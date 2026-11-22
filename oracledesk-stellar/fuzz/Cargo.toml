@@ -21,7 +21,9 @@ market-core = { path = "../contracts/market-core" }
 resolver = { path = "../contracts/resolver" }
 # Deterministic Ed25519 keys from 32-byte seeds for weighted-key signatures.
 ed25519-dalek = "2"
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+reasoning-registry = { path = "../contracts/reasoning-registry" }
+timelock = { path = "../contracts/timelock" }
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
 
 [[bin]]
 name = "fuzz_calc_buy"
@@ -66,6 +68,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_registry_sequence"
+path = "fuzz_targets/fuzz_registry_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_resolver_committee"
 path = "fuzz_targets/fuzz_resolver_committee.rs"
 test = false
@@ -74,6 +82,12 @@ doc = false
 [[bin]]
 name = "fuzz_resolver_spec_decode"
 path = "fuzz_targets/fuzz_resolver_spec_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_timelock_sequence"
+path = "fuzz_targets/fuzz_timelock_sequence.rs"
 test = false
 doc = false
 
