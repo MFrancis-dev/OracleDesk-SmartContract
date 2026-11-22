@@ -14,7 +14,13 @@ export type PaymentState =
   | "settled"
   | "delivered"
   | "failed"
-  | "indeterminate";
+  | "indeterminate"
+  // Refund pipeline (refunds.ts): settled-but-undelivered payments past the
+  // redelivery window. Every step is a ledger CAS.
+  | "refund_pending"
+  | "refunding"
+  | "refunded"
+  | "refund_failed";
 export interface PaymentEntry {
   paymentId: string;
   traceId: string;
@@ -31,6 +37,15 @@ export interface PaymentEntry {
   traceBytes?: string;
   requirementsKey?: string;
   error?: string;
+  /** When the payment reached `settled`; starts the redelivery window. */
+  settledAt?: number;
+  refundId?: string;
+  /** Hash of the confirmed refund transaction. */
+  refundTx?: string;
+  refundAttempts?: number;
+  refundLastError?: string;
+  /** Above the auto-approve threshold or the window cap: waits for an operator. */
+  refundReview?: boolean;
   expiresAt: number;
   createdAt: number;
   updatedAt: number;
@@ -51,7 +66,52 @@ export interface PaymentLedger {
   ): Promise<PaymentEntry>;
   get(id: string): Promise<PaymentEntry | undefined>;
   reconcileStuck(olderThanMs: number): Promise<number>;
+  /** Entries in `states` not updated for `olderThanMs`, oldest first. */
+  listByState(
+    states: PaymentState[],
+    olderThanMs: number,
+    limit: number,
+  ): Promise<PaymentEntry[]>;
+  /** Refund records: one per payment (`payment_id` is unique). */
+  refunds: RefundStore;
   close(): void;
+}
+
+export type RefundState =
+  | "review"
+  | "pending"
+  | "submitted"
+  | "succeeded"
+  | "failed"
+  | "rejected";
+export interface RefundRecord {
+  refundId: string;
+  paymentId: string;
+  state: RefundState;
+  amount: string;
+  asset: string;
+  payer: string;
+  /** Hash and signed XDR, persisted *before* `sendTransaction`. */
+  txHash?: string;
+  txXdr?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface RefundStore {
+  /** Inserts; `false` if the payment already has a refund record. */
+  insert(r: RefundRecord): Promise<boolean>;
+  get(paymentId: string): Promise<RefundRecord | undefined>;
+  update(
+    paymentId: string,
+    patch: Partial<Omit<RefundRecord, "refundId" | "paymentId" | "createdAt">>,
+  ): Promise<RefundRecord>;
+  /** Sum of `amount` over records created after `since`, excluding rejected ones. */
+  sumSince(since: number): Promise<bigint>;
+  list(
+    state: RefundState | undefined,
+    cursor: number,
+    limit: number,
+  ): Promise<{ items: RefundRecord[]; next?: number }>;
 }
 export class LedgerConflict extends Error {}
 function updated(
@@ -60,8 +120,19 @@ function updated(
   patch: Partial<PaymentEntry>,
 ): PaymentEntry {
   // Identity and expiry are immutable, even if an adapter passes a broad patch.
-  const { payer, settlementTx, paymentResponseHeader, responseBody, error } =
-    patch;
+  const {
+    payer,
+    settlementTx,
+    paymentResponseHeader,
+    responseBody,
+    error,
+    settledAt,
+    refundId,
+    refundTx,
+    refundAttempts,
+    refundLastError,
+    refundReview,
+  } = patch;
   return {
     ...entry,
     ...Object.fromEntries(
@@ -71,14 +142,54 @@ function updated(
         paymentResponseHeader,
         responseBody,
         error,
+        settledAt,
+        refundId,
+        refundTx,
+        refundAttempts,
+        refundLastError,
+        refundReview,
       }).filter(([, v]) => v !== undefined),
     ),
     state: to,
     updatedAt: Date.now(),
   };
 }
+class MemoryRefundStore implements RefundStore {
+  private records = new Map<string, RefundRecord>();
+  async insert(r: RefundRecord) {
+    if (this.records.has(r.paymentId)) return false;
+    this.records.set(r.paymentId, structuredClone(r));
+    return true;
+  }
+  async get(id: string) {
+    const r = this.records.get(id);
+    return r && structuredClone(r);
+  }
+  async update(id: string, patch: Partial<RefundRecord>) {
+    const r = this.records.get(id);
+    if (!r) throw new LedgerConflict(`Refund for ${id}: not found`);
+    const next = { ...r, ...patch, updatedAt: Date.now() };
+    this.records.set(id, next);
+    return structuredClone(next);
+  }
+  async sumSince(since: number) {
+    let sum = 0n;
+    for (const r of this.records.values())
+      if (r.createdAt > since && r.state !== "rejected") sum += BigInt(r.amount);
+    return sum;
+  }
+  async list(state: RefundState | undefined, cursor: number, limit: number) {
+    const all = [...this.records.values()]
+      .filter((r) => !state || r.state === state)
+      .sort((a, b) => a.createdAt - b.createdAt || a.refundId.localeCompare(b.refundId));
+    const items = all.slice(cursor, cursor + limit).map((r) => structuredClone(r));
+    return { items, next: cursor + limit < all.length ? cursor + limit : undefined };
+  }
+}
+
 export class MemoryPaymentLedger implements PaymentLedger {
   private entries = new Map<string, PaymentEntry>();
+  readonly refunds: RefundStore = new MemoryRefundStore();
   async claim(e: PaymentClaim) {
     const existing = this.entries.get(e.paymentId);
     if (existing) return { created: false, entry: structuredClone(existing) };
@@ -122,10 +233,22 @@ export class MemoryPaymentLedger implements PaymentLedger {
       }
     return count;
   }
+  async listByState(states: PaymentState[], olderThanMs: number, limit: number) {
+    const cutoff = Date.now() - olderThanMs;
+    return [...this.entries.values()]
+      .filter((e) => states.includes(e.state) && e.updatedAt <= cutoff)
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(0, limit)
+      .map((e) => structuredClone(e));
+  }
   close() {}
 }
+
+/** Current SQLite schema version (v2: refunds table, #279). */
+export const LEDGER_SCHEMA_VERSION = 2;
 export class SqlitePaymentLedger implements PaymentLedger {
   private db: Database.Database;
+  readonly refunds: RefundStore;
   constructor(path: string) {
     this.db = new Database(path);
     if (path !== ":memory:") chmodSync(path, 0o600);
@@ -133,15 +256,37 @@ export class SqlitePaymentLedger implements PaymentLedger {
     this.db.pragma("synchronous = FULL");
     this.db
       .exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
-      INSERT OR IGNORE INTO schema_version VALUES (1);
+      INSERT OR IGNORE INTO schema_version SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
       CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, entry TEXT NOT NULL);`);
-    const versions = this.db
-      .prepare("SELECT version FROM schema_version")
-      .all() as { version: number }[];
-    if (versions.length !== 1 || versions[0].version !== 1) {
+    const version = () =>
+      this.db.prepare("SELECT version FROM schema_version").all() as {
+        version: number;
+      }[];
+    let versions = version();
+    if (versions.length === 1 && versions[0].version === 1) {
+      // v1 -> v2 in one transaction: a crash leaves either v1 or full v2.
+      this.db.transaction(() => {
+        this.db.exec(`CREATE TABLE refunds (
+            refund_id TEXT PRIMARY KEY,
+            payment_id TEXT UNIQUE NOT NULL,
+            state TEXT,
+            amount TEXT,
+            asset TEXT,
+            payer TEXT,
+            tx_hash TEXT,
+            tx_xdr TEXT,
+            created_at INTEGER,
+            updated_at INTEGER);
+          CREATE INDEX payments_state_updated ON payments (state, updated_at);
+          UPDATE schema_version SET version = 2;`);
+      })();
+      versions = version();
+    }
+    if (versions.length !== 1 || versions[0].version !== LEDGER_SCHEMA_VERSION) {
       this.db.close();
       throw new Error("Unsupported payment ledger schema");
     }
+    this.refunds = new SqliteRefundStore(this.db);
   }
   async claim(e: PaymentClaim) {
     const entry: PaymentEntry = {
@@ -203,8 +348,115 @@ export class SqlitePaymentLedger implements PaymentLedger {
       );
     return rows.length;
   }
+  async listByState(states: PaymentState[], olderThanMs: number, limit: number) {
+    if (!states.length) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT entry FROM payments WHERE state IN (${states.map(() => "?").join(",")}) AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?`,
+      )
+      .all(...states, Date.now() - olderThanMs, limit) as { entry: string }[];
+    return rows.map((r) => JSON.parse(r.entry) as PaymentEntry);
+  }
   close() {
     this.db.close();
+  }
+}
+
+interface RefundRow {
+  refund_id: string;
+  payment_id: string;
+  state: RefundState;
+  amount: string;
+  asset: string;
+  payer: string;
+  tx_hash: string | null;
+  tx_xdr: string | null;
+  created_at: number;
+  updated_at: number;
+}
+function fromRow(r: RefundRow): RefundRecord {
+  return {
+    refundId: r.refund_id,
+    paymentId: r.payment_id,
+    state: r.state,
+    amount: r.amount,
+    asset: r.asset,
+    payer: r.payer,
+    ...(r.tx_hash ? { txHash: r.tx_hash } : {}),
+    ...(r.tx_xdr ? { txXdr: r.tx_xdr } : {}),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+class SqliteRefundStore implements RefundStore {
+  constructor(private readonly db: Database.Database) {}
+  async insert(r: RefundRecord) {
+    return (
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO refunds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          r.refundId,
+          r.paymentId,
+          r.state,
+          r.amount,
+          r.asset,
+          r.payer,
+          r.txHash ?? null,
+          r.txXdr ?? null,
+          r.createdAt,
+          r.updatedAt,
+        ).changes === 1
+    );
+  }
+  async get(id: string) {
+    const row = this.db
+      .prepare("SELECT * FROM refunds WHERE payment_id = ?")
+      .get(id) as RefundRow | undefined;
+    return row && fromRow(row);
+  }
+  async update(id: string, patch: Partial<RefundRecord>) {
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM refunds WHERE payment_id = ?")
+        .get(id) as RefundRow | undefined;
+      if (!row) throw new LedgerConflict(`Refund for ${id}: not found`);
+      const next = { ...fromRow(row), ...patch, updatedAt: Date.now() };
+      this.db
+        .prepare(
+          "UPDATE refunds SET state=?, tx_hash=?, tx_xdr=?, updated_at=? WHERE payment_id=?",
+        )
+        .run(next.state, next.txHash ?? null, next.txXdr ?? null, next.updatedAt, id);
+      return next;
+    })();
+  }
+  async sumSince(since: number) {
+    const rows = this.db
+      .prepare(
+        "SELECT amount FROM refunds WHERE created_at > ? AND state != 'rejected'",
+      )
+      .all(since) as { amount: string }[];
+    return rows.reduce((s, r) => s + BigInt(r.amount), 0n);
+  }
+  async list(state: RefundState | undefined, cursor: number, limit: number) {
+    const rows = (
+      state
+        ? this.db
+            .prepare(
+              "SELECT * FROM refunds WHERE state = ? ORDER BY created_at, refund_id LIMIT ? OFFSET ?",
+            )
+            .all(state, limit + 1, cursor)
+        : this.db
+            .prepare(
+              "SELECT * FROM refunds ORDER BY created_at, refund_id LIMIT ? OFFSET ?",
+            )
+            .all(limit + 1, cursor)
+    ) as RefundRow[];
+    return {
+      items: rows.slice(0, limit).map(fromRow),
+      next: rows.length > limit ? cursor + limit : undefined,
+    };
   }
 }
 

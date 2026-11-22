@@ -5,6 +5,7 @@
 //! `cargo +nightly fuzz`. See `fuzz/README.md`.
 
 pub mod inverse;
+pub mod resolver_harness;
 
 /// Widen a fuzz-generated `u64` into the i128 domain the contracts use.
 ///

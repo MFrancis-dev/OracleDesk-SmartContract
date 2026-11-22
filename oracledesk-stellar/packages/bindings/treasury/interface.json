@@ -159,6 +159,67 @@
         ]
       }
     },
+    "agent_buy_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Buys with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_buy_traced",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "agent_buy_v2": {
       "kind": "function_v0",
       "spec": {
@@ -468,6 +529,67 @@
         ]
       }
     },
+    "agent_sell_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sells with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_sell_traced",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "agent_sell_v2": {
       "kind": "function_v0",
       "spec": {
@@ -616,6 +738,49 @@
         ]
       }
     },
+    "cancel_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cancels `ticket_id` and re-mints shares for what it is still owed. Shares minted = `min(shares_for_deposit(remaining, nav, supply), floor(shares_burned * remaining / assets_at_request))`: after a NAV loss the owner cannot get back more shares than were burned for the same assets; after a gain they get fewer shares at the higher NAV. Either way request-then-cancel never profits at the expense of other shareholders. The reservation is released *before* NAV is read, because NAV subtracts `QueueReserved`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel_withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "capital_breakdown": {
       "kind": "function_v0",
       "spec": {
@@ -663,10 +828,45 @@
         ]
       }
     },
+    "claim_pool_remainders": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the LP pool remainders of up to `MAX_BATCH` treasury-created markets in one call, delegating to market-core's `claim_pool_remainders` (skips, never aborts on, markets the treasury did not create, markets not settled, or markets already claimed — see `redeem_many` for the batching rationale). (`ROLE_SETTLE`.)",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "claim_pool_remainders",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "claim_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Pays the ticket at the head of the queue as far as idle collateral allows. Permissionless: the money always goes to the ticket's owner. Only the head ticket can be paid (`NothingToPay` for later ones).",
+        "doc": "Permissionless wrapper around the queue drain (`drain_queue`): pays queued tickets from idle collateral, pro rata across the `QUEUE_WINDOW` head window, reading at most `MAX_QUEUE_STEPS` ids. The money always goes to each ticket's owner. `ticket_id` must name a live ticket (`TicketNotFound`); returns the total paid across all tickets, or `NothingToPay` when the drain made no progress. A call that only moved the head past a run of holes pays nothing but returns `Ok(0)`: failing would revert the head move and let a long run of cancelled tickets stall `claim_withdraw` forever.",
         "inputs": [
           {
             "doc": "",
@@ -907,6 +1107,27 @@
         ]
       }
     },
+    "estimated_unlock": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Rough unlock time for `ticket_id`: now if the collateral already held for the queue covers it; otherwise the close time of the open market whose settlement (floor value, in close-time order) first covers `owed_ahead + remaining`. `None` if the ticket is not live or the open markets cannot cover it. An estimate only: it ignores new deposits, trading and market resolution delays.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "estimated_unlock",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "execute_agent": {
       "kind": "function_v0",
       "spec": {
@@ -951,6 +1172,22 @@
         "doc": "Applies the pending price policy once its delay has passed. Permissionless.",
         "inputs": [],
         "name": "execute_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_trace_policy",
         "outputs": [
           {
             "result": {
@@ -1404,6 +1641,46 @@
         ]
       }
     },
+    "propose_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "propose_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "queue_bounds": {
       "kind": "function_v0",
       "spec": {
@@ -1417,6 +1694,61 @@
                 "u64",
                 "u64"
               ]
+            }
+          }
+        ]
+      }
+    },
+    "queue_page": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Live tickets with ids in `[start, start + limit)` (`limit` capped at `MAX_QUEUE_PAGE`), in queue order. Holes are skipped, so a page can hold fewer than `limit` rows; continue from `start + limit`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "queue_page",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": {
+                "udt": {
+                  "name": "QueueEntry"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "queue_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Position of `ticket_id` in the queue, or `None` if it is not live. Walks at most `MAX_POSITION_SCAN` ids ahead of it (`truncated` otherwise).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "queue_position",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "QueuePosition"
+                }
+              }
             }
           }
         ]
@@ -1525,6 +1857,41 @@
         ]
       }
     },
+    "redeem_many": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Redeems the treasury's positions in up to `MAX_BATCH` markets in one call (market-core issue #15), delegating to market-core's `redeem_many`. `market_ids` must be strictly ascending; markets that cannot be paid out right now are reported as skipped rather than aborting the batch. The single aggregated token transfer at the end amortizes fixed per-call costs, keeping the treasury inside the per-transaction resource limits even when it holds positions in many markets. (`ROLE_SETTLE`.)",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "redeem_many",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "remove_agent": {
       "kind": "function_v0",
       "spec": {
@@ -1550,7 +1917,7 @@
     "request_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket (FIFO, paid by `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
+        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket. Queued tickets are paid automatically by every transaction that brings collateral in (`drain_queue`, #277), pro rata within the `QUEUE_WINDOW` head window. Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
         "inputs": [
           {
             "doc": "",
@@ -1859,6 +2226,53 @@
         ]
       }
     },
+    "trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "trace_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "TracePolicyConfig"
+            }
+          }
+        ]
+      }
+    },
+    "transfer_ticket": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Moves `ticket_id` (and its cancellation right) from `from` to `to`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "transfer_ticket",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "window_pnl": {
       "kind": "function_v0",
       "spec": {
@@ -1957,6 +2371,92 @@
         ],
         "lib": "",
         "name": "AgentPolicy"
+      }
+    },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "BatchItem"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "BatchStatus"
       }
     },
     "CapitalBreakdown": {
@@ -2605,6 +3105,60 @@
         "name": "PricePolicy"
       }
     },
+    "QueueEntry": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One row of `queue_page`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "ticket",
+            "type_": {
+              "udt": {
+                "name": "WithdrawTicket"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "QueueEntry"
+      }
+    },
+    "QueuePosition": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Where a ticket stands in the withdrawal queue (`queue_position`).",
+        "fields": [
+          {
+            "doc": "Inside the pro-rata head window (`QUEUE_WINDOW` ids from the head).",
+            "name": "in_window",
+            "type_": "bool"
+          },
+          {
+            "doc": "Live tickets ahead of this one (holes are not counted).",
+            "name": "index",
+            "type_": "u32"
+          },
+          {
+            "doc": "Sum of `remaining` over those tickets.",
+            "name": "owed_ahead",
+            "type_": "i128"
+          },
+          {
+            "doc": "The walk stopped after `MAX_POSITION_SCAN` ids, so `index` and `owed_ahead` are lower bounds.",
+            "name": "truncated",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "QueuePosition"
+      }
+    },
     "Realized": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2859,6 +3413,104 @@
         "name": "SignerConfig"
       }
     },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "SkipReason"
+      }
+    },
+    "TracePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Off"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TracePolicy"
+      }
+    },
+    "TracePolicyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TracePolicyConfig"
+      }
+    },
     "UsageWindow": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2978,7 +3630,7 @@
     "WithdrawTicket": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Collateral still owed to `owner` for shares already burned.",
+        "doc": "Collateral still owed to `owner` for shares already burned. Layout frozen: tickets queued before the drain/cancel upgrade (#277) must still decode. Everything new lives in [`TicketMeta`].",
         "fields": [
           {
             "doc": "",
@@ -3014,7 +3666,12 @@
           {
             "doc": "Close-date bucket exposure would exceed its cap (#49).",
             "name": "BucketCapExceeded",
-            "value": 30
+            "value": 60
+          },
+          {
+            "doc": "`cancel_withdraw` before `created_at + MIN_CANCEL_DELAY`.",
+            "name": "CancelTooEarly",
+            "value": 76
           },
           {
             "doc": "",
@@ -3024,7 +3681,7 @@
           {
             "doc": "Category exposure would exceed its correlation cap (#49).",
             "name": "CategoryCapExceeded",
-            "value": 29
+            "value": 59
           },
           {
             "doc": "",
@@ -3094,7 +3751,7 @@
           {
             "doc": "`agent_create_market_and_reveal` was given a malformed resolution envelope or a rule outside the two primary modes (#64).",
             "name": "InvalidResolution",
-            "value": 33
+            "value": 63
           },
           {
             "doc": "",
@@ -3108,8 +3765,68 @@
           },
           {
             "doc": "",
+            "name": "MarketCoreAlreadyClaimed",
+            "value": 2038
+          },
+          {
+            "doc": "Cross-contract market-core errors, mapped into the treasury's own range by `core_call` / `map_market_core_code` (docs/adr/0006-cross-contract-errors.md, #60).",
+            "name": "MarketCoreCallFailed",
+            "value": 2031
+          },
+          {
+            "doc": "",
             "name": "MarketCoreError",
             "value": 45
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientLiquidity",
+            "value": 2036
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientShares",
+            "value": 2037
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInvalidAmount",
+            "value": 2040
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketClosed",
+            "value": 2035
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotFound",
+            "value": 2032
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotOpen",
+            "value": 2034
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNotFinal",
+            "value": 2033
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNothingToRedeem",
+            "value": 2039
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreOverflow",
+            "value": 2041
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreSlippageExceeded",
+            "value": 2042
           },
           {
             "doc": "",
@@ -3129,7 +3846,7 @@
           {
             "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
             "name": "NoPendingAdmin",
-            "value": 31
+            "value": 61
           },
           {
             "doc": "",
@@ -3169,7 +3886,7 @@
           {
             "doc": "A proposed admin handover was not accepted within its `expires_at`.",
             "name": "PendingAdminExpired",
-            "value": 32
+            "value": 62
           },
           {
             "doc": "",
@@ -3202,6 +3919,11 @@
             "value": 27
           },
           {
+            "doc": "The ticket predates #277 (no `TicketMeta`) and cannot be cancelled; it still drains and can be transferred.",
+            "name": "TicketNotCancellable",
+            "value": 75
+          },
+          {
             "doc": "",
             "name": "TicketNotFound",
             "value": 22
@@ -3215,6 +3937,61 @@
             "doc": "",
             "name": "TooManyOpenMarkets",
             "value": 18
+          },
+          {
+            "doc": "",
+            "name": "TraceAgentMismatch",
+            "value": 67
+          },
+          {
+            "doc": "",
+            "name": "TraceConsumed",
+            "value": 70
+          },
+          {
+            "doc": "",
+            "name": "TraceDecisionMismatch",
+            "value": 65
+          },
+          {
+            "doc": "",
+            "name": "TraceFlagged",
+            "value": 68
+          },
+          {
+            "doc": "",
+            "name": "TraceMismatch",
+            "value": 66
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyNotPending",
+            "value": 73
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyPending",
+            "value": 72
+          },
+          {
+            "doc": "",
+            "name": "TraceRegistryCallFailed",
+            "value": 71
+          },
+          {
+            "doc": "",
+            "name": "TraceRequired",
+            "value": 64
+          },
+          {
+            "doc": "",
+            "name": "TraceStale",
+            "value": 69
+          },
+          {
+            "doc": "",
+            "name": "TraceTimelockActive",
+            "value": 74
           },
           {
             "doc": "",
@@ -3970,6 +4747,26 @@
         ]
       }
     },
+    "QueueDrainSkipped": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "A drain hit an arithmetic overflow and stopped; the entrypoint that brought the proceeds still succeeded (settlement never fails because of the queue). `paid` is what was paid before the stop.",
+        "lib": "",
+        "name": "QueueDrainSkipped",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paid",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "queue_drain_skipped"
+        ]
+      }
+    },
     "SuccessorSet": {
       "kind": "event_v0",
       "spec": {
@@ -3997,6 +4794,38 @@
         ],
         "prefix_topics": [
           "successor_set"
+        ]
+      }
+    },
+    "TicketTransferred": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "TicketTransferred",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "ticket_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "to",
+            "type_": "address"
+          }
+        ],
+        "prefix_topics": [
+          "ticket_transferred"
         ]
       }
     },
@@ -4041,6 +4870,44 @@
         ],
         "prefix_topics": [
           "trade_authorized"
+        ]
+      }
+    },
+    "WithdrawCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "`cancel_withdraw`: the ticket's `assets` went back into the vault and `shares` were re-minted to `owner`.",
+        "lib": "",
+        "name": "WithdrawCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "ticket_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "assets",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "withdraw_cancelled"
         ]
       }
     },

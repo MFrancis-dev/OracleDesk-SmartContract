@@ -7,7 +7,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, Symbol, Vec,
+    Bytes, BytesN, Env, Vec,
 };
 
 // market-core is imported from its compiled wasm rather than as a normal
@@ -72,12 +72,9 @@ pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
+// `OracleAsset` is re-exported from `oracledesk-types` above (its canonical
+// home, PR #176); a second local definition would be a different XDR type
+// with the same name.
 
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
@@ -495,6 +492,106 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+
+    // --- market-core error mappings (canonical cross-contract model, #60,
+    // docs/adr/0006-cross-contract-errors.md) ------------------------------
+    /// The market-core invocation itself failed (host error, trap, or an
+    /// unmapped market-core error).
+    MarketCoreCallFailed = 1042,
+    MarketCoreMarketNotFound = 1043,
+    MarketCoreNotFinal = 1044,
+    MarketCoreMarketNotOpen = 1045,
+    MarketCoreMarketClosed = 1046,
+    MarketCoreInsufficientLiquidity = 1047,
+    MarketCoreInsufficientShares = 1048,
+    MarketCoreAlreadyClaimed = 1049,
+    MarketCoreNothingToRedeem = 1050,
+    MarketCoreInvalidAmount = 1051,
+    MarketCoreOverflow = 1052,
+    MarketCoreSlippageExceeded = 1053,
+
+    // --- reasoning-registry error mappings ---------------------------------
+    /// A reasoning-registry invocation failed (host error or unmapped error).
+    RegistryCallFailed = 1054,
+}
+
+/// Maps a market-core error into the resolver's own disjoint range. Only the
+/// conditions the resolver can meaningfully react to get a named variant; the
+/// rest collapse to [`Error::MarketCoreCallFailed`] rather than leaking
+/// market-core's numeric code through the resolver ABI.
+pub fn map_market_core_error(error: market_core::Error) -> Error {
+    use market_core::Error as Core;
+    match error {
+        Core::MarketNotFound => Error::MarketCoreMarketNotFound,
+        Core::NotFinal => Error::MarketCoreNotFinal,
+        Core::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        Core::MarketClosed => Error::MarketCoreMarketClosed,
+        Core::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        Core::InsufficientShares => Error::MarketCoreInsufficientShares,
+        Core::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        Core::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        Core::InvalidAmount => Error::MarketCoreInvalidAmount,
+        Core::Overflow => Error::MarketCoreOverflow,
+        Core::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Converts the shared `Outcome` into the `contractimport!`-generated
+/// market-core `Outcome`. They are structurally identical, but they are
+/// distinct Rust types.
+fn to_core_outcome(outcome: &Outcome) -> market_core::Outcome {
+    match outcome {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+    }
+}
+
+/// Runs a generated `try_*` market-core call, mapping both the callee error
+/// and a host/invocation failure into resolver variants. This is the *only*
+/// shape a cross-contract market-core call may take; the panicking generated
+/// methods are never used (they would abort with market-core's code).
+///
+/// soroban-sdk 27's `try_*` shape is
+/// `Result<Result<T, ConversionError>, Result<CalleeError, InvokeError>>`.
+/// Entrypoints that do not return `Result` surface a plain
+/// `soroban_sdk::Error`, which carries no market-core variant and collapses
+/// to `MarketCoreCallFailed`.
+fn core_call<T, C, E: CoreCallError>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Err(Ok(error)) => Err(error.into_resolver_error()),
+        Ok(Err(_)) | Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+trait CoreCallError {
+    fn into_resolver_error(self) -> Error;
+}
+
+impl CoreCallError for market_core::Error {
+    fn into_resolver_error(self) -> Error {
+        map_market_core_error(self)
+    }
+}
+
+impl CoreCallError for soroban_sdk::Error {
+    fn into_resolver_error(self) -> Error {
+        Error::MarketCoreCallFailed
+    }
+}
+
+/// Runs a generated `try_*` reasoning-registry call, mapping every failure
+/// into [`Error::RegistryCallFailed`].
+fn registry_call<T, C, E>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_) => Err(Error::RegistryCallFailed),
+    }
 }
 
 #[contracttype]
@@ -1039,6 +1136,8 @@ impl Resolver {
         let rule = ResolutionSpec::Committee(spec);
         Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
         Self::store_rule(&env, market_id, &rule);
+        let close_time = Self::market_close_time(&env, market_id)?;
+        Self::bump_market_entries(&env, market_id, close_time);
         Ok(())
     }
 
@@ -2955,6 +3054,10 @@ impl Resolver {
 
     fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
         let storage = env.storage().persistent();
+        // No fixed-length bump here: callers sweep every per-market entry
+        // to its close-time-aware target with `bump_market_entries` (#16). A
+        // fixed 60-day extend would leave the TTL above that sweep's
+        // threshold and below the settlement horizon.
         let (_key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
@@ -2987,7 +3090,6 @@ impl Resolver {
                 (key, ResolutionState::HybridPricePending)
             }
         };
-        storage.extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
         if let Some((_, policy)) = Self::evidence_config_internal(env) {
             let p_key = DataKey::EvidencePolicy(market_id);
             storage.set(&p_key, &policy);
@@ -3304,6 +3406,8 @@ impl Resolver {
             DataKey::Signers(market_id),
             DataKey::WeightedKeys(market_id),
             DataKey::Disputable(market_id),
+            DataKey::CommitteeSpec(market_id),
+            DataKey::Hybrid(market_id),
             DataKey::Proposal(market_id),
             DataKey::ProposalV2(market_id),
             DataKey::Snapshot(market_id),
@@ -3339,7 +3443,7 @@ mod test {
             Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke,
         },
         token::{self, StellarAssetClient},
-        BytesN, IntoVal,
+        BytesN, IntoVal, Symbol,
     };
 
     // ---- dual registration of market-core (coverage, issue #75) ---------------
@@ -3912,7 +4016,7 @@ mod test {
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -3941,7 +4045,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4234,7 +4338,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
@@ -4476,7 +4580,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4957,7 +5061,7 @@ mod test {
         open(&d);
         let treasury = d.f.market_core.get_config().treasury;
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
         assert_eq!(
             d.f.resolver.state(&d.f.market_id),
             ResolutionState::Finalized
@@ -4979,7 +5083,7 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::Yes));
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_escrow(&d, 0);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -5039,7 +5143,7 @@ mod test {
         assert_eq!(status(&d), MarketStatus::Open);
         d.f.resolver
             .escalation_attest(&d.f.market_id, &d.members[2], &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::Yes));
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
@@ -5192,7 +5296,7 @@ mod test {
                 },
             }])
             .settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     #[test]
@@ -5364,7 +5468,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5387,6 +5491,32 @@ mod test {
         f.resolver
             .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
         assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
+    }
+
+    /// Finding of `fuzz_resolver_spec_decode` (issue #278): a `Signers` rule
+    /// listing the same address twice passes `validate_rule` with a
+    /// threshold only reachable by counting that address twice, but
+    /// `record_attestation` dedups per address, so the market can never
+    /// reach quorum. Not fixed here (the issue keeps fixes in separate PRs):
+    /// tracked by this ignored regression test and the fuzz allow-list entry
+    /// `dup-signers` (fuzz/README.md). Un-ignore with the fix.
+    #[test]
+    #[ignore = "tracked finding dup-signers (#278): validate_rule accepts duplicate signer addresses"]
+    fn signers_rule_rejects_duplicate_addresses() {
+        let f = fixture(|env, _r, a, _b| {
+            ResolutionSpec::Signers(SignerConfig {
+                signers: Vec::from_array(env, [a.clone(), a.clone()]),
+                threshold: 2,
+                dispute_window: 100,
+            })
+        });
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_signer_spec(&f.market_id, &spec),
+            Err(Ok(Error::InvalidConfig))
+        );
     }
 
     #[test]
@@ -5547,7 +5677,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5666,7 +5796,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5905,7 +6035,7 @@ mod test {
         assert!(last_price_resolution(&f).from_snapshot);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6068,7 +6198,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6223,7 +6353,7 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
         // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
         assert_eq!(
@@ -6232,7 +6362,7 @@ mod test {
             Err(Ok(Error::AlreadyFinalized))
         );
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
     }
 
     /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
@@ -6252,7 +6382,7 @@ mod test {
         f.env.ledger().set_timestamp(2_000);
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
             Err(Ok(Error::AlreadyFinalized))
@@ -6353,7 +6483,7 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
     }
 
     /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
@@ -6446,9 +6576,9 @@ mod test {
         f.market_core.accept_resolver();
 
         f.env.ledger().set_timestamp(2_000);
-        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core.resolve(&f.market_id, &market_core::Outcome::No);
 
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::No));
         // This resolver saw none of it: no votes, still "pending", and it
         // can no longer move the market (market-core rejects it as resolver).
         assert_eq!(
@@ -6464,7 +6594,7 @@ mod test {
         attest_both(&f, AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     /// Everything observable about market-core through a resolver scenario,
@@ -6478,25 +6608,25 @@ mod test {
         let mut t = std::vec::Vec::new();
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "quote {}",
-            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+            f.market_core.quote_buy(&id, &market_core::Outcome::Yes, &(10 * one))
         ));
         t.push(format!(
             "buy {}",
             f.market_core
-                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+                .buy(&creator, &id, &market_core::Outcome::Yes, &(10 * one), &0)
         ));
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "sell {}",
             f.market_core
-                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+                .sell(&creator, &id, &market_core::Outcome::Yes, &(3 * one), &(100 * one))
         ));
         t.push(format!(
             "pos {:?}",
@@ -6602,7 +6732,7 @@ mod shared_types {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
         assert_eq!(
-            oracledesk_types::MarketStatus::Resolved(Outcome::Yes).to_xdr(&env),
+            oracledesk_types::MarketStatus::Resolved(oracledesk_types::Outcome::Yes).to_xdr(&env),
             market_core::MarketStatus::Resolved(market_core::Outcome::Yes).to_xdr(&env)
         );
         assert_eq!(
@@ -6699,7 +6829,7 @@ mod golden {
     #[test]
     fn golden_legacy_price_spec_hashes() {
         let env = Env::default();
-        let xlm = || OracleAsset::Other(Symbol::new(&env, "XLM"));
+        let xlm = || OracleAsset::Other(soroban_sdk::Symbol::new(&env, "XLM"));
         let asset = |id: &str| OracleAsset::Stellar(Address::from_str(&env, id));
         let vectors = [
             (

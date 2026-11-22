@@ -1224,16 +1224,58 @@ standard HTTP instructions and payment challenge headers.
 Settled/delivered retries return the original stored body and PAYMENT-RESPONSE
 without another facilitator call or gateway fetch. The original raw bytes are
 stored and hash-checked again on replay, so a changed registry record cannot
-change what was purchased. Retries expire at the original persisted deadline,
-bounded by transaction time bounds or maxTimeoutSeconds; expired payments get
-402. Finite ledger bounds and Soroban authorization expirations are checked
-against a live ledger on both first use and replay, using the corresponding
-`STELLAR_TESTNET_RPC_URL` or `STELLAR_MAINNET_RPC_URL`. Failure to obtain that
-anchor fails closed. Database/state conflicts are never auto-settled again.
+change what was purchased. A *new* payment expires at its persisted deadline,
+bounded by transaction time bounds or maxTimeoutSeconds (expired: 402), and its
+finite ledger bounds and Soroban authorization expirations are checked against a
+live ledger using the corresponding `STELLAR_TESTNET_RPC_URL` or
+`STELLAR_MAINNET_RPC_URL` (no anchor: fail closed). A *settled* payment is
+instead replayable for `X402_REDELIVERY_WINDOW_SECS` (default 900) after
+settlement, independent of those authorization bounds, so a buyer whose download
+failed after being charged can re-fetch with the same payment; after the window
+the replay gets 410. Database/state conflicts are never auto-settled again.
+
+#### Refunds for undelivered payments (#279)
+
+A first delivery is recorded (`delivered`) only when the response finishes; a
+client abort or crash between settlement and `finish` leaves the entry
+`settled`. A replay claims delivery with a CAS (`settled → delivered`) *before*
+sending, so a re-download racing the refund sweeper yields exactly one outcome:
+delivered (never refunded) or `refund_pending` (the replay answers 410).
+
+With `X402_REFUNDS_ENABLED=1` the server runs a sweeper every
+`X402_REFUND_SWEEP_MS` (default 60 s, at most `X402_REFUND_BATCH`, default 10,
+entries per tick; stopped on SIGINT/SIGTERM before the ledger closes). An entry
+is refund-eligible when it is `settled` with no `delivered` transition, has a
+`settlementTx` and a valid `G...`/`C...` payer, and its redelivery window has
+passed. States: `settled → refund_pending → refunding → refunded |
+refund_failed`, each a ledger CAS. The refund is a SEP-41
+`transfer(refund_account, payer, amount)` on the payment's own asset contract,
+built from the dedicated account `X402_REFUND_SECRET` (the server never holds
+`payTo` keys), simulated, assembled and signed; its hash and signed XDR are
+written to the `refunds` table **before** `sendTransaction`, and the executor
+polls `getTransaction` until SUCCESS/FAILED or the transaction's time bound. On
+restart a `refunding` entry is resumed by hash: a known outcome is recorded, an
+unknown hash is waited on until its time bound passes and only then rebuilt
+with a fresh sequence number, so one payment never yields two refund
+transactions. RPC and passphrase come from the entry's network. Failed
+simulations or transactions retry with backoff up to
+`X402_REFUND_MAX_ATTEMPTS` (default 5), then end in `refund_failed`.
+
+Payments above `X402_REFUND_AUTO_APPROVE_MAX` (base units, default 1000000 =
+0.1 USDC) and any refund that would push the rolling `X402_REFUND_WINDOW_SECS`
+(default 86400) total above `X402_REFUND_WINDOW_CAP` (default 100000000) park in
+`refund_pending` with `refundReview` set (the cap logs
+`x402_refund_cap_reached`). Operators use `GET /admin/refunds?state=&cursor=`
+and `POST /admin/refunds/:paymentId/approve|reject` (same bearer token as the
+payments endpoint). The SQLite ledger is at schema version 2: the v1 → v2
+migration adds the `refunds` table and a `payments(state, updated_at)` index in
+one transaction, and unknown versions are still refused. Disputes about the
+content of delivered traces are out of scope here.
 
 `GET /admin/payments/:paymentId` requires `Authorization: Bearer X402_ADMIN_TOKEN`
 and is disabled if unset. It returns purchase state and transaction/payer fields,
 with raw trace bytes, response content and requirement keys redacted. The SQLite
 file is permissioned to its owner and git-ignored. Back it up as sensitive
-purchase history. This design supports one service process; shared multi-instance
-locking, refunds and automatic indeterminate reconciliation remain separate work.
+purchase history. The admin view also shows `refundId`/`refundTx`. This design
+supports one service process (one writer per ledger file); shared multi-instance
+locking and automatic indeterminate reconciliation remain separate work.

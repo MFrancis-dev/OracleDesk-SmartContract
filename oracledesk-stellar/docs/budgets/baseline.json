@@ -163,6 +163,60 @@
       "read_bytes": 0,
       "write_bytes": 0,
       "events_bytes": 0
+    },
+    "treasury.cancel_withdraw.markets_12": {
+      "cpu_insns": 21500431,
+      "mem_bytes": 32047636,
+      "read_entries": 47,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 2892,
+      "events_bytes": 216
+    },
+    "treasury.claim_withdraw.pro_rata_window": {
+      "cpu_insns": 5891927,
+      "mem_bytes": 1936114,
+      "read_entries": 20,
+      "write_entries": 18,
+      "read_bytes": 0,
+      "write_bytes": 6580,
+      "events_bytes": 2976
+    },
+    "treasury.deposit.markets_12_tickets_8": {
+      "cpu_insns": 27481384,
+      "mem_bytes": 33324997,
+      "read_entries": 62,
+      "write_entries": 21,
+      "read_bytes": 0,
+      "write_bytes": 7020,
+      "events_bytes": 3440
+    },
+    "treasury.settle_market.queue_0": {
+      "cpu_insns": 9151678,
+      "mem_bytes": 11556380,
+      "read_entries": 18,
+      "write_entries": 12,
+      "read_bytes": 0,
+      "write_bytes": 4144,
+      "events_bytes": 1020
+    },
+    "treasury.settle_market.queue_1": {
+      "cpu_insns": 10141648,
+      "mem_bytes": 11618974,
+      "read_entries": 21,
+      "write_entries": 15,
+      "read_bytes": 0,
+      "write_bytes": 4512,
+      "events_bytes": 1392
+    },
+    "treasury.settle_market.queue_8": {
+      "cpu_insns": 14448654,
+      "mem_bytes": 12431954,
+      "read_entries": 42,
+      "write_entries": 36,
+      "read_bytes": 0,
+      "write_bytes": 6080,
+      "events_bytes": 3996
     }
   }
 }

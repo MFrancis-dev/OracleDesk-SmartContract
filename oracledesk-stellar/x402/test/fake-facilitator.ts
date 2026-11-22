@@ -17,6 +17,8 @@ export async function fakeFacilitator(networks: string[]) {
     verifyLatencyMs: 0,
     beforeVerify: undefined as (() => Promise<void>) | undefined,
     beforeSettle: undefined as (() => Promise<void>) | undefined,
+    /** Payer reported by verify/settle (a strkey makes the payment refundable). */
+    payer: "test-payer",
   };
   const app = express();
   app.use(express.json());
@@ -44,7 +46,7 @@ export async function fakeFacilitator(networks: string[]) {
     res.json({
       isValid: knobs.valid,
       ...(knobs.valid
-        ? { payer: "test-payer" }
+        ? { payer: knobs.payer }
         : { invalidReason: "invalid_payment" }),
     });
   });
@@ -61,7 +63,7 @@ export async function fakeFacilitator(networks: string[]) {
       success: knobs.success,
       transaction: "fake-settlement-tx",
       network: req.body.paymentRequirements.network,
-      payer: "test-payer",
+      payer: knobs.payer,
       ...(!knobs.success ? { errorReason: "settlement_failed" } : {}),
     });
   });
