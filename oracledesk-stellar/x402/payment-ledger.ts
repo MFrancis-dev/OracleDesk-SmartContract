@@ -47,6 +47,12 @@ export interface PaymentEntry {
   error?: string;
   reconciledAt?: number;
   reconcileReason?: string;
+  /** #330: issuing server's clock (unix secs) when settlement was recorded. */
+  settledAt?: number;
+  /** #330: signed `oracledesk-x402-receipt-v1`, issued once in the settled CAS. */
+  receipt?: string;
+  /** #330: receipt issued lazily on replay for a pre-receipt settlement. */
+  receiptBackfilled?: boolean;
   expiresAt: number;
   createdAt: number;
   updatedAt: number;
@@ -67,6 +73,8 @@ export interface PaymentLedger {
   ): Promise<PaymentEntry>;
   get(id: string): Promise<PaymentEntry | undefined>;
   reconcileStuck(olderThanMs: number): Promise<number>;
+  /** #328: entries per state, sampled by the metrics scrape (not per request). */
+  countByState(): Promise<Partial<Record<PaymentState, number>>>;
   close(): void;
 }
 export class LedgerConflict extends Error {}
@@ -88,6 +96,9 @@ function updated(
     error,
     reconciledAt,
     reconcileReason,
+    settledAt,
+    receipt,
+    receiptBackfilled,
   } = patch;
   return {
     ...entry,
@@ -104,6 +115,9 @@ function updated(
         error,
         reconciledAt,
         reconcileReason,
+        settledAt,
+        receipt,
+        receiptBackfilled,
       }).filter(([, v]) => v !== undefined),
     ),
     state: to,
@@ -155,6 +169,12 @@ export class MemoryPaymentLedger implements PaymentLedger {
       }
     return count;
   }
+  async countByState() {
+    const counts: Partial<Record<PaymentState, number>> = {};
+    for (const e of this.entries.values())
+      counts[e.state] = (counts[e.state] ?? 0) + 1;
+    return counts;
+  }
   close() {}
 }
 export class SqlitePaymentLedger implements PaymentLedger {
@@ -167,11 +187,12 @@ export class SqlitePaymentLedger implements PaymentLedger {
     this.db
       .exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
       INSERT OR IGNORE INTO schema_version VALUES (1);
-      CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, entry TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, entry TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS payments_state ON payments(state);`);
     const versions = this.db
       .prepare("SELECT version FROM schema_version")
       .all() as { version: number }[];
-    if (versions.length !== 1 || versions[0].version !== 1) {
+    if (versions.length !== 1 || versions[0]?.version !== 1) {
       this.db.close();
       throw new Error("Unsupported payment ledger schema");
     }
@@ -235,6 +256,15 @@ export class SqlitePaymentLedger implements PaymentLedger {
         { error: "Interrupted payment; inspect before reconciliation" },
       );
     return rows.length;
+  }
+  async countByState() {
+    // Index-only GROUP BY over `payments_state`; run on scrape only.
+    const rows = this.db
+      .prepare("SELECT state, COUNT(*) AS n FROM payments GROUP BY state")
+      .all() as { state: PaymentState; n: number }[];
+    return Object.fromEntries(rows.map((r) => [r.state, r.n])) as Partial<
+      Record<PaymentState, number>
+    >;
   }
   close() {
     this.db.close();

@@ -17,6 +17,7 @@ export async function fakeFacilitator(networks: string[]) {
     verifyLatencyMs: 0,
     beforeVerify: undefined as (() => Promise<void>) | undefined,
     beforeSettle: undefined as (() => Promise<void>) | undefined,
+    settlementTx: "ab".repeat(32),
   };
   const app = express();
   app.use(express.json());
@@ -59,7 +60,8 @@ export async function fakeFacilitator(networks: string[]) {
     await new Promise((r) => setTimeout(r, knobs.settleLatencyMs));
     res.json({
       success: knobs.success,
-      transaction: "fake-settlement-tx",
+      // A Stellar tx hash is 64 lowercase hex (receipts validate it, #330).
+      transaction: knobs.settlementTx,
       network: req.body.paymentRequirements.network,
       payer: "test-payer",
       ...(!knobs.success ? { errorReason: "settlement_failed" } : {}),
