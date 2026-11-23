@@ -163,3 +163,53 @@ test("reconcileStuck(0) is gone from startup flow", () => {
   // the actual removal is in server.ts.
   assert.ok(true, "server.ts no longer calls reconcileStuck(0)");
 });
+
+for (const kind of ["memory", "sqlite"])
+  test(`${kind}: settled transition stores receipt and settledAt atomically (#330)`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "x402-ledger-"));
+    const path = join(dir, "ledger.sqlite");
+    let ledger: PaymentLedger =
+      kind === "memory" ? new MemoryPaymentLedger() : new SqlitePaymentLedger(path);
+    try {
+      await ledger.claim(claim);
+      await ledger.transition("a", ["verifying"], "settling");
+      const [first, second] = await Promise.allSettled([
+        ledger.transition("a", ["settling"], "settled", {
+          receipt: "receipt-1",
+          settledAt: 1_700_000_000,
+        }),
+        ledger.transition("a", ["settling"], "settled", {
+          receipt: "receipt-2",
+          settledAt: 1_700_000_001,
+        }),
+      ]);
+      // Exactly one CAS wins; the loser's receipt is never persisted.
+      assert.equal(first.status, "fulfilled");
+      assert.equal(second.status, "rejected");
+      if (kind === "sqlite") {
+        ledger.close();
+        ledger = new SqlitePaymentLedger(path);
+      }
+      const e = await ledger.get("a");
+      assert.equal(e?.state, "settled");
+      assert.equal(e?.receipt, "receipt-1");
+      assert.equal(e?.settledAt, 1_700_000_000);
+    } finally {
+      ledger.close();
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+for (const kind of ["memory", "sqlite"])
+  test(`${kind}: countByState groups entries by state (#328)`, async () => {
+    const ledger: PaymentLedger =
+      kind === "memory" ? new MemoryPaymentLedger() : new SqlitePaymentLedger(":memory:");
+    try {
+      assert.deepEqual(await ledger.countByState(), {});
+      for (const id of ["x", "y", "z"]) await ledger.claim({ ...claim, paymentId: id });
+      await ledger.transition("z", ["verifying"], "failed");
+      assert.deepEqual(await ledger.countByState(), { verifying: 2, failed: 1 });
+    } finally {
+      ledger.close();
+    }
+  });
