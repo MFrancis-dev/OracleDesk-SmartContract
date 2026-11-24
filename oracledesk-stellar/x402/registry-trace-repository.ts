@@ -24,7 +24,13 @@ import type {
   TraceRepository,
 } from "./trace-api.js";
 import type { TraceVerdict } from "./trace-verification.js";
-import { classifyRegistryError, RepositoryUnavailable, TRACE_NOT_FOUND_CODE } from "./errors.js";
+import {
+  classifyRegistryError,
+  isRestoreRequired,
+  RegistryRestoreRequired,
+  RepositoryUnavailable,
+  TRACE_NOT_FOUND_CODE,
+} from "./errors.js";
 
 export type { TraceVerdict };
 
@@ -209,13 +215,16 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
         agent: result.agent,
       };
     } catch (e) {
+      // #328: only the contract's TraceNotFound (3005) means "absent".
+      // Everything else is an outage the caller must not report as 404.
+      // #329: an archived entry (simulation asks for a restore) is
+      // unavailable too, so buyers get 503 + Retry-After, not 404.
+      if (isRestoreRequired(e)) throw new RegistryRestoreRequired(traceId);
       const classified = classifyRegistryError(e);
-      // TraceNotFound (3005) → no record; any other error → surface it.
       if (classified.kind === "contract" && classified.code === TRACE_NOT_FOUND_CODE) {
         return undefined;
       }
-      // RPC failure: surface as undefined (caller gets 404-equivalent).
-      return undefined;
+      throw new RepositoryUnavailable(classified);
     }
   }
 

@@ -1,11 +1,11 @@
 #![no_std]
 
-mod math;
+pub mod math;
 #[cfg(kani)]
 mod math_proofs;
 pub mod ttl;
 
-use math::{MathError, Settlement, BPS, MAX_SETS};
+use math::{MathError, SettleLedger, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
     Address, Bytes, BytesN, Env, String, Vec,
@@ -188,8 +188,11 @@ pub struct SettleState {
     /// Redemption window, snapshotted at creation from the admin default.
     /// `redeem_deadline = finalized_at + horizon_secs`.
     pub horizon_secs: u64,
-    /// Collateral already paid to holders and the LP (`redeem` +
-    /// `claim_pool_remainder` payouts); tracks what has left the market.
+    /// Share/pool collateral already paid to holders and the LP (`redeem`
+    /// payouts + the pool value of `claim_pool_remainder`); tracks what of
+    /// `sets_minted` has left the market. LP fees paid alongside the pool
+    /// remainder are **not** counted here: they never entered `sets_minted`
+    /// (issue #276, see docs/formal-verification.md "Settlement").
     pub paid_out: i128,
     /// `finalize_market` has swept the market's remaining balance; no
     /// redemption or claim can ever pay out again.
@@ -1556,16 +1559,19 @@ impl MarketCore {
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
-        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
-            if settle.closed {
-                return Err(Error::RedemptionClosed);
-            }
+        let settle = Self::load_settle_opt(&env, market_id);
+        if settle.as_ref().is_some_and(|s| s.closed) {
+            return Err(Error::RedemptionClosed);
         }
         let pos = Self::load_position(&env, market_id, &holder, m.close_time);
         if pos.yes == 0 && pos.no == 0 {
             return Err(Error::NothingToRedeem);
         }
-        let payout = math::settle_value(kind, pos.yes, pos.no);
+        // Pure settlement arithmetic (math::apply_redeem, proved in
+        // math_proofs.rs): both sides decrement even when only one pays, so
+        // a losing-side redemption still clears its outstanding shares.
+        let mut ledger = Self::settle_ledger(&m, settle.as_ref(), 0);
+        let payout = math::apply_redeem(&mut ledger, kind, pos.yes, pos.no)?;
 
         Self::save_position(
             &env,
@@ -1574,18 +1580,8 @@ impl MarketCore {
             &Position { yes: 0, no: 0 },
             m.close_time,
         );
-        // Both sides decrement even when only one pays: the shares are no
-        // longer outstanding, so a losing-side redemption still clears here.
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
-            settle.outstanding_yes = settle
-                .outstanding_yes
-                .checked_sub(pos.yes)
-                .ok_or(Error::Overflow)?;
-            settle.outstanding_no = settle
-                .outstanding_no
-                .checked_sub(pos.no)
-                .ok_or(Error::Overflow)?;
-            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+        if let Some(mut settle) = settle {
+            Self::write_settle_ledger(&mut settle, &ledger);
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
@@ -1606,26 +1602,24 @@ impl MarketCore {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let kind = Self::settlement(&m)?;
-        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
-            if settle.closed {
-                return Err(Error::RedemptionClosed);
-            }
+        let settle = Self::load_settle_opt(&env, market_id);
+        if settle.as_ref().is_some_and(|s| s.closed) {
+            return Err(Error::RedemptionClosed);
         }
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
-        let pool_value = math::settle_value(kind, m.reserve_yes, m.reserve_no);
-        let payout = pool_value
-            .checked_add(Self::load_lp_fees(&env, market_id))
-            .ok_or(Error::Overflow)?;
-        Self::save_lp_fees(&env, market_id, 0);
-        m.reserve_yes = 0;
-        m.reserve_no = 0;
-        m.lp_claimed = true;
+        // Pool value goes to `paid_out`; the LP-fee part does not, because
+        // LP fees were never part of `sets_minted` (math::apply_pool_claim).
+        let lp_fees = Self::load_lp_fees(&env, market_id);
+        let mut ledger = Self::settle_ledger(&m, settle.as_ref(), lp_fees);
+        let payout = math::apply_pool_claim(&mut ledger, kind)?;
+        Self::save_lp_fees(&env, market_id, ledger.lp_fees);
+        Self::write_market_ledger(&mut m, &ledger);
         let creator = m.creator.clone();
         Self::save_market(&env, market_id, &m);
-        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
-            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+        if let Some(mut settle) = settle {
+            Self::write_settle_ledger(&mut settle, &ledger);
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
@@ -1689,23 +1683,19 @@ impl MarketCore {
                 continue;
             }
             ttl::bump_persistent(&env, &key, ttl::market_target(&env, m.close_time));
-            let payout = math::settle_value(kind, pos.yes, pos.no);
+            // Same arithmetic as the single-market path, folded into the
+            // batch total (math::batch_redeem_step, proved equal to
+            // sequential `redeem`s by proof_batch_equals_sequential).
+            let settle = Self::load_settle_opt(&env, id);
+            let mut ledger = Self::settle_ledger(&m, settle.as_ref(), 0);
+            let next_total = math::batch_redeem_step(total, &mut ledger, kind, pos.yes, pos.no)?;
+            let payout = next_total - total;
+            total = next_total;
             Self::save_position(&env, id, &holder, &Position { yes: 0, no: 0 }, m.close_time);
-            // Both sides decrement even when only one pays (same as the
-            // single-market path).
-            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
-                settle.outstanding_yes = settle
-                    .outstanding_yes
-                    .checked_sub(pos.yes)
-                    .ok_or(Error::Overflow)?;
-                settle.outstanding_no = settle
-                    .outstanding_no
-                    .checked_sub(pos.no)
-                    .ok_or(Error::Overflow)?;
-                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+            if let Some(mut settle) = settle {
+                Self::write_settle_ledger(&mut settle, &ledger);
                 Self::save_settle(&env, id, &settle);
             }
-            total = total.checked_add(payout).ok_or(Error::Overflow)?;
             Redeemed {
                 market_id: id,
                 holder: holder.clone(),
@@ -1768,17 +1758,17 @@ impl MarketCore {
                 items.push_back(Self::batch_skip(id, SkipReason::AlreadyClaimed));
                 continue;
             }
-            let pool_value = math::settle_value(kind, m.reserve_yes, m.reserve_no);
-            let payout = pool_value
-                .checked_add(Self::load_lp_fees(&env, id))
-                .ok_or(Error::Overflow)?;
-            Self::save_lp_fees(&env, id, 0);
-            m.reserve_yes = 0;
-            m.reserve_no = 0;
-            m.lp_claimed = true;
+            // Same arithmetic as `claim_pool_remainder` (LP fees are paid
+            // but kept out of `paid_out`).
+            let settle = Self::load_settle_opt(&env, id);
+            let lp_fees = Self::load_lp_fees(&env, id);
+            let mut ledger = Self::settle_ledger(&m, settle.as_ref(), lp_fees);
+            let payout = math::apply_pool_claim(&mut ledger, kind)?;
+            Self::save_lp_fees(&env, id, ledger.lp_fees);
+            Self::write_market_ledger(&mut m, &ledger);
             Self::save_market(&env, id, &m);
-            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
-                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+            if let Some(mut settle) = settle {
+                Self::write_settle_ledger(&mut settle, &ledger);
                 Self::save_settle(&env, id, &settle);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
@@ -1826,34 +1816,19 @@ impl MarketCore {
         if env.ledger().timestamp() < settle.finalized_at.saturating_add(settle.horizon_secs) {
             return Err(Error::RedemptionWindowOpen);
         }
-        // Upper bound on what the outstanding shares can still claim. For
-        // Yes/No this is exact; for Void, `floor((oy + on) / 2)` is at least
-        // the sum of per-holder floors (`settle_value` floors each pair), so
-        // reserving the aggregate floor never under-reserves.
-        let unclaimed_user =
-            math::settle_upper(kind, settle.outstanding_yes, settle.outstanding_no);
-        let lp_claim = if m.lp_claimed {
-            0
-        } else {
-            math::settle_value(kind, m.reserve_yes, m.reserve_no)
-        };
-        // Sets are collateralized 1:1 and `paid_out` tracks what already
-        // left the market, so remaining claims minus those two figures is
-        // non-negative: it is exactly the per-holder void rounding dust
-        // (zero for Yes/No markets). checked_sub makes that an assertion.
-        let dust = m
-            .sets_minted
-            .checked_sub(settle.paid_out)
-            .and_then(|v| v.checked_sub(unclaimed_user))
-            .and_then(|v| v.checked_sub(lp_claim))
-            .ok_or(Error::Overflow)?;
+        // math::finalize_residual reserves `settle_upper(outstanding)` for
+        // the shares still out (exact for Yes/No; for Void the aggregate
+        // floor is at least the sum of per-holder floors) plus the unclaimed
+        // pool value, and returns the share/pool residual `dust`. Kani proves
+        // `0 <= dust <= (H + 1) / 2` (0 for Yes/No) on every reachable
+        // ledger, including after the LP claimed a remainder with LP fees.
+        // The two fee legs (`fees_accrued`, unclaimed LP fees) live outside
+        // `sets_minted` and are only added by math::finalize_sweep.
         let lp_fees = Self::load_lp_fees(&env, market_id);
-        let swept = dust
-            .checked_add(unclaimed_user)
-            .and_then(|v| v.checked_add(lp_claim))
-            .and_then(|v| v.checked_add(m.fees_accrued))
-            .and_then(|v| v.checked_add(lp_fees))
-            .ok_or(Error::Overflow)?;
+        let ledger = Self::settle_ledger(&m, Some(&settle), lp_fees);
+        let residual = math::finalize_residual(&ledger, kind)?;
+        let (unclaimed_user, _lp_claim, dust) = residual;
+        let swept = math::finalize_sweep(&ledger, residual, m.fees_accrued)?;
 
         m.reserve_yes = 0;
         m.reserve_no = 0;
@@ -2469,6 +2444,45 @@ impl MarketCore {
         // the keeper (docs/wave-issues/14) until the market is finalized.
         ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
         Some(settle)
+    }
+
+    /// Builds the pure settlement view of a market (issue #276). `settle`
+    /// is `None` for legacy markets, which the ledger marks untracked so the
+    /// pure layer leaves `outstanding_*` / `paid_out` alone, exactly as the
+    /// `if let Some(settle)` guards did before the refactor.
+    fn settle_ledger(m: &Market, settle: Option<&SettleState>, lp_fees: i128) -> SettleLedger {
+        let (outstanding_yes, outstanding_no, paid_out) = match settle {
+            Some(s) => (s.outstanding_yes, s.outstanding_no, s.paid_out),
+            None => (0, 0, 0),
+        };
+        SettleLedger {
+            sets_minted: m.sets_minted,
+            outstanding_yes,
+            outstanding_no,
+            reserve_yes: m.reserve_yes,
+            reserve_no: m.reserve_no,
+            paid_out,
+            fees_paid: 0,
+            lp_fees,
+            lp_claimed: m.lp_claimed,
+            tracked: settle.is_some(),
+        }
+    }
+
+    /// Copies the pool fields of a ledger back into the `Market`.
+    fn write_market_ledger(m: &mut Market, ledger: &SettleLedger) {
+        m.reserve_yes = ledger.reserve_yes;
+        m.reserve_no = ledger.reserve_no;
+        m.lp_claimed = ledger.lp_claimed;
+    }
+
+    /// Copies the tracked fields of a ledger back into `SettleState`. The
+    /// stored layout is unchanged; `paid_out` now means share/pool
+    /// collateral only (see docs/formal-verification.md, "Settlement").
+    fn write_settle_ledger(settle: &mut SettleState, ledger: &SettleLedger) {
+        settle.outstanding_yes = ledger.outstanding_yes;
+        settle.outstanding_no = ledger.outstanding_no;
+        settle.paid_out = ledger.paid_out;
     }
 
     fn load_settle(env: &Env, id: u64) -> Result<SettleState, Error> {
@@ -4494,7 +4508,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
+    #[should_panic(expected = "Error(Contract, #28)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4579,6 +4593,92 @@ mod test {
         assert!(client.try_redeem(&trader2, &market_id).is_err());
     }
 
+    /// Regression for issue #276: the LP claims a pool remainder that
+    /// includes LP fees *before* the deadline. LP fees never entered
+    /// `sets_minted`, so counting them in `paid_out` drove the finalize
+    /// residual to `-lp_fees` and the market could never close.
+    fn finalize_after_lp_fee_claim(void: bool) {
+        // protocol_share_bps = 0: the whole trade fee goes to the LP.
+        let (env, client, creator, trader, _, collateral) = setup_market_full(0, None);
+        let trader2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&trader2, &10_000_000_000_i128);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        // Odd collateral amounts so the per-holder Void floors bite.
+        client.buy(&trader, &market_id, &Outcome::Yes, &333_333_333_i128, &0_i128);
+        client.buy(&trader2, &market_id, &Outcome::No, &77_777_777_i128, &0_i128);
+        client.buy(&trader, &market_id, &Outcome::No, &12_345_678_i128, &0_i128);
+        let lp_fees = lp_fees_stored(&env, &client, market_id);
+        assert!(lp_fees > 0, "fees must accrue to the LP");
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        if void {
+            client.void_market(&market_id);
+        } else {
+            client.resolve(&market_id, &Outcome::Yes);
+        }
+        let pos = client.get_position(&market_id, &trader);
+        if void {
+            assert_eq!((pos.yes + pos.no) % 2, 1, "want an odd void position");
+        }
+
+        // LP claims first (pool value + LP fees), then one holder redeems.
+        let m = client.get_market(&market_id);
+        let pool_value = if void {
+            (m.reserve_yes + m.reserve_no) / 2
+        } else {
+            m.reserve_yes
+        };
+        let lp_payout = client.claim_pool_remainder(&market_id);
+        assert_eq!(lp_payout, pool_value + lp_fees);
+        assert_eq!(
+            client.settle_state(&market_id).paid_out,
+            pool_value,
+            "LP fees must not be counted as share/pool collateral"
+        );
+        let trader_payout = client.redeem(&trader, &market_id);
+
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+        let m_before = client.get_market(&market_id);
+        let s_before = client.settle_state(&market_id);
+        assert_eq!(s_before.paid_out, pool_value + trader_payout);
+        let balance_before = token.balance(&client.address);
+
+        let swept = client.finalize_market(&market_id);
+
+        // Nothing stranded: the sweep is the whole remaining balance.
+        assert_eq!(swept, balance_before);
+        assert_eq!(token.balance(&client.address), 0);
+        let unclaimed = if void {
+            (s_before.outstanding_yes + s_before.outstanding_no) / 2
+        } else {
+            s_before.outstanding_yes
+        };
+        let dust = m_before.sets_minted - s_before.paid_out - unclaimed;
+        // Two redeeming legs (trader + LP): dust <= (2 + 1) / 2 = 1 for Void,
+        // exactly 0 for Yes/No.
+        if void {
+            assert!((0..=1).contains(&dust), "dust={dust}");
+        } else {
+            assert_eq!(dust, 0);
+        }
+        assert_eq!(swept, dust + unclaimed + m_before.fees_accrued);
+        assert!(client.settle_state(&market_id).closed);
+    }
+
+    #[test]
+    fn finalize_succeeds_after_large_lp_fee_claim() {
+        finalize_after_lp_fee_claim(true);
+    }
+
+    #[test]
+    fn finalize_succeeds_after_lp_fee_claim_yes_market() {
+        finalize_after_lp_fee_claim(false);
+    }
+
     #[test]
     fn redeem_before_deadline_never_underpaid() {
         let (env, client, creator, trader, _, _) = setup_market();
@@ -4617,7 +4717,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -4638,7 +4738,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4652,7 +4752,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4666,7 +4766,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #26)")]
+    #[should_panic(expected = "Error(Contract, #30)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);

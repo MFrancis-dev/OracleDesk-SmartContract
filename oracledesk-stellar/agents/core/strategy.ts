@@ -345,3 +345,65 @@ function cumulativeAt(observations: readonly PriceObservation[], t: number): big
   const b = observations[lo + 1];
   return a.cumulative + ((b.cumulative - a.cumulative) * BigInt(t - a.ts)) / BigInt(b.ts - a.ts);
 }
+
+// ─── Market fair-value sources (#331) ───────────────────────────────────────
+
+/** One market's estimate. `model` carries every input needed for replay. */
+export interface FairValueResult {
+  fairYesBps: number;
+  uncertaintyBps: number;
+  source: string;
+  /** Unix seconds of the newest observation the estimate used. */
+  observedAt: number;
+  model?: Record<string, unknown>;
+}
+
+/**
+ * A per-market fair-value estimator. Returns `null` when it has no
+ * estimate for this market (wrong rule type, stale feed, too little data):
+ * a market with no estimate is not traded.
+ */
+export interface MarketFairValueSource {
+  name: string;
+  estimate(m: { marketId: bigint; closeTime: bigint }, now: bigint): Promise<FairValueResult | null>;
+}
+
+/**
+ * Asks `sources` in order and returns the first estimate. A source that
+ * throws is treated as having no estimate (reported through `onError`), so
+ * one broken feed never blocks the others.
+ */
+export async function firstEstimate(
+  sources: readonly MarketFairValueSource[],
+  m: { marketId: bigint; closeTime: bigint },
+  now: bigint,
+  onError?: (source: string, error: unknown) => void,
+): Promise<FairValueResult | null> {
+  for (const s of sources) {
+    try {
+      const r = await s.estimate(m, now);
+      if (r) return r;
+    } catch (error) {
+      onError?.(s.name, error);
+    }
+  }
+  return null;
+}
+
+/**
+ * A market's fair value for the trader (#331): the first source's estimate,
+ * else the static `FAIR_VALUE_BPS` override (tests and dry-run only; the
+ * config rejects it in live mode), else `undefined`: the market is not
+ * traded. There is deliberately no fallback to the market's own price.
+ */
+export async function fairValueFor(
+  sources: readonly MarketFairValueSource[],
+  staticBps: number | undefined,
+  m: { marketId: bigint; closeTime: bigint },
+  now: bigint,
+  onError?: (source: string, error: unknown) => void,
+): Promise<{ fairValueBps: number; uncertaintyBps?: number; fairValue?: FairValueResult } | undefined> {
+  const estimate = await firstEstimate(sources, m, now, onError);
+  if (estimate) return { fairValueBps: estimate.fairYesBps, uncertaintyBps: estimate.uncertaintyBps, fairValue: estimate };
+  return staticBps === undefined ? undefined : { fairValueBps: staticBps };
+}
