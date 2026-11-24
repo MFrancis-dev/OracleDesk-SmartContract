@@ -15,6 +15,7 @@ export interface TraceRecord {
   traceHash: string;
   marketId?: bigint;
   agent?: string;
+  action?: string;
   /** #299: verdict from the registry's `trace_verdict`, if available. */
   verdict?: TraceVerdict;
 }

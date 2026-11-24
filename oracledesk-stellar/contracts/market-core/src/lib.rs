@@ -150,6 +150,22 @@ pub struct Position {
 }
 
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lifecycle {
+    Open,
+    Final,
+    Closed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketView {
+    pub market: Market,
+    pub lifecycle: Lifecycle,
+    pub redeem_deadline: Option<u64>,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingMarketResolver {
     pub new_resolver: Address,
@@ -236,6 +252,7 @@ pub enum SkipReason {
     AlreadyClaimed,
     NotCreator,
     Duplicate,
+    Closed,
 }
 
 /// Per-market result of a batch settlement.
@@ -434,9 +451,6 @@ pub enum Error {
     /// Inbound collateral transfer delivered fewer (or different) units than
     /// expected, e.g. a fee-on-transfer or under-delivering token (#137).
     CollateralShortfall = 32,
-    /// `create_market` used a token missing from, or disabled in, the
-    /// admin collateral allow-list (#151).
-    CollateralNotAllowed = 32,
     /// Allow-list parameters failed validation (decimals, seed bounds).
     InvalidCollateralParams = 33,
     ResolverMismatch = 34,
@@ -444,6 +458,11 @@ pub enum Error {
     MarketResolverNotReady = 36,
     MarketResolverExpired = 37,
     OldResolverConsentRequired = 38,
+    /// `create_market` used a token missing from, or disabled in, the
+    /// admin collateral allow-list (#151).
+    CollateralNotAllowed = 39,
+    /// The market was closed out and its remaining value swept.
+    MarketClosedOut = 40,
 }
 
 impl From<MathError> for Error {
@@ -524,6 +543,13 @@ pub struct MarketFinalized {
     pub unclaimed_user: i128,
     /// Rounding left over after per-holder void floors were accounted for.
     pub dust: i128,
+}
+
+#[contractevent]
+pub struct PositionsPurged {
+    #[topic]
+    pub market_id: u64,
+    pub count: u32,
 }
 
 /// Same sweep as `FeesSwept` plus the actual recipient. New event rather
@@ -1713,6 +1739,10 @@ impl MarketCore {
                     continue;
                 }
             };
+            if Self::settle_closed(&env, id) {
+                items.push_back(Self::batch_skip(id, SkipReason::Closed));
+                continue;
+            }
             if m.creator != creator {
                 items.push_back(Self::batch_skip(id, SkipReason::NotCreator));
                 continue;
@@ -1724,7 +1754,7 @@ impl MarketCore {
                     continue;
                 }
             };
-            if m.lp_claimed || Self::settle_closed(&env, id) {
+            if m.lp_claimed {
                 items.push_back(Self::batch_skip(id, SkipReason::AlreadyClaimed));
                 continue;
             }
@@ -1876,9 +1906,9 @@ impl MarketCore {
     // them is bookkeeping only: no collateral moves, `k` is untouched, and
     // the invariant `reserve_yes + Σ pos.yes == sets_minted` holds by
     // construction. Transfers are allowed while the market is Open, Paused,
-    // or final — a transfer spends no collateral, so the pause does not
-    // apply. After `redeem` the position is empty and transfers fail
-    // naturally with `InsufficientShares`.
+    // or final (including after the redemption deadline, before close-out) —
+    // a transfer spends no collateral, so the pause does not apply. Closed
+    // markets reject transfers explicitly.
 
     /// Moves `amount` shares of `outcome` from `from` to `to`.
     pub fn transfer_position(
@@ -1899,6 +1929,9 @@ impl MarketCore {
             return Err(Error::InvalidAmount);
         }
         let m = Self::load_market(&env, market_id)?;
+        if Self::settle_closed(&env, market_id) {
+            return Err(Error::MarketClosedOut);
+        }
         let mut a = Self::load_position(&env, market_id, &from, m.close_time);
         let mut b = Self::load_position(&env, market_id, &to, m.close_time);
         match outcome {
@@ -1936,6 +1969,9 @@ impl MarketCore {
     pub fn transfer_lp(env: Env, market_id: u64, new_creator: Address) -> Result<(), Error> {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
+        if Self::settle_closed(&env, market_id) {
+            return Err(Error::MarketClosedOut);
+        }
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
@@ -1985,6 +2021,33 @@ impl MarketCore {
         Self::load_market(&env, market_id)
     }
 
+    /// Returns the market and its lifecycle. Integrators must use this view
+    /// rather than `get_market` when deciding whether positions have value.
+    pub fn get_market_view(env: Env, market_id: u64) -> Result<MarketView, Error> {
+        let market = Self::load_market(&env, market_id)?;
+        let lifecycle = if Self::settle_closed(&env, market_id) {
+            Lifecycle::Closed
+        } else if market.status != MarketStatus::Open {
+            Lifecycle::Final
+        } else {
+            Lifecycle::Open
+        };
+        let redeem_deadline = Self::load_settle_opt(&env, market_id).and_then(|s| {
+            (s.finalized_at > 0).then_some(s.finalized_at.saturating_add(s.horizon_secs))
+        });
+        Ok(MarketView {
+            market,
+            lifecycle,
+            redeem_deadline,
+        })
+    }
+
+    pub fn is_closed(env: Env, market_id: u64) -> bool {
+        Self::settle_closed(&env, market_id)
+    }
+
+    /// Returns zero for a closed market. Historical amounts must be recovered
+    /// from `Redeemed`, `PositionTransferred`, and `MarketFinalized` events.
     pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
         // The TTL of the position entry tracks the market's close time. With
         // no market to anchor to (a stale id), fall back to the settlement
@@ -1993,7 +2056,36 @@ impl MarketCore {
             Ok(m) => m.close_time,
             Err(_) => env.ledger().timestamp(),
         };
+        if Self::settle_closed(&env, market_id) {
+            return Position { yes: 0, no: 0 };
+        }
         Self::load_position(&env, market_id, &holder, close_time)
+    }
+
+    /// Removes valueless position entries from a closed market. This is
+    /// permissionless and does not refund rent; it only reduces live state.
+    pub fn purge_closed_positions(
+        env: Env,
+        market_id: u64,
+        holders: Vec<Address>,
+    ) -> Result<u32, Error> {
+        Self::load_market(&env, market_id)?;
+        if holders.len() > MAX_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        if !Self::settle_closed(&env, market_id) {
+            return Err(Error::NotFinal);
+        }
+        let mut count = 0u32;
+        for holder in holders.iter() {
+            let key = DataKey::Position(market_id, holder);
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                count = count.checked_add(1).ok_or(Error::Overflow)?;
+            }
+        }
+        PositionsPurged { market_id, count }.publish(&env);
+        Ok(count)
     }
 
     /// Outstanding-share accounting for a market (issue #14).
@@ -2223,6 +2315,8 @@ impl MarketCore {
             return Err(Error::CollateralShortfall);
         }
         Ok(())
+    }
+
     fn market_resolver_of(env: &Env, market_id: u64) -> Result<Address, Error> {
         let key = DataKey::MarketResolver(market_id);
         if let Some(resolver) = env.storage().persistent().get(&key) {
@@ -3877,6 +3971,84 @@ mod test {
     }
 
     // ----- #13: transferable positions and LP role --------------------------
+
+    #[test]
+    fn market_view_and_positions_reflect_close_out() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert_eq!(client.get_market_view(&market_id).lifecycle, Lifecycle::Open);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_eq!(client.get_market_view(&market_id).lifecycle, Lifecycle::Final);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+
+        assert!(client.is_closed(&market_id));
+        let view = client.get_market_view(&market_id);
+        assert_eq!(view.lifecycle, Lifecycle::Closed);
+        assert_eq!(client.get_position(&market_id, &trader), Position { yes: 0, no: 0 });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #40)")]
+    fn transfer_position_rejected_after_close_out() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+        client.transfer_position(
+            &trader,
+            &Address::generate(&env),
+            &market_id,
+            &Outcome::Yes,
+            &1_i128,
+        );
+    }
+
+    #[test]
+    fn purge_closed_positions_removes_entries_and_rejects_open() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = new_market(&env, &client, &creator, 5000);
+        assert_eq!(
+            client.try_purge_closed_positions(&market_id, &soroban_sdk::vec![&env, trader.clone()]),
+            Err(Ok(Error::NotFinal))
+        );
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline);
+        client.finalize_market(&market_id);
+        assert_eq!(
+            client.purge_closed_positions(&market_id, &soroban_sdk::vec![&env, trader.clone()]),
+            1
+        );
+    }
 
     #[test]
     fn transfer_position_moves_shares_and_preserves_invariant() {
@@ -5956,7 +6128,9 @@ mod multisig_account {
             }
         }
 
-        fn create_default(f: &AdvFixture) -> Result<u64, Result<Error, soroban_sdk::InvokeError>> {
+        fn create_default(
+            f: &AdvFixture,
+        ) -> Result<Result<u64, soroban_sdk::Error>, Result<Error, soroban_sdk::InvokeError>> {
             f.client.try_create_market(
                 &f.creator,
                 &BytesN::from_array(&f.env, &[1u8; 32]),

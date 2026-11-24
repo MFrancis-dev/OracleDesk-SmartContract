@@ -32,6 +32,13 @@ import {
 } from "./payment-ledger.js";
 import { approveRefund, rejectRefund } from "./refunds.js";
 import {
+  decodeCursor,
+  encodeCursor,
+  parseCursorKeys,
+  type CursorKeys,
+} from "./discovery.js";
+import { classifyRegistryError } from "./errors.js";
+import {
   loadVerdictPolicy,
   decide,
   type VerdictPolicy,
@@ -73,6 +80,8 @@ export interface TraceListEntry {
   agent: string;
   action: string;
   publishedAt: string;
+  ledger?: number;
+  archived?: boolean;
 }
 
 export interface TraceListPage {
@@ -87,11 +96,12 @@ export interface TraceListPage {
  * "everything agent X published" and "every Buy decision on market 7".
  */
 export interface TraceListRepository {
-  listByAgent(agent: string, cursor?: string, limit?: number): Promise<TraceListPage>;
+  listByAgent(agent: string, cursor?: bigint | string, limit?: number): Promise<TraceListPage>;
+  listByMarket(marketId: string, cursor?: bigint | string, limit?: number): Promise<TraceListPage>;
   listByMarketAction(
     marketId: string,
     action: string,
-    cursor?: string,
+    cursor?: bigint | string,
     limit?: number,
   ): Promise<TraceListPage>;
 }
@@ -124,6 +134,40 @@ export interface TraceApiOptions {
   ledger?: PaymentLedger;
   adminToken?: string;
   ledgerSequence?: (network: string) => Promise<number>;
+  cursorKeys?: CursorKeys;
+  quote?: (traceId: string) => string;
+  listCacheSize?: number;
+  paymentsDisabled?: boolean;
+}
+
+const ACTION_LABELS = new Set([
+  "create_market", "propose_market", "buy", "sell", "skip", "redeem",
+  "claim_remainder", "resolve",
+]);
+function queryDigest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+function publicEntry(entry: TraceListEntry, priceQuote: string): Record<string, unknown> {
+  return {
+    traceId: entry.traceId,
+    marketId: entry.marketId,
+    agent: entry.agent,
+    action: entry.action,
+    publishedAt: entry.publishedAt,
+    ...(entry.ledger === undefined ? {} : { ledger: entry.ledger }),
+    ...(entry.archived ? { archived: true } : {}),
+    priceQuote,
+  };
+}
+function parseMarket(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+  try {
+    const n = BigInt(value);
+    return n <= 18446744073709551615n ? n.toString() : undefined;
+  } catch { return undefined; }
+}
+function parseAgent(value: unknown): string | undefined {
+  return typeof value === "string" && /^G[A-Z2-7]+$/.test(value) ? value : undefined;
   /**
    * Seconds after settlement during which the same payment can re-download
    * the trace, even past the payment's own `expiresAt`
@@ -396,6 +440,19 @@ export function createTraceApi(options: TraceApiOptions): Express {
   const ledger = instrumentLedger(baseLedger, metrics);
   const signer = options.receiptSigner;
   const app = express();
+  const cursorKeys = options.cursorKeys ?? parseCursorKeys() ?? {
+    current: { kid: "default", secret: "x402-development-cursor-key" },
+  };
+  const pageCache = new Map<string, TraceListPage>();
+  const cacheGet = async (key: string, load: () => Promise<TraceListPage>) => {
+    const cached = pageCache.get(key);
+    if (cached) return cached;
+    const value = await load();
+    pageCache.set(key, value);
+    while (pageCache.size > (options.listCacheSize ?? 1000))
+      pageCache.delete(pageCache.keys().next().value!);
+    return value;
+  };
   app.locals.metrics = metrics;
   // Request-scoped logger first: every later line carries `reqId`.
   app.use(createHttpLogger(log));
@@ -481,6 +538,95 @@ export function createTraceApi(options: TraceApiOptions): Express {
   // Attach a rejection handler immediately, while preserving rejection for the startup caller.
   void ready.catch(() => {});
   app.locals.ready = ready;
+  app.get("/traces", async (req, res) => {
+    if (!options.listRepository) {
+      res.status(404).json({ error: "Discovery not configured" });
+      return;
+    }
+    const market = req.query.market;
+    const agent = req.query.agent;
+    const action = req.query.action;
+    if ((market === undefined) === (agent === undefined) || (action !== undefined && market === undefined)) {
+      res.status(400).json({ error: "Exactly one of market or agent is required; action requires market" });
+      return;
+    }
+    const marketId = market === undefined ? undefined : parseMarket(market);
+    const agentId = agent === undefined ? undefined : parseAgent(agent);
+    if ((market !== undefined && marketId === undefined) || (agent !== undefined && agentId === undefined)) {
+      res.status(400).json({ error: "Invalid market or agent" });
+      return;
+    }
+    if (action !== undefined && (typeof action !== "string" || (!ACTION_LABELS.has(action) && !action.startsWith("other:")))) {
+      res.status(400).json({ error: "Invalid action" });
+      return;
+    }
+    const order = req.query.order === undefined ? "desc" : req.query.order;
+    if (order !== "asc" && order !== "desc") {
+      res.status(400).json({ error: "order must be asc or desc" });
+      return;
+    }
+    const rawLimit = req.query.limit === undefined ? 25 : Number(req.query.limit);
+    if (!Number.isInteger(rawLimit) || rawLimit < 1) {
+      res.status(400).json({ error: "limit must be between 1 and 25" });
+      return;
+    }
+    const limit = Math.min(rawLimit, 25);
+    const canonical = JSON.stringify({ market: marketId, agent: agentId, action: action ?? null, order, limit });
+    const digest = queryDigest(canonical);
+    const supplied = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+    let cursor = supplied ? decodeCursor(supplied, cursorKeys, digest) : undefined;
+    if (supplied && !cursor) {
+      res.status(400).json({ error: "Invalid or expired cursor" });
+      return;
+    }
+    let start = cursor ? BigInt(cursor.next) : 0n;
+    let anchorTotal = cursor ? BigInt(cursor.anchorTotal) : undefined;
+    try {
+      const ledgerNumber = options.ledgerSequence
+        ? await options.ledgerSequence(options.networks[0].network)
+        : 0;
+      const loadPage = (at: bigint) => {
+        if (marketId !== undefined && action !== undefined)
+          return options.listRepository!.listByMarketAction(marketId, action, at, limit);
+        if (marketId !== undefined) return options.listRepository!.listByMarket(marketId, at, limit);
+        return options.listRepository!.listByAgent(agentId!, at, limit);
+      };
+      if (order === "desc" && !cursor) {
+        const first = await cacheGet(`${ledgerNumber}:${canonical}:0`, () => loadPage(0n));
+        anchorTotal = BigInt(first.total);
+        start = anchorTotal > BigInt(limit) ? anchorTotal - BigInt(limit) : 0n;
+      }
+      const load = async () => {
+        let page: TraceListPage;
+        page = await cacheGet(`${ledgerNumber}:${canonical}:${start}`, () => loadPage(start));
+        if (anchorTotal === undefined) anchorTotal = BigInt(page.total);
+        page = { ...page, total: anchorTotal.toString() };
+        if (order === "desc") {
+          page = { ...page, items: [...page.items].reverse() };
+          const next = start > BigInt(limit) ? start - BigInt(limit) : 0n;
+          page = { ...page, next: next.toString(), total: anchorTotal.toString() };
+        }
+        return page;
+      };
+      const page = await load();
+      const next = BigInt(page.next);
+      const hasNext = order === "desc" ? next > 0n : next < BigInt(page.total);
+      const nextCursor = hasNext
+        ? encodeCursor({ q: digest, order, next: next.toString(), anchorTotal: (anchorTotal ?? BigInt(page.total)).toString(), exp: Math.floor(Date.now() / 1000) + 86400 }, cursorKeys)
+        : null;
+      const items = page.items.map((entry) => publicEntry({ ...entry, ledger: ledgerNumber }, options.quote?.(entry.traceId) ?? options.price));
+      res.set("Cache-Control", "public, max-age=5").json({ items, nextCursor, total: page.total });
+    } catch (error) {
+      const classified = classifyRegistryError(error);
+      if (classified.kind === "upstream") {
+        res.set("Retry-After", "2").status(503).json({ error: "Registry unavailable", retryAfter: 2 });
+      } else if (classified.kind === "contract" && classified.code === 3001) {
+        res.status(400).json({ error: "Page too large" });
+      } else {
+        res.status(503).json({ error: "Registry unavailable" });
+      }
+    }
+  });
 
   /** Sends `{ error: kind, message, ...extra }` and counts the kind. */
   function fail(

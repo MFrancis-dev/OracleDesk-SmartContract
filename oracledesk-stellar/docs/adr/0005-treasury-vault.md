@@ -349,19 +349,24 @@ close); and `agent_buy` never asked whether a market could be resolved at all
   market-core, for the case where market-core is what broke. The owner forfeits
   their part of open positions, which stays with the remaining shareholders.
 
-The treasury has no upgrade path, so existing deployments move by
-redeploying:
+The treasury has no upgrade path, so Existing deployments move through the authenticated migration protocol:
 
-1. Deploy the new treasury.
-2. On the old treasury, `set_successor(new)`, then queue and execute
-   `migrate_markets` after `config_delay`.
-3. Call `market_core.propose_treasury`, then the new treasury's
-   `accept_market_core_role` (the `set_treasury` API this ADR predates was
-   replaced by the authenticated handshake in ADR 0006).
+1. Deploy the successor with the same configuration and call
+   `accept_predecessor`.
+2. The old admin calls `begin_migration`, opening the seven-day (or configured
+   timelock, whichever is longer) exit window. Deposits and agent trading are
+   disabled while withdrawals and settlement remain available.
+3. After the window, call `migrate_markets` in bounded batches, then
+   `migrate_idle`. Each packet transfers positions and the LP role, imports net
+   cost, lifetime exposure and PnL, and mints successor shares for the old
+   vault at the conservative floor value. Idle collateral is transferred last.
+4. Old depositors call `exit_to_successor` to receive their pro-rata successor
+   shares. Queued withdrawals remain reserved in the old vault.
 
-Positions moved with `migrate_markets` are not in the successor's index and
-count as zero in its NAV until they are redeemed. The old pre-vault flow's
-admin `withdraw` no longer exists.
+The successor indexes received markets immediately, so their carried positions
+and cost basis are valued from the first ledger. Packets are versioned,
+authenticated by the predecessor, and idempotent.
+
 
 ## Consequences
 
@@ -376,8 +381,10 @@ admin `withdraw` no longer exists.
   - **Fee sweeps.** `collect_market_fees` (admin) raises NAV for every
     shareholder at the moment fees arrive. A depositor who knows a sweep is
     imminent gets a slightly better entry. Sweep often.
-  - **Admin custody.** `set_successor` + `migrate_markets` can move positions
-    out of the vault without compensation (SECURITY.md).
+  - **Migration timing.** The admin controls when the announced migration is
+    executed after the depositor exit window; successor shares compensate the
+    old vault for every migrated floor value.
+
   - **Unindexed positions** (pre-migration, or received from a predecessor)
     are valued at zero until redeemed.
 - Agent activity is capped at 12 markets with open capital at once.

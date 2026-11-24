@@ -919,6 +919,12 @@ export class StellarAdapter {
     return BigInt(v.cost_basis);
   }
 
+  async marketValuation(marketId: bigint): Promise<{ cost_basis: bigint; floor_value: bigint; spot_value: bigint; at_risk: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as any;
+    return { cost_basis: BigInt(v.cost_basis), floor_value: BigInt(v.floor_value), spot_value: BigInt(v.spot_value), at_risk: BigInt(v.at_risk) };
+  }
+
   /** An RPC client for this adapter's network (event polling, ledger reads). */
   rpcServer(): rpc.Server {
     return new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") });

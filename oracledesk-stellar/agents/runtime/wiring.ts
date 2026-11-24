@@ -30,6 +30,7 @@ import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
 import type { MakerDeps } from "./tasks/maker.js";
 import type { WatcherTaskDeps } from "./tasks/watcher.js";
 import { fixtureCandidates, type TraderCandidate, type TraderDeps, type TraderRiskCheck } from "./tasks/trader.js";
+import { inventoryTask, type InventoryCandidate, type InventoryDeps } from "./tasks/inventory.js";
 
 /** Placeholder signal source until a real one is wired in (see docs/wave-issues).
  * Deterministic so dry-runs are reproducible. */
@@ -283,6 +284,32 @@ export function traderDeps(
     nowSecs,
     dueDiligence,
     riskCheck,
+  };
+}
+
+export function inventoryDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): InventoryDeps {
+  return {
+    adapter,
+    traceStore: new LocalTraceStore(t.traceStoreDir),
+    treasury: deployments.contracts.treasury,
+    candidates: async () => {
+      const count = await adapter.marketCount();
+      const out: InventoryCandidate[] = [];
+      for (let id = 0n; id < count; id++) {
+        const m = await adapter.getMarket(id);
+        if (!m || m.status !== "Open" || m.creator !== deployments.contracts.treasury) continue;
+        const [position, value] = await Promise.all([adapter.treasuryPosition(id), adapter.marketValuation(id)]);
+        out.push({ marketId: id, closeTime: m.closeTime, pool: { reserveYes: m.reserveYes, reserveNo: m.reserveNo, feeBps: m.feeBps }, position, lpOwned: true, costBasis: value.cost_basis });
+      }
+      return out;
+    },
+    caps: async () => {
+      const c = await adapter.riskCaps();
+      return { ...c, availableCapital: c.dailyHeadroom ?? c.maxDaily - c.dailyUsed };
+    },
+    policy: { maxBuyPriceBps: 10_000n, minSellPriceBps: 1n },
+    hedge: { maxDeltaBps: t.inventory.maxDeltaBps, targetDeltaBps: t.inventory.rebalanceBps, maxTradeStroops: t.inventory.maxHedgeStroops, dailyHeadroom: t.inventory.dailyHedgeStroops, minSecsToClose: t.inventory.minSecsToClose },
+    deadlineSecs: t.trading.deadlineSecs,
   };
 }
 

@@ -1,11 +1,11 @@
 # Agent runtime (agentd)
 
-`agents/runtime/` turns the one-shot maker and trader CLIs into one
+`agents/runtime/` turns the one-shot maker, trader, and inventory CLIs into one
 long-running, supervised process.
 
 ```bash
 cd oracledesk-stellar/agents
-npm run agentd                         # both tasks, continuously
+npm run agentd                         # maker, trader, and inventory continuously
 npm run agentd -- --once               # each task exactly once, then exit
 npm run agentd -- --tasks trader       # a subset
 npm run agentd -- --config agentd.json # env-style overrides from a JSON object
@@ -348,3 +348,13 @@ provides:
 `Lease` is an interface: a shared backend for multiple hosts can replace
 `FileLease` without touching the runtime. Event-driven wake-ups can later call
 into the same loops instead of waiting out `intervalMs`.
+## Inventory task
+
+`inventory` scans open markets created by the treasury, verifies the local
+inventory floor against `market_valuation`, publishes a trace, then submits a
+bounded `agent_buy_v2` or `agent_sell_v2` under the market lock. It requires a
+credential with `ROLE_TRADE` (normally the trader key); a maker-only key is
+refused. Configure the exposure band and hedge budgets with
+`MAKER_INVENTORY_MAX_DELTA_BPS`, `MAKER_INVENTORY_REBALANCE_BPS`,
+`MAKER_HEDGE_MAX_STROOPS`, `MAKER_HEDGE_DAILY_STROOPS`, and
+`MAKER_HEDGE_MIN_SECS_TO_CLOSE`.

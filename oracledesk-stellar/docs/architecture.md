@@ -140,7 +140,7 @@ share-count slippage parameters:
 **Transferability.** `transfer_position(from, to, market_id, outcome,
 amount)` moves shares between any two addresses (owner auth; allowed while
 `Paused` — a transfer moves no collateral — and after finality until
-`redeem`), rejecting self-transfers, transfers to the contract's own
+close-out), rejecting self-transfers, transfers to the contract's own
 address (they could never be redeemed) and over-transfers, and emitting
 `PositionTransferred` so indexers stay in sync. `transfer_lp(market_id,
 new_creator)` (current-creator auth, until `lp_claimed`) moves the single
@@ -176,7 +176,11 @@ complete sets without touching the pool (`split` before `close_time`,
 `merge` any time before resolution, including while paused). After
 finality, `redeem` handles both legs; `merge` is not used post-resolution.
 `finalize_market` (permissionless, after the redemption deadline) closes the
-market and sweeps the residual.
+market and sweeps the residual. `get_market_view` exposes an additive
+`Lifecycle` (`Open`, `Final`, `Closed`) without changing the stored `Market`
+XDR; `get_position` returns zero for `Closed`, and closed transfers fail with
+`MarketClosedOut`. Dead position entries may be removed permissionlessly with
+`purge_closed_positions`.
 
 A per-market `SettleState` side entry (views `settle_state` and
 `redeem_deadline`) tracks user-held outstanding shares, the finality

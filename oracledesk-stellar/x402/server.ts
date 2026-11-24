@@ -7,6 +7,7 @@ import {
   type TraceListRepository,
   type TraceRecord,
   type TraceRepository,
+  type TraceListRepository,
 } from "./trace-api.js";
 import { createRegistryTraceRepository } from "./registry-trace-repository.js";
 import {
@@ -165,6 +166,7 @@ async function main() {
     facilitatorTimeoutMs: Number(
       process.env.X402_FACILITATOR_TIMEOUT_MS ?? 5000,
     ),
+    ...(await buildRepository()),
     ...built,
     ipfsGateway: process.env.IPFS_GATEWAY_URL ?? "https://ipfs.io/ipfs",
     price: process.env.TRACE_PRICE_USDC ?? "0.01",
