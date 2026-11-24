@@ -123,6 +123,11 @@ export interface FairValueEstimate {
   bps: number;
   source: string;
   observedAt: number;
+  /**
+   * #331: every input of a model-based estimate (e.g. the volatility
+   * model's `PriceModel`), so `replayFairValue` can recompute `bps`.
+   */
+  model?: Record<string, unknown>;
 }
 
 export interface TradeContracts {
@@ -439,3 +444,4 @@ export function decisionHashSell(args: {
     deadline: args.deadline,
   });
 }
+

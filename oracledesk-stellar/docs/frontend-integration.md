@@ -362,6 +362,31 @@ a verified reasoning trace in the UI:
 `x402/trace-verification.ts` has the reference hash-check implementation the
 frontend can port.
 
+### Verifying delivery receipts (#330)
+
+A paid `GET /traces/:traceId` response carries a signed receipt in the
+`X-OracleDesk-Receipt` header and the `receipt` body field (replays return
+the same bytes). It binds the payment id, settlement transaction, trace id
+and hash, verdict at sale, amount, asset, network, `payTo`, payer and
+`settledAt`, so a buyer can prove to a third party what was sold to them.
+Verify it offline in the browser:
+
+```ts
+import { fetchKeySet, verifyReceipt } from "../x402/verify-client";
+
+const keys = await fetchKeySet("https://x402.example.org"); // cached per origin; https only
+const r = await verifyReceipt(response.headers.get("X-OracleDesk-Receipt")!, keys, {
+  now: Math.floor(Date.now() / 1000),
+});
+if (!r.ok) throw new Error(`receipt rejected: ${r.reason}`);
+// r.fields.traceHash must equal the hash you verified the bytes against.
+```
+
+`fetchKeySet` refuses plain HTTP outside localhost. Re-fetch a lost receipt
+with `GET /receipts/:paymentId`, sending the original `PAYMENT-SIGNATURE`.
+The encoding and golden vectors (`docs/vectors/x402-receipt-v1.json`) are
+described in [architecture.md](architecture.md#x402-signed-delivery-receipts-330).
+
 ## Off-chain math mirrors
 
 ```ts

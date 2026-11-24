@@ -37,6 +37,17 @@ import {
   type VerdictPolicy,
 } from "./verdict-policy.js";
 import type { RegistryTraceRepository } from "./registry-trace-repository.js";
+import type { Logger } from "pino";
+import { createHttpLogger, logger as defaultLogger } from "./logger.js";
+import {
+  toX402Error,
+  X402Error,
+  type Stage,
+  type X402ErrorKind,
+} from "./errors.js";
+import { createMetrics, since, type X402Metrics } from "./metrics.js";
+import { KEYS_PATH, type ReceiptSigner } from "./receipt-keys.js";
+import { decodeReceipt, normalizeHex } from "./receipt.js";
 export type { TraceRecord };
 export interface TraceRepository {
   get(traceId: string): Promise<TraceRecord | undefined>;
@@ -120,6 +131,12 @@ export interface TraceApiOptions {
    * payment is refunded (refunds.ts).
    */
   redeliveryWindowSecs?: number;
+  /** #328: structured logger; defaults to the shared redacting pino logger. */
+  logger?: Logger;
+  /** #328: Prometheus metrics; a private registry is created when omitted. */
+  metrics?: X402Metrics;
+  /** #330: when set, every settled payment gets a signed delivery receipt. */
+  receiptSigner?: ReceiptSigner;
 }
 
 const REFUNDED_STATES = new Set(["refund_pending", "refunding", "refunded"]);
@@ -133,6 +150,7 @@ export class NetworkScopedFacilitator implements FacilitatorClient {
   constructor(
     readonly network: string,
     private readonly client: FacilitatorClient,
+    private readonly metrics?: X402Metrics,
   ) {}
   async getSupported() {
     const s = await this.client.getSupported();
@@ -140,11 +158,34 @@ export class NetworkScopedFacilitator implements FacilitatorClient {
   }
   verify(p: PaymentPayload, r: PaymentRequirements) {
     this.assertNetwork(r);
-    return this.client.verify(p, r);
+    return this.timed("facilitator_verify", this.client.verify(p, r));
   }
   settle(p: PaymentPayload, r: PaymentRequirements) {
     this.assertNetwork(r);
-    return this.client.settle(p, r);
+    return this.timed("facilitator_settle", this.client.settle(p, r));
+  }
+  /** #328: latency histogram, including timeouts (`outcome="timeout"`). */
+  private timed<T>(
+    upstream: "facilitator_verify" | "facilitator_settle",
+    call: Promise<T>,
+  ): Promise<T> {
+    const m = this.metrics;
+    if (!m) return call;
+    const start = performance.now();
+    return call.then(
+      (value) => {
+        m.observeUpstream(upstream, "ok", since(start));
+        return value;
+      },
+      (error: unknown) => {
+        m.observeUpstream(
+          upstream,
+          error instanceof FacilitatorTimeoutError ? "timeout" : "error",
+          since(start),
+        );
+        throw error;
+      },
+    );
   }
   private assertNetwork(r: PaymentRequirements) {
     if (r.network !== this.network)
@@ -170,6 +211,7 @@ function authorizationScheme() {
 export function facilitatorFor(
   n: TracePaymentNetwork,
   timeoutMs = 5000,
+  metrics?: X402Metrics,
 ): FacilitatorClient {
   return new NetworkScopedFacilitator(
     n.network,
@@ -183,6 +225,7 @@ export function facilitatorFor(
           }
         : undefined,
     }),
+    metrics,
   );
 }
 export function buildRoutes(options: TraceApiOptions): RoutesConfig {
@@ -209,29 +252,85 @@ export function writeInstructions(
   if (instructions.isHtml) res.send(instructions.body);
   else res.json(instructions.body);
 }
+async function timedUpstream<T>(
+  metrics: X402Metrics,
+  upstream: "registry" | "ipfs",
+  call: () => Promise<T>,
+): Promise<T> {
+  const start = performance.now();
+  try {
+    const value = await call();
+    metrics.observeUpstream(upstream, "ok", since(start));
+    return value;
+  } catch (error) {
+    metrics.observeUpstream(
+      upstream,
+      (error as { name?: unknown })?.name === "AbortError" ? "timeout" : "error",
+      since(start),
+    );
+    throw error;
+  }
+}
 async function loadVerifiedTrace(
   options: TraceApiOptions,
+  metrics: X402Metrics,
   traceId: string,
   signal: AbortSignal,
 ) {
-  const record = await options.repository.get(traceId);
-  if (!record) return undefined;
-  const response = await (options.fetchImpl ?? fetch)(
-    ipfsUrl(options.ipfsGateway, record.ipfsCid),
-    { signal },
+  const record = await timedUpstream(metrics, "registry", () =>
+    options.repository.get(traceId),
   );
+  if (!record) return undefined;
+  let response: globalThis.Response;
+  try {
+    response = await timedUpstream(metrics, "ipfs", () =>
+      (options.fetchImpl ?? fetch)(ipfsUrl(options.ipfsGateway, record.ipfsCid), {
+        signal,
+      }),
+    );
+  } catch (e) {
+    throw new X402Error("gateway_unavailable", undefined, e);
+  }
   if (!response.ok)
-    throw new Error(`IPFS gateway returned HTTP ${response.status}`);
+    throw new X402Error(
+      "gateway_unavailable",
+      undefined,
+      undefined,
+      `IPFS gateway returned HTTP ${response.status}`,
+    );
   const bytes = new Uint8Array(await response.arrayBuffer());
   if (!verifyTraceHash(bytes, record.traceHash))
-    throw new Error(`Trace ${traceId} failed on-chain hash verification`);
+    throw new X402Error("trace_hash_mismatch");
   let content: unknown;
   try {
     content = JSON.parse(new TextDecoder().decode(bytes));
   } catch {
-    throw new Error(`Trace ${traceId} is not valid JSON`);
+    throw new X402Error("trace_invalid_json");
   }
   return { record, bytes, content };
+}
+
+/** #328: counts every durable ledger transition, with no extra awaits. */
+function instrumentLedger(inner: PaymentLedger, metrics: X402Metrics): PaymentLedger {
+  return {
+    claim: (e) => inner.claim(e),
+    get: (id) => inner.get(id),
+    reconcileStuck: (ms) => inner.reconcileStuck(ms),
+    countByState: () => inner.countByState(),
+    close: () => inner.close(),
+    transition: (id, from, to, patch) =>
+      inner.transition(id, from, to, patch).then((entry) => {
+        metrics.observeTransition(from, to);
+        return entry;
+      }),
+  };
+}
+
+/** `tag[:reason]` for the receipt's verdict field (#330, #306). */
+function verdictField(v: TraceVerdict | undefined): string {
+  if (!v) return "unchecked";
+  const value = (v as { values?: unknown[] }).values?.[0];
+  return value === undefined || value === "" ? v.tag : `${v.tag}:${String(value)}`;
 }
 function requirementsKey(p: PaymentPayload): string {
   const r = p.accepted;
@@ -286,22 +385,33 @@ export function createTraceApi(options: TraceApiOptions): Express {
   const redeliveryWindowMs = (options.redeliveryWindowSecs ?? 900) * 1000;
   if (!Number.isFinite(redeliveryWindowMs) || redeliveryWindowMs < 0)
     throw new Error("redeliveryWindowSecs must be a non-negative number");
+  const baseLedger = options.ledger ?? new MemoryPaymentLedger();
+  const log = options.logger ?? defaultLogger;
+  const metrics =
+    options.metrics ??
+    createMetrics({
+      networks: options.networks.map((n) => n.network),
+      countByState: () => baseLedger.countByState(),
+    });
+  const ledger = instrumentLedger(baseLedger, metrics);
+  const signer = options.receiptSigner;
   const app = express();
+  app.locals.metrics = metrics;
+  // Request-scoped logger first: every later line carries `reqId`.
+  app.use(createHttpLogger(log));
   async function initialize() {
     const pairs = await Promise.all(
       options.networks.map(async (n) => {
-        const client = facilitatorFor(n, options.facilitatorTimeoutMs);
+        const client = facilitatorFor(n, options.facilitatorTimeoutMs, metrics);
         try {
           if (!(await client.getSupported()).kinds.length)
             throw new Error("No supported kinds");
           return { n, client };
         } catch (error) {
           if (options.requireAllNetworks !== false) throw error;
-          console.warn(
-            JSON.stringify({
-              event: "x402_network_unavailable",
-              network: n.network,
-            }),
+          log.warn(
+            { event: "x402_network_unavailable", network: n.network, err: error },
+            "x402 network unavailable",
           );
           return undefined;
         }
@@ -337,11 +447,13 @@ export function createTraceApi(options: TraceApiOptions): Express {
         }
       }
       if (error instanceof FacilitatorTimeoutError)
-        console.error(
-          JSON.stringify({
+        log.error(
+          {
             event: "x402_settlement_indeterminate",
             paymentId: id,
-          }),
+            network: metrics.networkLabel(paymentPayload.accepted.network),
+          },
+          "x402 settlement indeterminate",
         );
     });
     const http = new x402HTTPResourceServer(
@@ -369,14 +481,129 @@ export function createTraceApi(options: TraceApiOptions): Express {
   // Attach a rejection handler immediately, while preserving rejection for the startup caller.
   void ready.catch(() => {});
   app.locals.ready = ready;
+
+  /** Sends `{ error: kind, message, ...extra }` and counts the kind. */
+  function fail(
+    res: Response,
+    kind: X402ErrorKind,
+    extra: Record<string, unknown> = {},
+    status?: number,
+  ) {
+    const e = new X402Error(kind, status);
+    metrics.observeError(kind);
+    res.status(e.status).json({ ...e.toJSON(), ...extra });
+  }
+
+  /** Issues the receipt for a settled payment (#330). Never throws. */
+  async function issueReceipt(
+    entry: Pick<
+      PaymentEntry,
+      "network" | "paymentId" | "traceId" | "traceHash" | "amount" | "asset" | "payTo"
+    >,
+    settlementTx: string | undefined,
+    payer: string | undefined,
+    settledAt: number,
+    verdict: TraceVerdict | undefined,
+    plog: Logger,
+  ): Promise<string | undefined> {
+    if (!signer) return undefined;
+    try {
+      return await signer.sign({
+        network: entry.network,
+        paymentId: entry.paymentId,
+        settlementTx: normalizeHex(settlementTx ?? ""),
+        traceId: entry.traceId,
+        traceHash: normalizeHex(entry.traceHash),
+        verdict: verdictField(verdict),
+        amount: entry.amount,
+        asset: entry.asset,
+        payTo: entry.payTo,
+        payer: payer ?? "",
+        settledAt: String(settledAt),
+      });
+    } catch (err) {
+      metrics.observeError("internal");
+      plog.error({ event: "x402_receipt_failed", err }, "x402 receipt issuance failed");
+      return undefined;
+    }
+  }
+
+  app.get(KEYS_PATH, (_req, res) => {
+    if (!signer) {
+      res.status(404).json({ error: "not_found", message: "Receipts not enabled" });
+      return;
+    }
+    res
+      .set("Cache-Control", "public, max-age=300")
+      .json(signer.publicKeySet());
+  });
+
+  app.get("/receipts/:paymentId", async (req, res) => {
+    // Same 404 for unknown, unsettled and header-mismatch cases, so this
+    // route is not an oracle for whether a payment exists.
+    const notFound = () =>
+      res.status(404).json({ error: "not_found", message: "Receipt not found" });
+    const header = req.get("payment-signature") ?? req.get("x-payment");
+    if (!header) return notFound();
+    let paymentId: string;
+    try {
+      const payload = JSON.parse(
+        Buffer.from(header, "base64").toString(),
+      ) as PaymentPayload;
+      paymentId = paymentIdentity(payload).paymentId;
+    } catch {
+      return notFound();
+    }
+    if (paymentId !== String(req.params.paymentId)) return notFound();
+    try {
+      const entry = await ledger.get(paymentId);
+      if (
+        !entry?.receipt ||
+        (entry.state !== "settled" && entry.state !== "delivered")
+      )
+        return notFound();
+      res
+        .set("Cache-Control", "private, no-store")
+        .json({ receipt: entry.receipt, keysUrl: KEYS_PATH });
+    } catch (err) {
+      req.log.error({ err }, "x402 receipt lookup failed");
+      fail(res, "ledger_unavailable");
+    }
+  });
+
   app.get("/traces/:traceId", async (req, res) => {
     let paymentId: string | undefined;
     let ownsClaim = false;
+    let stage: Stage = "prepare";
+    let network: string | undefined;
+    let plog: Logger = req.log;
     let verified:
       | Extract<HTTPProcessResult, { type: "payment-verified" }>
       | undefined;
+    const traceId = String(req.params.traceId);
+    function deliver(entry: PaymentEntry, replay: boolean) {
+      res.on("finish", () => {
+        void ledger
+          .transition(entry.paymentId, ["settled", "delivered"], "delivered")
+          .catch((err) =>
+            plog.error({ err }, "x402 payment delivery record failed"),
+          );
+      });
+      metrics.observeStage("deliver", replay ? "replay" : "ok", entry.network);
+      // The stored body was verified before settlement; the receipt is added
+      // at send time, so replays return the same receipt bytes.
+      const body = entry.receipt
+        ? JSON.stringify({ ...JSON.parse(entry.responseBody!), receipt: entry.receipt })
+        : entry.responseBody;
+      if (entry.receipt) res.set("X-OracleDesk-Receipt", entry.receipt);
+      res
+        .set("PAYMENT-RESPONSE", entry.paymentResponseHeader!)
+        .set("Cache-Control", "private, no-store")
+        .status(200)
+        .type("application/json")
+        .send(body);
+    }
     try {
-      const traceId = String(req.params.traceId);
       const { http, resource, allowed } = await ready;
       const header = req.get("payment-signature") ?? req.get("x-payment");
       let payload: PaymentPayload | undefined;
@@ -388,15 +615,41 @@ export function createTraceApi(options: TraceApiOptions): Express {
           ) as PaymentPayload;
           paymentId = paymentIdentity(payload).paymentId;
         } catch {
-          res.status(402).json({ error: "Invalid payment envelope" });
+          fail(res, "invalid_envelope");
           return;
         }
+        network = payload.accepted.network;
+        // Never log the payload: only its derived identity.
+        plog = req.log.child({
+          paymentId,
+          traceId,
+          network: metrics.networkLabel(network),
+        });
         const identity = paymentIdentity(payload);
+        if (identity.maxLedger !== undefined) {
+          if (
+            !options.ledgerSequence ||
+            (await options.ledgerSequence(payload.accepted.network)) >=
+              identity.maxLedger
+          ) {
+            fail(res, "payment_expired", {
+              message: "Payment ledger bounds expired or unavailable",
+            });
+            return;
+          }
+        }
         existing = await ledger.get(paymentId);
         if (existing && !samePurchase(existing, payload, traceId)) {
-          res
-            .status(409)
-            .json({ error: "Payment already bound to another purchase" });
+          fail(res, "payment_conflict", {
+            message: "Payment already bound to another purchase",
+          });
+          return;
+        }
+        if (
+          (existing?.expiresAt ?? paymentIdentity(payload).expiresAt) <=
+          Date.now()
+        ) {
+          fail(res, "payment_expired");
           return;
         }
         if (existing) {
@@ -466,15 +719,38 @@ export function createTraceApi(options: TraceApiOptions): Express {
               return;
             }
             send(claimed);
+            stage = "deliver";
+            if (signer && !existing.receipt) {
+              // #330: settled before receipts existed. Backfill once, from the
+              // stored settlement; the flag is not part of the signed fields.
+              const settledAt =
+                existing.settledAt ?? Math.floor(existing.updatedAt / 1000);
+              const receipt = await issueReceipt(
+                existing,
+                existing.settlementTx,
+                existing.payer,
+                settledAt,
+                undefined,
+                plog,
+              );
+              if (receipt) {
+                existing = await ledger.transition(
+                  existing.paymentId,
+                  [existing.state],
+                  existing.state,
+                  { receipt, settledAt, receiptBackfilled: true },
+                );
+                plog.info({ event: "x402_receipt_backfilled" }, "x402 receipt backfilled");
+              }
+            }
+            deliver(existing, true);
             return;
           }
-          res
-            .set("Retry-After", "2")
-            .status(409)
-            .json({
-              error: `Payment ${existing.state}; do not repay without reconciliation`,
-              retryAfter: 2,
-            });
+          res.set("Retry-After", "2");
+          fail(res, "payment_conflict", {
+            message: `Payment ${existing.state}; do not repay without reconciliation`,
+            retryAfter: 2,
+          });
           return;
         }
         // Only a new payment is subject to its authorization expiry and
@@ -496,25 +772,29 @@ export function createTraceApi(options: TraceApiOptions): Express {
           }
         }
       }
+      const prepareStart = performance.now();
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort();
-          reject(new Error("Trace loading timed out"));
+          reject(
+            new X402Error("gateway_unavailable", undefined, undefined, "Trace loading timed out"),
+          );
         }, loadTimeout);
       });
       let prepared: Awaited<ReturnType<typeof loadVerifiedTrace>>;
       try {
         prepared = await Promise.race([
-          loadVerifiedTrace(options, traceId, controller.signal),
+          loadVerifiedTrace(options, metrics, traceId, controller.signal),
           timeout,
         ]);
       } finally {
         clearTimeout(timer);
       }
       if (!prepared) {
-        res.status(404).json({ error: "Trace not found" });
+        metrics.observeStage("prepare", "error", network, since(prepareStart));
+        fail(res, "trace_not_found");
         return;
       }
 
@@ -532,6 +812,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           .catch(() => "unavailable" as const);
         const action = decide(rawVerdict === "unavailable" ? "unavailable" : rawVerdict, policy);
         if (action.kind === "refuse") {
+          metrics.observeError("verdict_refused");
           res.status(action.status).json({
             error: "Trace verdict refused",
             verdict:
@@ -549,6 +830,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
       // #299: refuse to serve traces whose verdict is anything other than Valid,
       // before any payment is verified or settled.
       if (prepared.record.verdict && prepared.record.verdict.tag !== "Valid") {
+        metrics.observeError("verdict_refused");
         res
           .status(410)
           .json({ error: "trace_not_valid", verdict: prepared.record.verdict });
@@ -560,6 +842,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
         verdict: verdictAtSale ?? null,
         content: prepared.content,
       });
+      metrics.observeStage("prepare", "ok", network, since(prepareStart));
       if (payload && paymentId) {
         // Match before claiming, so a tampered unsigned requirement cannot
         // poison the identity of an otherwise valid signed transaction.
@@ -568,7 +851,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           !resource.findMatchingRequirements(allowed, payload) ||
           r.extra?.paymentFlow !== "authorization"
         ) {
-          res.status(402).json({ error: "Unsupported payment requirements" });
+          fail(res, "unsupported_requirements");
           return;
         }
         const identity = paymentIdentity(payload);
@@ -589,10 +872,11 @@ export function createTraceApi(options: TraceApiOptions): Express {
           requirementsKey: requirementsKey(payload),
         });
         if (!claim.created) {
-          res
-            .set("Retry-After", "2")
-            .status(409)
-            .json({ error: "Payment in progress", retryAfter: 2 });
+          res.set("Retry-After", "2");
+          fail(res, "payment_conflict", {
+            message: "Payment in progress",
+            retryAfter: 2,
+          });
           return;
         }
         ownsClaim = true;
@@ -603,18 +887,27 @@ export function createTraceApi(options: TraceApiOptions): Express {
         method: req.method,
         paymentHeader: header,
       };
+      stage = "verify";
+      const verifyStart = performance.now();
       const result = await http.processHTTPRequest(ctx);
+      const verifyMs = performance.now() - verifyStart;
       if (result.type === "payment-error") {
-        if (paymentId)
+        if (paymentId) {
           await ledger.transition(paymentId, ["verifying"], "failed", {
             error: "Payment verification rejected",
           });
+          metrics.observeStage("verify", "error", network, verifyMs / 1000);
+          metrics.observeError("verify_rejected");
+          plog.info({ stage: "verify", outcome: "rejected" }, "x402 payment verification rejected");
+        }
+        // Protocol-defined 402 challenge / rejection body from the SDK.
         writeInstructions(res, result.response);
         return;
       }
       if (result.type !== "payment-verified" || !paymentId)
         throw new Error("Unexpected payment state");
       verified = result;
+      metrics.observeStage("verify", "ok", network, verifyMs / 1000);
       if (result.beforeHandlerSettlement)
         throw new Error("Upfront flow must be disabled");
       // SDK 2.26.0 logs thrown before-settle hook errors and continues.
@@ -640,6 +933,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
             await verified.cancellationDispatcher
               .cancel({ reason: "handler_threw", error: new Error("verdict changed") })
               .catch(() => {});
+          metrics.observeError("verdict_refused");
           res.status(action.status).json({
             error: "Trace verdict changed before settlement",
             verdict: rawVerdict === "unavailable" ? "unavailable" : (rawVerdict as TraceVerdict).tag,
@@ -648,6 +942,10 @@ export function createTraceApi(options: TraceApiOptions): Express {
         }
       }
       // ── End pre-settlement re-check ──────────────────────────────────────
+      stage = "settle";
+      // Timing uses performance.now() only: no await is added between the
+      // durable verifying → settling CAS and the facilitator settle call.
+      const settleStart = performance.now();
       await ledger.transition(paymentId, ["verifying"], "settling");
       const s = await http.processSettlement(
         result.paymentPayload,
@@ -659,6 +957,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           responseHeaders: { "Content-Type": "application/json" },
         },
       );
+      const settleMs = performance.now() - settleStart;
       if (!s.success) {
         const e = await ledger.get(paymentId);
         if (e?.state === "settling")
@@ -667,21 +966,33 @@ export function createTraceApi(options: TraceApiOptions): Express {
             facilitatorTx: s.transaction,
           });
         if ((await ledger.get(paymentId))?.state === "indeterminate") {
-          res.status(502).json({
-            error: "Settlement outcome indeterminate",
+          metrics.observeStage("settle", "timeout", network, settleMs / 1000);
+          plog.error(
+            { event: "x402_settlement_indeterminate", stage: "settle", settleMs },
+            "x402 settlement indeterminate",
+          );
+          fail(res, "settle_indeterminate", {
             paymentId,
             transaction: s.transaction,
           });
           return;
         }
+        metrics.observeStage("settle", "error", network, settleMs / 1000);
         // #300: if failed_unconfirmed, tell the buyer to wait for reconciliation
         if ((await ledger.get(paymentId))?.state === "failed_unconfirmed") {
-          res.status(409).json({
-            error: "Settlement being reconciled",
-            retryAfter: 30,
-          });
+          plog.warn(
+            { stage: "settle", outcome: "failed_unconfirmed", settleMs },
+            "x402 settlement being reconciled",
+          );
+          fail(
+            res,
+            "settle_failed",
+            { message: "Settlement being reconciled", retryAfter: 30 },
+            409,
+          );
           return;
         }
+        metrics.observeError("settle_failed");
         writeInstructions(res, s.response);
         return;
       }
@@ -689,6 +1000,21 @@ export function createTraceApi(options: TraceApiOptions): Express {
         ([k]) => k.toLowerCase() === "payment-response",
       )?.[1];
       if (!responseHeader) throw new Error("Missing settlement receipt");
+      metrics.observeStage("settle", "ok", network, settleMs / 1000);
+      // #330: the receipt is computed before, and persisted by, the single
+      // settling → settled CAS. A replica that loses the CAS discards it.
+      const settledAt = Math.floor(Date.now() / 1000);
+      const claimed = await ledger.get(paymentId);
+      const receipt = claimed
+        ? await issueReceipt(
+            claimed,
+            s.transaction,
+            s.payer,
+            settledAt,
+            verdictAtSale,
+            plog,
+          )
+        : undefined;
       const entry = await ledger.transition(
         paymentId,
         ["settling"],
@@ -698,8 +1024,10 @@ export function createTraceApi(options: TraceApiOptions): Express {
           payer: s.payer,
           paymentResponseHeader: responseHeader,
           settledAt: Date.now(),
+          receipt,
         },
       );
+      stage = "deliver";
       // Set X-Trace-Verdict header when a verdict was recorded at sale (#306).
       if (verdictAtSale) {
         const tag = verdictAtSale.tag;
@@ -756,12 +1084,23 @@ export function createTraceApi(options: TraceApiOptions): Express {
             })
             .catch(() => {});
       }
-      console.error("x402 request failed", error);
-      if (!res.headersSent)
-        res.status(502).json({
-          error: "Trace or payment processing failed",
+      const typed = toX402Error(error, stage);
+      metrics.observeStage(stage, "error", network);
+      metrics.observeError(typed.kind);
+      // Logged once, here: 5xx is an operator problem, the rest client-side.
+      (typed.status >= 500 ? plog.error : plog.warn).call(
+        plog,
+        { err: typed.cause ?? error, kind: typed.kind, stage },
+        "x402 request failed",
+      );
+      if (!res.headersSent) {
+        if (typed.kind === "registry_restore_required" || typed.kind === "registry_unavailable")
+          res.set("Retry-After", "30");
+        res.status(typed.status).json({
+          ...typed.toJSON(),
           ...(paymentId ? { paymentId } : {}),
         });
+      }
     }
   });
   /** Bearer check shared by the admin routes (the signed-admin item replaces it). */
@@ -792,14 +1131,24 @@ export function createTraceApi(options: TraceApiOptions): Express {
         requirementsKey: _requirements,
         ...redacted
       } = e;
+      let receiptFields: unknown;
+      if (e.receipt) {
+        try {
+          receiptFields = decodeReceipt(e.receipt).fields;
+        } catch {
+          receiptFields = null;
+        }
+      }
       // #300: surface reconciliation state in admin API
       const adminEntry = {
         ...redacted,
         needsOperator: e.state === "needs_operator",
+        ...(e.receipt ? { receiptFields } : {}),
       };
       res.set("Cache-Control", "no-store").json(adminEntry);
-    } catch {
-      res.status(503).json({ error: "Ledger unavailable" });
+    } catch (err) {
+      req.log.error({ err }, "x402 admin ledger read failed");
+      fail(res, "ledger_unavailable");
     }
   });
   const REFUND_STATES: RefundState[] = [

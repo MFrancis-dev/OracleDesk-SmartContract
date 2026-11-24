@@ -959,8 +959,8 @@ shared policy:
 - Instance TTL is extended by every entrypoint that reads instance storage
   (30-day target, 7-day threshold); pure views over persistent entries stay
   read-only so indexer simulations keep read-only footprints.
-- The registry additionally refreshes an agent's registration on every
-  successful `publish_trace`.
+- The registry classifies every key into a retention class and extends TTL
+  on writes only; none of its views write ledger state (#329, below).
 - The market-core `Settle` entry (outstanding shares, redemption deadline) is
   kept to the long-lived target — 365 days, clamped to `max_ttl()`. A market
   whose redemption deadline is more than one network-max TTL away can archive
@@ -976,6 +976,106 @@ shared policy:
   alive by a single bump and need periodic touches or the keeper described in
   [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),
   which also covers TTL monitoring and the rent cost model.
+### Reasoning-registry retention classes (#329)
+
+The registry is an audit log whose entries live for very different times.
+Every `DataKey` variant maps to exactly one class in
+`contracts/reasoning-registry/src/retention.rs` (`class_of` is an exhaustive
+`match`, so a new key without a class does not compile):
+
+| Class | Keys | Target |
+| --- | --- | --- |
+| `Identity` | `Agent`, `AgentHead`, `AgentSigningKeys`, `KeyToAgent`, `SigningKeyHistory*`, `KeyRevocation`, `Consumer`, `AgentConsumer*`, `AgentDefaultConsumer`, `AgentMissedRevealCount` | `long_lived_target` (365 d, clamped to `max_ttl`) |
+| `Audit` | `Trace`, `TraceLedger`, `TraceDecision`, `TraceLink`, `TraceSignature`, `TraceConsumer`, `Consumed`, `Flag`, `FlagHistory*`, `AgentTrace(seq)`, `MarketClose` | `audit_target(close_time)`; `long_lived_target` for `NO_MARKET` traces |
+| `Index` | `MarketTrace*`, `AgentTraceAt`/`Count`, `MarketActionTrace*`, `KeyTraceAt`/`Count`, `AgentBatch*`, `AgentCommit*` | `max(existing TTL, target of the trace written)` |
+| `Batch` | `Batch`, `BatchConsumer`, `TraceCommit` | `long_lived_target` |
+| `Instance` | `Admin`, `PendingAdmin`, `NextId`, `NextBatchId`, `MarketCore`, `ConsumerScoping` | `ttl::bump_instance` on every mutating entrypoint |
+
+`audit_target(close_time) = (close_time − now + SETTLEMENT_HORIZON_SECS +
+AUDIT_MARGIN_SECS) / 5 s`, clamped to `max_ttl()`, with `AUDIT_MARGIN_SECS =
+365 d` so a trace outlives market-core's default 365-day redemption horizon.
+The close time is read from market-core once, on a market's first trace, and
+cached in `DataKey::MarketClose(market_id)`.
+
+**Writes only.** `get_trace`, `get_batch`, `agent_batch_at`, `trace_count`,
+`traces_by_*`, `trace_verdict`, `agent_chain_head`, the signing-key and
+signature views and the internal `load_agent`/`read_head` are pure reads, so
+view simulations have read-only footprints and pay no rent. Publish paths
+write every audit key at the trace's target and extend the three indexes and
+their counts to at least that target, so an index never archives before its
+newest trace. The agent's `Agent` and `AgentHead` entries are refreshed on
+publish (`touch_identity`, half-target threshold).
+
+**Instance liveness.** Views no longer bump the instance. The contract stays
+invocable as long as some write (any mutating entrypoint, including the
+archivist calls below) lands at least every 23 days (30-day target minus the
+7-day threshold). Under view-only traffic, run `extend_traces([])` or any
+archivist call on a schedule.
+
+**Archivist entrypoints** (permissionless; the caller pays the rent; extend
+only, never shorten; missing keys are skipped with `has()` because extending
+a missing key panics):
+
+- `extend_traces(ids: Vec<u64>) -> u32`: at most 32 ids. Extends each trace
+  and all its side keys to its class target, returns how many entries it
+  extended, and bumps the instance.
+- `extend_index(key: IndexKey, from, to) -> u32`: at most 64 entries of
+  `IndexKey::Market(id)`, `Agent(addr)` or `MarketAction(id, action)`; `to`
+  is clamped to the index length. Each entry is extended to its trace's
+  target and the count to the largest of those.
+- `extend_agent(agent)`: the agent's identity entries, active key bindings
+  and up to 32 signing-key history records.
+
+`TooManyEntries` (3049) rejects an oversized call.
+
+**Archived reads.** A paged view cannot skip an archived entry from inside the
+contract: RPC simulation reports the entry as archived and the invocation
+fails at footprint validation before contract code runs. Readers either
+restore (the protocol's automatic restore via the simulation's
+`restorePreamble`, or `stellar contract restore`) or fall back to per-id reads
+around the gap. The x402 server maps a restore-required simulation to
+`503 registry_restore_required` with `Retry-After`, never 404
+(`x402/registry-trace-repository.ts`).
+
+**Rent.** With the CAP-0066 formula cited in `ttl.rs` (`ceil(bytes / 1024) ×
+ledgers × rate / 1215`, rate from 1 000 stroops/KB at the floor to 10 000 at
+the target live-state size), one 1-KB rent unit costs:
+
+| Days live | Ledgers | Floor rate | Target rate |
+| --- | --- | --- | --- |
+| 30 | 518 400 | 0.043 XLM | 0.43 XLM |
+| 180 (today's `max_ttl`) | 3 110 400 | 0.256 XLM | 2.56 XLM |
+| 365 | 6 307 200 | 0.519 XLM | 5.19 XLM |
+
+Every registry entry is under 1 KB (a `Trace` is at most ~340 bytes, see the
+`MAX_PAGE_SIZE` comment), so each costs one unit. A plain trace writes five
+audit/index entries (`Trace`, `TraceLedger`, three index slots; the counts are
+shared), so it costs 5 units: about 1.28 XLM (floor) to 12.8 XLM (target) to
+keep for 180 days. A signed, chained trace adds `TraceLink`, `AgentTrace`,
+`TraceSignature` and `KeyTraceAt` (9 units). These are upper bounds: the
+protocol charges by exact entry size.
+
+**Clamping.** `max_ttl()` (about 180 days on testnet and mainnet today)
+clamps every target, so "until the redemption deadline" means "until
+`max_ttl`, then archivists". That is why `extend_traces` is part of the
+design rather than an extra.
+
+**Migration.** Existing entries keep their current TTL. After upgrading, run a
+one-off sweep over testnet ids `0..trace_count` in batches of 32:
+
+```bash
+for start in $(seq 0 32 $((COUNT - 1))); do
+  ids=$(seq -s, "$start" $((start + 31 < COUNT - 1 ? start + 31 : COUNT - 1)))
+  stellar contract invoke --id "$REGISTRY" --source archivist --network testnet \
+    -- extend_traces --ids "[$ids]"
+done
+```
+
+Resource scenarios: `registry.publish_trace.audit_class`,
+`registry.get_trace.read_only`, `registry.traces_by_market.page25.read_only`
+(both with zero write entries) and `registry.extend_traces.32` in
+`docs/budgets/baseline.json`.
+
 ### router
 
 A stateless address book (`RouterConfig { market_core, resolver,
@@ -1292,6 +1392,74 @@ settlement bound (`maxTimeoutSeconds + facilitatorTimeoutMs`), so live
 requests owned by another replica are never touched.
 A settlement timeout returns 502 without content. Other SDK failures retain
 standard HTTP instructions and payment challenge headers.
+
+### x402 observability (#328)
+
+Every log line is structured pino JSON with a `reqId` (an inbound
+`X-Request-Id` matching `^[A-Za-z0-9-]{8,64}$` is reused and echoed);
+payment-path lines also carry `paymentId`, `traceId` and `network`.
+Payment payloads (signed authorisations), facilitator API keys,
+`Authorization`/`Cookie` headers and HTTP-client error bodies are redacted or
+dropped by the serializer, and messages are constant strings so nothing is
+interpolated past the redactor. Every failure is classified into a typed
+`X402Error` with a stable status and `{ error, message }` body; a registry RPC
+outage is `503 registry_unavailable`, not 404. Prometheus metrics are served
+by a separate listener on `METRICS_PORT` with closed label sets only. The
+metric names, labels, error-code table and scrape config are in
+[`x402/README.md`](../x402/README.md). The verify-then-settle order and the
+durable `verifying → settling` CAS are unchanged: timers use
+`performance.now()` deltas and add no awaits between the CAS and the
+facilitator call.
+
+### x402 signed delivery receipts (#330)
+
+When `X402_RECEIPT_KEYS` is configured, every settled payment gets one
+Ed25519 receipt signed by the server, binding payment id, settlement tx,
+trace id and hash, verdict at sale, amount, asset, network, `payTo`, payer and
+`settledAt`. The encoding (`oracledesk-x402-receipt-v1`) is length-prefixed
+fields, never JSON, so the signed bytes are identical in every runtime:
+
+```text
+msg = "oracledesk-x402-receipt-v1" || 0x00
+    || field(1, kid) || field(2, network) || field(3, paymentId hex)
+    || field(4, settlementTx hex) || field(5, traceId decimal) || field(6, traceHash hex)
+    || field(7, verdict tag[:reason]) || field(8, amount decimal base units) || field(9, asset)
+    || field(10, payTo) || field(11, payer) || field(12, settledAt unix secs decimal)
+field(tag, s) = u8 tag || u32be(len(utf8(s))) || utf8(s)
+receipt = base64url(msg) + "." + base64url(ed25519_sign(sha256(msg)))
+```
+
+Hex is lowercase without `0x`, decimals have no leading zeros, and `amount`
+stays a decimal string (it may exceed 2^53). The verdict is `unchecked` when
+no registry verdict was taken at sale.
+
+- **Exactly once.** The route computes `settledAt` and the receipt after the
+  facilitator settles and persists both in the single `settling → settled`
+  CAS. Ed25519 is deterministic, so a replica that loses the CAS would have
+  produced the same bytes; it discards its copy. Replays return
+  `entry.receipt` and never re-sign. Entries settled before receipts existed
+  are signed once on their first replay (`settledAt` from the entry's
+  `updatedAt`) and marked `receiptBackfilled` outside the signed fields.
+- **Delivery.** `X-OracleDesk-Receipt` header plus `"receipt"` in the JSON
+  body on delivery and replay. `GET /receipts/:paymentId` re-serves it to
+  whoever presents the original `PAYMENT-SIGNATURE`; unknown, unsettled and
+  mismatched requests all get the same 404, so the route is not an oracle for
+  payment existence.
+- **Keys.** `GET /.well-known/oracledesk-x402-keys.json` publishes
+  `{ kid, publicKey, notBefore, notAfter? }` for every key
+  (`Cache-Control: public, max-age=300`); `kid` is the first 8 bytes (hex) of
+  `sha256(publicKey)`. Rotate by adding the new key, then setting `notAfter`
+  on the old one. Retired keys stay listed indefinitely, or their receipts
+  become unverifiable; removing a key declares it compromised. A receipt
+  verifies only if its `settledAt` is inside the key's
+  `[notBefore, notAfter)` window.
+- **Clock.** `settledAt` is the issuing server's clock, not ledger close time;
+  `settlementTx` lets a verifier look the ledger time up.
+- **Fail fast.** Invalid keys, or `X402_RECEIPTS=required` with no keys, stop
+  startup: the server never settles payments it cannot receipt.
+
+Golden vectors (including negative ones) live in
+`docs/vectors/x402-receipt-v1.json`, generated by `x402/receipt-vectors.ts`.
 
 ### On-chain reconciliation (#300)
 

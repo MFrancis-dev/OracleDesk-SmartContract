@@ -62,6 +62,12 @@ export interface PaymentEntry {
   refundReview?: boolean;
   reconciledAt?: number;
   reconcileReason?: string;
+  /** #330: issuing server's clock (unix secs) when settlement was recorded. */
+  settledAt?: number;
+  /** #330: signed `oracledesk-x402-receipt-v1`, issued once in the settled CAS. */
+  receipt?: string;
+  /** #330: receipt issued lazily on replay for a pre-receipt settlement. */
+  receiptBackfilled?: boolean;
   expiresAt: number;
   createdAt: number;
   updatedAt: number;
@@ -90,6 +96,8 @@ export interface PaymentLedger {
   ): Promise<PaymentEntry[]>;
   /** Refund records: one per payment (`payment_id` is unique). */
   refunds: RefundStore;
+  /** #328: entries per state, sampled by the metrics scrape (not per request). */
+  countByState(): Promise<Partial<Record<PaymentState, number>>>;
   close(): void;
 }
 
@@ -154,6 +162,8 @@ function updated(
     refundAttempts,
     refundLastError,
     refundReview,
+    receipt,
+    receiptBackfilled,
   } = patch;
   return {
     ...entry,
@@ -176,6 +186,8 @@ function updated(
         refundAttempts,
         refundLastError,
         refundReview,
+        receipt,
+        receiptBackfilled,
       }).filter(([, v]) => v !== undefined),
     ),
     state: to,
@@ -268,6 +280,11 @@ export class MemoryPaymentLedger implements PaymentLedger {
       .sort((a, b) => a.updatedAt - b.updatedAt)
       .slice(0, limit)
       .map((e) => structuredClone(e));
+  async countByState() {
+    const counts: Partial<Record<PaymentState, number>> = {};
+    for (const e of this.entries.values())
+      counts[e.state] = (counts[e.state] ?? 0) + 1;
+    return counts;
   }
   close() {}
 }
@@ -284,33 +301,13 @@ export class SqlitePaymentLedger implements PaymentLedger {
     this.db.pragma("synchronous = FULL");
     this.db
       .exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
-      INSERT OR IGNORE INTO schema_version SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
-      CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, entry TEXT NOT NULL);`);
-    const version = () =>
-      this.db.prepare("SELECT version FROM schema_version").all() as {
-        version: number;
-      }[];
-    let versions = version();
-    if (versions.length === 1 && versions[0].version === 1) {
-      // v1 -> v2 in one transaction: a crash leaves either v1 or full v2.
-      this.db.transaction(() => {
-        this.db.exec(`CREATE TABLE refunds (
-            refund_id TEXT PRIMARY KEY,
-            payment_id TEXT UNIQUE NOT NULL,
-            state TEXT,
-            amount TEXT,
-            asset TEXT,
-            payer TEXT,
-            tx_hash TEXT,
-            tx_xdr TEXT,
-            created_at INTEGER,
-            updated_at INTEGER);
-          CREATE INDEX payments_state_updated ON payments (state, updated_at);
-          UPDATE schema_version SET version = 2;`);
-      })();
-      versions = version();
-    }
-    if (versions.length !== 1 || versions[0].version !== LEDGER_SCHEMA_VERSION) {
+      INSERT OR IGNORE INTO schema_version VALUES (1);
+      CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL, entry TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS payments_state ON payments(state);`);
+    const versions = this.db
+      .prepare("SELECT version FROM schema_version")
+      .all() as { version: number }[];
+    if (versions.length !== 1 || versions[0]?.version !== 1) {
       this.db.close();
       throw new Error("Unsupported payment ledger schema");
     }
@@ -384,6 +381,14 @@ export class SqlitePaymentLedger implements PaymentLedger {
       )
       .all(...states, Date.now() - olderThanMs, limit) as { entry: string }[];
     return rows.map((r) => JSON.parse(r.entry) as PaymentEntry);
+  async countByState() {
+    // Index-only GROUP BY over `payments_state`; run on scrape only.
+    const rows = this.db
+      .prepare("SELECT state, COUNT(*) AS n FROM payments GROUP BY state")
+      .all() as { state: PaymentState; n: number }[];
+    return Object.fromEntries(rows.map((r) => [r.state, r.n])) as Partial<
+      Record<PaymentState, number>
+    >;
   }
   close() {
     this.db.close();
