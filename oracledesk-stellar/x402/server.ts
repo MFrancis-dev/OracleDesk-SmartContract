@@ -8,13 +8,20 @@ import {
   type TraceRecord,
   type TraceRepository,
 } from "./trace-api.js";
+import { createRegistryTraceRepository } from "./registry-trace-repository.js";
 import {
-  createRegistryTraceRepository,
-  type RegistryTraceRepository,
-} from "./registry-trace-repository.js";
-import { logger } from "./logger.js";
-import { createMetrics, startMetricsServer } from "./metrics.js";
-import { receiptSignerFromEnv } from "./receipt-keys.js";
+  RefundExecutor,
+  refundPolicyFromEnv,
+  sweepRefunds,
+} from "./refunds.js";
+
+/** Soroban RPC for a payment network; always chosen from the entry's network. */
+function rpcUrlFor(network: string): string {
+  return network === "stellar:testnet"
+    ? (process.env.STELLAR_TESTNET_RPC_URL ??
+        "https://soroban-testnet.stellar.org")
+    : (process.env.STELLAR_MAINNET_RPC_URL ?? "https://soroban.stellar.org");
+}
 
 interface BuiltRepository {
   repository: TraceRepository;
@@ -62,6 +69,22 @@ async function main() {
     mode === "memory"
       ? new MemoryPaymentLedger()
       : new SqlitePaymentLedger(ledgerPath);
+  // Refunds (#279): settled-but-undelivered payments past the redelivery
+  // window are refunded from a dedicated account. Fail fast on a missing key.
+  const refundPolicy = refundPolicyFromEnv(process.env);
+  const refundsEnabled = process.env.X402_REFUNDS_ENABLED === "1";
+  if (refundsEnabled && !process.env.X402_REFUND_SECRET) {
+    ledger.close();
+    throw new Error("X402_REFUNDS_ENABLED=1 requires X402_REFUND_SECRET");
+  }
+  const refundExecutor = refundsEnabled
+    ? new RefundExecutor({
+        ledger,
+        policy: refundPolicy,
+        secret: process.env.X402_REFUND_SECRET!,
+        rpcFor: (network) => new rpc.Server(rpcUrlFor(network), { timeout: 10 }),
+      })
+    : undefined;
   // #300: no longer clobber in-flight payments at startup. Reconciliation
   // is age-based and only touches entries older than the settlement bound.
   const reconcileMs = Number(process.env.X402_RECONCILE_MS ?? 30_000);
@@ -129,15 +152,11 @@ async function main() {
     metrics,
     receiptSigner,
     ledger,
+    redeliveryWindowSecs: refundPolicy.redeliveryWindowMs / 1000,
     ledgerSequence: async (network) => {
-      const url =
-        network === "stellar:testnet"
-          ? (process.env.STELLAR_TESTNET_RPC_URL ??
-            "https://soroban-testnet.stellar.org")
-          : (process.env.STELLAR_MAINNET_RPC_URL ??
-            "https://soroban.stellar.org");
-      return (await new rpc.Server(url, { timeout: 5 }).getLatestLedger())
-        .sequence;
+      return (
+        await new rpc.Server(rpcUrlFor(network), { timeout: 5 }).getLatestLedger()
+      ).sequence;
     },
     adminToken: process.env.X402_ADMIN_TOKEN,
     requireAllNetworks: process.env.X402_REQUIRE_ALL_NETWORKS !== "false",
@@ -170,6 +189,22 @@ async function main() {
   const server = app.listen(port, () => {
     logger.info({ event: "x402_listening", port }, "x402 trace API listening");
   });
+  let sweeping = false;
+  const sweeper = refundExecutor
+    ? setInterval(() => {
+        if (sweeping) return;
+        sweeping = true;
+        sweepRefunds(ledger, refundExecutor, refundPolicy, {
+          batch: Number(process.env.X402_REFUND_BATCH ?? 10),
+        })
+          .catch((error) =>
+            console.error(JSON.stringify({ event: "x402_refund_sweep_failed", error: String(error) })),
+          )
+          .finally(() => {
+            sweeping = false;
+          });
+      }, Number(process.env.X402_REFUND_SWEEP_MS ?? 60_000))
+    : undefined;
   // Separate listener: /metrics is never exposed on the public API port.
   const metricsPort = process.env.METRICS_PORT
     ? Number(process.env.METRICS_PORT)
@@ -180,6 +215,8 @@ async function main() {
     logger.info({ event: "x402_metrics_listening", port: metricsPort }, "metrics listening");
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
+      // Stop the sweeper before the ledger it writes to is closed.
+      if (sweeper) clearInterval(sweeper);
       if (reconcileTimer) clearInterval(reconcileTimer);
       metricsServer?.close();
       server.close(() => {

@@ -17,6 +17,8 @@ export async function fakeFacilitator(networks: string[]) {
     verifyLatencyMs: 0,
     beforeVerify: undefined as (() => Promise<void>) | undefined,
     beforeSettle: undefined as (() => Promise<void>) | undefined,
+    /** Payer reported by verify/settle (a strkey makes the payment refundable). */
+    payer: "test-payer",
     settlementTx: "ab".repeat(32),
   };
   const app = express();
@@ -45,7 +47,7 @@ export async function fakeFacilitator(networks: string[]) {
     res.json({
       isValid: knobs.valid,
       ...(knobs.valid
-        ? { payer: "test-payer" }
+        ? { payer: knobs.payer }
         : { invalidReason: "invalid_payment" }),
     });
   });
@@ -63,7 +65,7 @@ export async function fakeFacilitator(networks: string[]) {
       // A Stellar tx hash is 64 lowercase hex (receipts validate it, #330).
       transaction: knobs.settlementTx,
       network: req.body.paymentRequirements.network,
-      payer: "test-payer",
+      payer: knobs.payer,
       ...(!knobs.success ? { errorReason: "settlement_failed" } : {}),
     });
   });

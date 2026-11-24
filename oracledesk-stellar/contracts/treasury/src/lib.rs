@@ -116,16 +116,39 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// market-core call must go through this (or [`Treasury::core_trade`] for the
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
-fn core_call<T>(
-    result: Result<
-        Result<T, market_core::Error>,
-        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
-    >,
+///
+/// soroban-sdk 27's generated `try_*` methods return
+/// `Result<Result<T, ConversionError>, Result<market_core::Error, InvokeError>>`:
+/// the callee's contract error is `Err(Ok(_))`, a host/invoke failure is
+/// `Err(Err(_))` and a return value that fails to decode is `Ok(Err(_))`.
+/// Entrypoints that do not return `Result` (plain getters) surface the
+/// callee error as a numeric `soroban_sdk::Error`, mapped through the same
+/// table by `map_market_core_code`.
+fn core_call<T, C, E: CoreCallError>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(error)) => Err(error.into_treasury_error()),
+        Ok(Err(_)) | Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// The two callee-error shapes a generated market-core `try_*` call can
+/// return, both normalised into the treasury's `MarketCore*` range.
+trait CoreCallError {
+    fn into_treasury_error(self) -> Error;
+}
+
+impl CoreCallError for market_core::Error {
+    fn into_treasury_error(self) -> Error {
+        map_market_core_error(self)
+    }
+}
+
+impl CoreCallError for soroban_sdk::Error {
+    fn into_treasury_error(self) -> Error {
+        map_market_core_code(self)
     }
 }
 
@@ -178,6 +201,21 @@ pub const MAX_MIGRATE_BATCH: u32 = 16;
 pub const DEFAULT_MAX_MARK_AGE_LEDGERS: u32 = 17_280;
 /// Smallest `deposit` (10 USDC): keeps share prices away from dust rounding.
 pub const MIN_DEPOSIT: i128 = 10 * 10_000_000;
+/// Tickets (ids from the queue head) that share a pro-rata payout (#277).
+/// No ticket past the window is paid while one inside it is still owed.
+pub const QUEUE_WINDOW: u64 = 8;
+/// Ticket ids (live or holes) one `drain_queue` call may read. Bounds the
+/// footprint of every entrypoint that drains; see
+/// contracts/budget-tests (treasury scenarios) for the measured costs.
+pub const MAX_QUEUE_STEPS: u32 = 8;
+/// A ticket must wait this long before `cancel_withdraw`, so a request
+/// cannot be used as a free option on NAV within one ledger or block of
+/// news.
+pub const MIN_CANCEL_DELAY: u64 = 86_400;
+/// Max rows per `queue_page`.
+pub const MAX_QUEUE_PAGE: u32 = 25;
+/// Max ticket ids `queue_position` / `estimated_unlock` walk.
+pub const MAX_POSITION_SCAN: u64 = 200;
 /// Virtual offset against first-depositor share inflation (the ERC-4626
 /// mitigation, see docs/adr/0005-treasury-vault.md). The first mint also
 /// burns `VIRTUAL_SHARES` dead shares.
@@ -370,12 +408,52 @@ pub struct PendingMarkAge {
 }
 
 /// Collateral still owed to `owner` for shares already burned.
+///
+/// Layout frozen: tickets queued before the drain/cancel upgrade (#277) must
+/// still decode. Everything new lives in [`TicketMeta`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawTicket {
     pub owner: Address,
     pub remaining: i128,
     pub created_at: u64,
+}
+
+/// Written by `request_withdraw` next to each new ticket
+/// (`DataKey::TicketMeta(id)`) so `cancel_withdraw` can cap the re-minted
+/// shares at the burn rate of the original request. Tickets created before
+/// #277 have none and are not cancellable (`TicketNotCancellable`).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TicketMeta {
+    /// Shares burned by the request that created the ticket.
+    pub shares_burned: i128,
+    /// Assets those shares were worth at the request's NAV (paid now plus
+    /// queued), so `shares_burned / assets_at_request` is the burn rate.
+    pub assets_at_request: i128,
+}
+
+/// One row of `queue_page`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueEntry {
+    pub ticket_id: u64,
+    pub ticket: WithdrawTicket,
+}
+
+/// Where a ticket stands in the withdrawal queue (`queue_position`).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueuePosition {
+    /// Live tickets ahead of this one (holes are not counted).
+    pub index: u32,
+    /// Sum of `remaining` over those tickets.
+    pub owed_ahead: i128,
+    /// Inside the pro-rata head window (`QUEUE_WINDOW` ids from the head).
+    pub in_window: bool,
+    /// The walk stopped after `MAX_POSITION_SCAN` ids, so `index` and
+    /// `owed_ahead` are lower bounds.
+    pub truncated: bool,
 }
 
 // Issue #45
@@ -563,6 +641,8 @@ pub enum DataKey {
     DataGlobalCap,
     /// #318: sliding 25-bucket daily window for data spend, per agent.
     DataBudgetWindow(Address),
+    /// Per-ticket cancellation metadata (#277), persistent.
+    TicketMeta(u64),
 }
 
 #[contracttype]
@@ -744,6 +824,26 @@ pub enum Error {
     TraceTimelockActive = 74,
     StaleMarks = 75,
     MarkBatchTooLarge = 76,
+    /// Cross-contract market-core errors, mapped into the treasury's own
+    /// range by `core_call` / `map_market_core_code`
+    /// (docs/adr/0006-cross-contract-errors.md, #60).
+    MarketCoreCallFailed = 2031,
+    MarketCoreMarketNotFound = 2032,
+    MarketCoreNotFinal = 2033,
+    MarketCoreMarketNotOpen = 2034,
+    MarketCoreMarketClosed = 2035,
+    MarketCoreInsufficientLiquidity = 2036,
+    MarketCoreInsufficientShares = 2037,
+    MarketCoreAlreadyClaimed = 2038,
+    MarketCoreNothingToRedeem = 2039,
+    MarketCoreInvalidAmount = 2040,
+    MarketCoreOverflow = 2041,
+    MarketCoreSlippageExceeded = 2042,
+    /// The ticket predates #277 (no `TicketMeta`) and cannot be cancelled;
+    /// it still drains and can be transferred.
+    TicketNotCancellable = 77,
+    /// `cancel_withdraw` before `created_at + MIN_CANCEL_DELAY`.
+    CancelTooEarly = 78,
 }
 
 #[contractevent]
@@ -946,6 +1046,37 @@ pub struct WithdrawPaid {
     #[topic]
     pub ticket_id: u64,
     pub amount: i128,
+}
+
+/// `cancel_withdraw`: the ticket's `assets` went back into the vault and
+/// `shares` were re-minted to `owner`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawCancelled {
+    #[topic]
+    pub ticket_id: u64,
+    #[topic]
+    pub owner: Address,
+    pub assets: i128,
+    pub shares: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketTransferred {
+    #[topic]
+    pub ticket_id: u64,
+    pub from: Address,
+    pub to: Address,
+}
+
+/// A drain hit an arithmetic overflow and stopped; the entrypoint that
+/// brought the proceeds still succeeded (settlement never fails because of
+/// the queue). `paid` is what was paid before the stop.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueDrainSkipped {
+    pub paid: i128,
 }
 
 #[contractevent]
@@ -2060,13 +2191,19 @@ impl Treasury {
             nav,
         }
         .publish(&env);
+        // Priced above, before the drain: NAV already excludes the queue's
+        // reservation, so paying tickets from this deposit moves no value
+        // between the depositor and anyone else (#277).
+        Self::drain_queue(&env, &global, MAX_QUEUE_STEPS);
         Ok(shares)
     }
 
     /// Burns `shares` of `owner` at the current NAV, pays what free idle
-    /// collateral allows now and queues the rest as a ticket (FIFO, paid by
-    /// `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`,
-    /// `ticket_id` 0 when nothing was queued.
+    /// collateral allows now and queues the rest as a ticket. Queued tickets
+    /// are paid automatically by every transaction that brings collateral in
+    /// (`drain_queue`, #277), pro rata within the `QUEUE_WINDOW` head
+    /// window. Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing
+    /// was queued.
     pub fn request_withdraw(env: Env, owner: Address, shares: i128) -> Result<(i128, u64), Error> {
         let global = Self::load_global(&env)?;
         owner.require_auth();
@@ -2107,6 +2244,14 @@ impl Treasury {
                     created_at: env.ledger().timestamp(),
                 },
             );
+            Self::put_persistent(
+                &env,
+                &DataKey::TicketMeta(ticket_id),
+                &TicketMeta {
+                    shares_burned: shares,
+                    assets_at_request: assets,
+                },
+            );
             let storage = env.storage().instance();
             storage.set(&DataKey::QueueTail, &(ticket_id + 1));
             storage.set(
@@ -2127,41 +2272,211 @@ impl Treasury {
         Ok((paid_now, ticket_id))
     }
 
-    /// Pays the ticket at the head of the queue as far as idle collateral
-    /// allows. Permissionless: the money always goes to the ticket's owner.
-    /// Only the head ticket can be paid (`NothingToPay` for later ones).
+    /// Permissionless wrapper around the queue drain (`drain_queue`):
+    /// pays queued tickets from idle collateral, pro rata across the
+    /// `QUEUE_WINDOW` head window, reading at most `MAX_QUEUE_STEPS` ids.
+    /// The money always goes to each ticket's owner. `ticket_id` must name
+    /// a live ticket (`TicketNotFound`); returns the total paid across all
+    /// tickets, or `NothingToPay` when the drain made no progress.
+    ///
+    /// A call that only moved the head past a run of holes pays nothing but
+    /// returns `Ok(0)`: failing would revert the head move and let a long
+    /// run of cancelled tickets stall `claim_withdraw` forever.
     pub fn claim_withdraw(env: Env, ticket_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
+        if !env.storage().persistent().has(&DataKey::Ticket(ticket_id)) {
+            return Err(Error::TicketNotFound);
+        }
+        let head_before = Self::queue_head(&env);
+        let paid = Self::drain_queue(&env, &global, MAX_QUEUE_STEPS);
+        if paid <= 0 && Self::queue_head(&env) == head_before {
+            return Err(Error::NothingToPay);
+        }
+        Ok(paid)
+    }
+
+    /// Cancels `ticket_id` and re-mints shares for what it is still owed.
+    ///
+    /// Shares minted = `min(shares_for_deposit(remaining, nav, supply),
+    /// floor(shares_burned * remaining / assets_at_request))`: after a NAV
+    /// loss the owner cannot get back more shares than were burned for the
+    /// same assets; after a gain they get fewer shares at the higher NAV.
+    /// Either way request-then-cancel never profits at the expense of other
+    /// shareholders. The reservation is released *before* NAV is read,
+    /// because NAV subtracts `QueueReserved`.
+    pub fn cancel_withdraw(env: Env, owner: Address, ticket_id: u64) -> Result<i128, Error> {
+        owner.require_auth();
+        Self::assert_not_paused(&env)?;
+        let global = Self::load_global(&env)?;
+        let key = DataKey::Ticket(ticket_id);
+        let ticket: WithdrawTicket = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TicketNotFound)?;
+        if ticket.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        let meta: TicketMeta = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketMeta(ticket_id))
+            .ok_or(Error::TicketNotCancellable)?;
+        if env.ledger().timestamp() < ticket.created_at.saturating_add(MIN_CANCEL_DELAY) {
+            return Err(Error::CancelTooEarly);
+        }
+        let remaining = ticket.remaining;
+        // 1. Release the reservation, so NAV is not reduced by it twice.
+        let reserved = Self::reserved(&env)
+            .checked_sub(remaining)
+            .ok_or(Error::InvalidAmount)?
+            .max(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::QueueReserved, &reserved);
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TicketMeta(ticket_id));
+        // 2. Price the re-mint at the NAV without the reservation, capped at
+        //    the request's own burn rate.
+        let nav = Self::compute_nav(&env, &global)?;
+        let supply = Self::supply(&env);
+        let at_nav = shares_for_deposit(remaining, nav, supply).ok_or(Error::InvalidAmount)?;
+        let capped = price_math::mul_div_floor(meta.shares_burned, remaining, meta.assets_at_request)
+            .ok_or(Error::InvalidAmount)?;
+        let shares = Self::credit_shares(&env, &owner, at_nav.min(capped))?;
+        // 3. Repair the head if this was it.
+        if ticket_id == Self::queue_head(&env) {
+            Self::advance_head(&env, MAX_QUEUE_STEPS);
+        }
+        WithdrawCancelled {
+            ticket_id,
+            owner,
+            assets: remaining,
+            shares,
+        }
+        .publish(&env);
+        Ok(shares)
+    }
+
+    /// Moves `ticket_id` (and its cancellation right) from `from` to `to`.
+    pub fn transfer_ticket(env: Env, from: Address, to: Address, ticket_id: u64) -> Result<(), Error> {
+        from.require_auth();
         let key = DataKey::Ticket(ticket_id);
         let mut ticket: WithdrawTicket = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::TicketNotFound)?;
+        if ticket.owner != from {
+            return Err(Error::Unauthorized);
+        }
+        ticket.owner = to.clone();
+        Self::put_persistent(&env, &key, &ticket);
+        if env.storage().persistent().has(&DataKey::TicketMeta(ticket_id)) {
+            Self::bump_persistent(&env, &DataKey::TicketMeta(ticket_id));
+        }
+        TicketTransferred {
+            ticket_id,
+            from,
+            to,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Live tickets with ids in `[start, start + limit)` (`limit` capped at
+    /// `MAX_QUEUE_PAGE`), in queue order. Holes are skipped, so a page can
+    /// hold fewer than `limit` rows; continue from `start + limit`.
+    pub fn queue_page(env: Env, start: u64, limit: u32) -> Vec<QueueEntry> {
+        let mut out = Vec::new(&env);
+        let from = start.max(Self::queue_head(&env));
+        let to = from
+            .saturating_add(limit.min(MAX_QUEUE_PAGE) as u64)
+            .min(Self::queue_tail(&env));
+        for ticket_id in from..to {
+            if let Some(ticket) = env
+                .storage()
+                .persistent()
+                .get::<_, WithdrawTicket>(&DataKey::Ticket(ticket_id))
+            {
+                out.push_back(QueueEntry { ticket_id, ticket });
+            }
+        }
+        out
+    }
+
+    /// Position of `ticket_id` in the queue, or `None` if it is not live.
+    /// Walks at most `MAX_POSITION_SCAN` ids ahead of it (`truncated`
+    /// otherwise).
+    pub fn queue_position(env: Env, ticket_id: u64) -> Option<QueuePosition> {
         let head = Self::queue_head(&env);
-        if ticket_id != head {
-            return Err(Error::NothingToPay);
+        if !env.storage().persistent().has(&DataKey::Ticket(ticket_id)) || ticket_id < head {
+            return None;
         }
-        let amount = ticket.remaining.min(Self::idle(&env, &global));
-        if amount <= 0 {
-            return Err(Error::NothingToPay);
+        let scan_end = ticket_id.min(head.saturating_add(MAX_POSITION_SCAN));
+        let mut index: u32 = 0;
+        let mut owed_ahead: i128 = 0;
+        for id in head..scan_end {
+            if let Some(t) = env
+                .storage()
+                .persistent()
+                .get::<_, WithdrawTicket>(&DataKey::Ticket(id))
+            {
+                index = index.saturating_add(1);
+                owed_ahead = owed_ahead.saturating_add(t.remaining);
+            }
         }
-        token::TokenClient::new(&env, &global.collateral).transfer(
-            &env.current_contract_address(),
-            &ticket.owner,
-            &amount,
-        );
-        ticket.remaining -= amount;
-        let storage = env.storage().instance();
-        storage.set(&DataKey::QueueReserved, &(Self::reserved(&env) - amount));
-        if ticket.remaining == 0 {
-            env.storage().persistent().remove(&key);
-            storage.set(&DataKey::QueueHead, &(head + 1));
-        } else {
-            Self::put_persistent(&env, &key, &ticket);
+        Some(QueuePosition {
+            index,
+            owed_ahead,
+            in_window: ticket_id < head.saturating_add(QUEUE_WINDOW),
+            truncated: scan_end < ticket_id,
+        })
+    }
+
+    /// Rough unlock time for `ticket_id`: now if the collateral already
+    /// held for the queue covers it; otherwise the close time of the open
+    /// market whose settlement (floor value, in close-time order) first
+    /// covers `owed_ahead + remaining`. `None` if the ticket is not live or
+    /// the open markets cannot cover it. An estimate only: it ignores new
+    /// deposits, trading and market resolution delays.
+    pub fn estimated_unlock(env: Env, ticket_id: u64) -> Option<u64> {
+        let ticket: WithdrawTicket = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Ticket(ticket_id))?;
+        let pos = Self::queue_position(env.clone(), ticket_id)?;
+        let need = pos.owed_ahead.saturating_add(ticket.remaining);
+        let global = Self::load_global(&env).ok()?;
+        let mut covered = Self::idle(&env, &global).min(Self::reserved(&env)).max(0);
+        if covered >= need {
+            return Some(env.ledger().timestamp());
         }
-        WithdrawPaid { ticket_id, amount }.publish(&env);
-        Ok(amount)
+        // At most MAX_OPEN_MARKETS entries: (close_time, floor value).
+        let mut markets: Vec<(u64, i128)> = Vec::new(&env);
+        for i in 0..Self::open_count(&env) {
+            let entry: OpenMarket = env.storage().persistent().get(&DataKey::OpenMarketAt(i))?;
+            let market = core_call(
+                MarketCoreClient::new(&env, &entry.core).try_get_market(&entry.market_id),
+            )
+            .ok()?;
+            let (floor, _) = Self::holdings_value(&env, &entry.core, entry.market_id).ok()?;
+            // Insertion sort by close time (n <= MAX_OPEN_MARKETS).
+            let mut at = markets.len();
+            while at > 0 && markets.get_unchecked(at - 1).0 > market.close_time {
+                at -= 1;
+            }
+            markets.insert(at, (market.close_time, floor));
+        }
+        for (close_time, floor) in markets.iter() {
+            covered = covered.saturating_add(floor);
+            if covered >= need {
+                return Some(close_time);
+            }
+        }
+        None
     }
 
     /// While paused only: burns `shares` for their pro-rata part of the free
@@ -2309,7 +2624,7 @@ impl Treasury {
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2385,7 +2700,7 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         let global = Self::load_global(&env)?;
@@ -2451,7 +2766,7 @@ impl Treasury {
         collateral_in: i128,
         min_shares_out: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2481,7 +2796,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_buy(
@@ -2509,7 +2824,7 @@ impl Treasury {
         collateral_out: i128,
         max_shares_in: i128,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -2537,7 +2852,7 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
-        if Self::trace_policy(&env).policy == TracePolicy::Required {
+        if Self::load_trace_policy_config(&env).policy == TracePolicy::Required {
             return Err(Error::TraceRequired);
         }
         Self::do_agent_sell(
@@ -2703,6 +3018,7 @@ impl Treasury {
         let result = MarketCoreClient::new(&env, &global.market_core)
             .redeem_many(&treasury_addr, &market_ids);
         Self::apply_batch_result(&env, &global.market_core, &result)?;
+        Self::drain_after_proceeds(&env);
         Ok(result)
     }
 
@@ -2722,6 +3038,7 @@ impl Treasury {
         let result = MarketCoreClient::new(&env, &global.market_core)
             .claim_pool_remainders(&treasury_addr, &market_ids);
         Self::apply_batch_result(&env, &global.market_core, &result)?;
+        Self::drain_after_proceeds(&env);
         Ok(result)
     }
 
@@ -2829,10 +3146,12 @@ impl Treasury {
             Self::close_market_exposure(&env, core, market_id);
         }
         Self::save_realized(&env, market_id, &r);
-        Self::prune_if_settled(&env, core, market_id);
+        Self::prune_if_settled(&env, core, market_id)?;
         if r.settled {
             Self::try_realize(&env, core, market_id)?;
         }
+        // Proceeds are in idle now: pay the withdrawal queue (#277).
+        Self::drain_after_proceeds(&env);
 
         MarketSettled {
             market_id,
@@ -3094,6 +3413,7 @@ impl Treasury {
             reason: Symbol::new(&env, "admin"),
         }
         .publish(&env);
+        Self::drain_after_proceeds(&env);
         Ok(())
     }
 
@@ -3615,6 +3935,7 @@ impl Treasury {
         // market-core transfers exactly `collateral_out` on success.
         Self::record_return(&env, &global.market_core, market_id, collateral_out)?;
         Self::record_proceeds(&env, market_id, collateral_out)?;
+        Self::drain_after_proceeds(&env);
         Ok(shares_in)
     }
 
@@ -3756,7 +4077,7 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        Self::prune_if_settled(env, core, market_id)?;
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
@@ -3791,19 +4112,27 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        Self::prune_if_settled(env, core, market_id)?;
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
         Ok(payout)
     }
 
+    /// `redeem` / `legacy_redeem`: the payout lands in idle, so queued
+    /// withdrawals are paid in the same transaction (#277).
     fn settle_redeem(env: &Env, core: &Address, market_id: u64) -> Result<i128, Error> {
-        Self::do_redeem(env, core, market_id)
+        let payout = Self::do_redeem(env, core, market_id)?;
+        Self::drain_after_proceeds(env);
+        Ok(payout)
     }
 
+    /// `claim_pool_remainder` / `legacy_claim_pool_remainder`; drains like
+    /// `settle_redeem`.
     fn settle_claim(env: &Env, core: &Address, market_id: u64) -> Result<i128, Error> {
-        Self::do_claim(env, core, market_id)
+        let payout = Self::do_claim(env, core, market_id)?;
+        Self::drain_after_proceeds(env);
+        Ok(payout)
     }
 
     // ----- daily windows ---------------------------------------------------------
@@ -4450,6 +4779,203 @@ impl Treasury {
             .unwrap_or(1)
     }
 
+    /// Pays queued withdrawal tickets from idle collateral (#277).
+    ///
+    /// `available = min(idle, reserved)`: reserved collateral already sits
+    /// in idle and belongs to the tickets. Tickets are taken a window at a
+    /// time (`QUEUE_WINDOW` ids from the head; holes left by paid or
+    /// cancelled tickets are skipped but count as steps). A window the
+    /// available collateral covers is paid in full and the head moves past
+    /// it; otherwise each ticket gets `floor(available * remaining_i /
+    /// window_owed)`, the rounding dust goes to the oldest ticket (never
+    /// above what it is owed) and the drain stops. So no ticket outside the
+    /// window is paid while one inside it is still owed, and the floors
+    /// never add up to more than `available`.
+    ///
+    /// At most `max_steps` ticket ids are read. Never fails: an arithmetic
+    /// overflow stops the drain, emits `QueueDrainSkipped` and returns what
+    /// was paid so far, so the entrypoint that brought the proceeds (a
+    /// settlement, a sale, a deposit) always succeeds. Each window is fully
+    /// computed before any transfer, so a stop never leaves it half-applied.
+    fn drain_queue(env: &Env, global: &GlobalConfig, max_steps: u32) -> i128 {
+        if Self::reserved(env) <= 0 {
+            return 0;
+        }
+        let mut paid = 0;
+        if Self::try_drain_queue(env, global, max_steps, &mut paid).is_err() {
+            QueueDrainSkipped { paid }.publish(env);
+        }
+        paid
+    }
+
+    fn try_drain_queue(
+        env: &Env,
+        global: &GlobalConfig,
+        max_steps: u32,
+        paid: &mut i128,
+    ) -> Result<(), Error> {
+        let storage = env.storage().persistent();
+        let token = token::TokenClient::new(env, &global.collateral);
+        let this = env.current_contract_address();
+        let mut idle = Self::idle(env, global);
+        let mut reserved = Self::reserved(env);
+        let mut head = Self::queue_head(env);
+        let tail = Self::queue_tail(env);
+        let mut steps: u32 = 0;
+
+        while steps < max_steps && head < tail && reserved > 0 {
+            let available = idle.min(reserved);
+            // The window: QUEUE_WINDOW ids, cut short by the queue tail and
+            // by the step budget.
+            let budget = (max_steps - steps) as u64;
+            let end = head
+                .saturating_add(QUEUE_WINDOW.min(budget))
+                .min(tail);
+            let mut ids: Vec<u64> = Vec::new(env);
+            let mut tickets: Vec<WithdrawTicket> = Vec::new(env);
+            let mut window_owed: i128 = 0;
+            for id in head..end {
+                steps += 1;
+                let key = DataKey::Ticket(id);
+                if let Some(t) = storage.get::<_, WithdrawTicket>(&key) {
+                    // Waits can outlive BUMP_TO: keep every ticket read alive.
+                    Self::bump_persistent(env, &key);
+                    window_owed = window_owed
+                        .checked_add(t.remaining)
+                        .ok_or(Error::InvalidAmount)?;
+                    ids.push_back(id);
+                    tickets.push_back(t);
+                }
+            }
+            if ids.is_empty() {
+                // A run of holes: skip it, it already cost its steps.
+                head = end;
+                env.storage().instance().set(&DataKey::QueueHead, &head);
+                continue;
+            }
+            if available <= 0 {
+                break;
+            }
+
+            // Compute every payment of this window before moving any money.
+            let full = available >= window_owed;
+            let mut pays: Vec<i128> = Vec::new(env);
+            let mut total: i128 = 0;
+            for t in tickets.iter() {
+                let pay = if full {
+                    t.remaining
+                } else {
+                    price_math::mul_div_floor(available, t.remaining, window_owed)
+                        .ok_or(Error::InvalidAmount)?
+                };
+                total = total.checked_add(pay).ok_or(Error::InvalidAmount)?;
+                pays.push_back(pay);
+            }
+            if !full {
+                // Rounding dust to the oldest ticket only, capped at what it
+                // is still owed; anything it cannot absorb waits.
+                let dust = available - total;
+                let oldest = tickets.get_unchecked(0).remaining;
+                let first = pays.get_unchecked(0);
+                let extra = dust.min(oldest - first).max(0);
+                pays.set(0, first + extra);
+                total += extra;
+            }
+            if total > available || total > reserved {
+                return Err(Error::InvalidAmount);
+            }
+
+            // Apply.
+            for i in 0..ids.len() {
+                let id = ids.get_unchecked(i);
+                let pay = pays.get_unchecked(i);
+                let mut t = tickets.get_unchecked(i);
+                if pay > 0 {
+                    token.transfer(&this, &t.owner, &pay);
+                    WithdrawPaid {
+                        ticket_id: id,
+                        amount: pay,
+                    }
+                    .publish(env);
+                }
+                t.remaining -= pay;
+                let key = DataKey::Ticket(id);
+                if t.remaining == 0 {
+                    storage.remove(&key);
+                    storage.remove(&DataKey::TicketMeta(id));
+                } else if pay > 0 {
+                    Self::put_persistent(env, &key, &t);
+                }
+            }
+            idle -= total;
+            reserved -= total;
+            *paid += total;
+            env.storage()
+                .instance()
+                .set(&DataKey::QueueReserved, &reserved);
+
+            if full {
+                head = end;
+                env.storage().instance().set(&DataKey::QueueHead, &head);
+            } else {
+                // Partially paid: the head can only move past tickets that
+                // were paid off (or holes) at the very front.
+                Self::advance_head(env, max_steps.saturating_sub(steps).max(1));
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the head past paid-off tickets and holes, reading at most
+    /// `max_steps` ids. The drain skips any holes left over, so stopping
+    /// early only costs a later call a few steps.
+    fn advance_head(env: &Env, max_steps: u32) {
+        let storage = env.storage().persistent();
+        let mut head = Self::queue_head(env);
+        let tail = Self::queue_tail(env);
+        let mut steps = 0;
+        while head < tail && steps < max_steps && !storage.has(&DataKey::Ticket(head)) {
+            head += 1;
+            steps += 1;
+        }
+        env.storage().instance().set(&DataKey::QueueHead, &head);
+    }
+
+    /// Drains the queue after an entrypoint brought collateral in, if any
+    /// tickets are waiting. Never fails (see `drain_queue`).
+    fn drain_after_proceeds(env: &Env) {
+        if Self::reserved(env) <= 0 {
+            return;
+        }
+        if let Ok(global) = Self::load_global(env) {
+            Self::drain_queue(env, &global, MAX_QUEUE_STEPS);
+        }
+    }
+
+    /// Credits exactly `minted` new shares to `owner` (the first mint
+    /// withholds `VIRTUAL_SHARES` dead shares, as in `mint_shares`).
+    fn credit_shares(env: &Env, owner: &Address, minted: i128) -> Result<i128, Error> {
+        let supply = Self::supply(env);
+        let credited = if supply == 0 {
+            minted - VIRTUAL_SHARES
+        } else {
+            minted
+        };
+        if credited <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let new_supply = supply.checked_add(minted).ok_or(Error::InvalidAmount)?;
+        let balance = Self::shares_of(env.clone(), owner.clone())
+            .checked_add(credited)
+            .ok_or(Error::InvalidAmount)?;
+        Self::put_persistent(env, &DataKey::Shares(owner.clone()), &balance);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &new_supply);
+        Ok(credited)
+    }
+
     /// Mints shares for `amount` deposited at `nav` and returns those
     /// credited to `owner`. The first mint withholds `VIRTUAL_SHARES` as dead
     /// shares nobody owns.
@@ -5025,13 +5551,13 @@ impl Treasury {
             action.clone().into_val(env),
             cfg.max_trace_age_ledgers.into_val(env),
         ];
-        let info: TraceConsumeInfo = match env.try_invoke_contract(
+        let info: TraceConsumeInfo = match env.try_invoke_contract::<_, soroban_sdk::Error>(
             &registry,
             &Symbol::new(env, "consume_trace_for"),
             args,
         ) {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(Self::map_registry_trace_error(e)),
+            Ok(Err(_)) => return Err(Error::TraceRegistryCallFailed),
             Err(Ok(e)) => return Err(Self::map_registry_trace_error(e)),
             Err(Err(_)) => return Err(Error::TraceRegistryCallFailed),
         };
@@ -6616,7 +7142,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_net_cap_below_max_trade() {
         fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
     }
@@ -7109,13 +7635,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_invalid_caps_panics_with_contract_error_3() {
         fixture_with_caps(20 * USDC, 10 * USDC, 60 * USDC);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_config_delay_below_minimum() {
         let default_policy = CreationPolicy {
             max_seed: USDC,
@@ -7685,9 +8211,12 @@ mod test {
         let shares = f.treasury.shares_of(&alice);
         f.treasury.request_withdraw(&alice, &shares);
         let reserved = f.treasury.queue_reserved();
-        // New money arrives: 10 USDC more than what the queue is owed.
+        // New money arrives without a drain (a plain token transfer, e.g. a
+        // donation): 10 USDC more than what the queue is owed. A deposit
+        // would pay the queue at once (#277) and leave nothing reserved.
         let carol = depositor(&f, reserved + 10 * USDC);
-        f.treasury.deposit(&carol, &(reserved + 10 * USDC));
+        donate(&f, &carol, reserved + 10 * USDC);
+        assert_queue_consistent(&f);
         let other = extra_market(&f, 44);
         assert_eq!(
             f.treasury
@@ -7699,8 +8228,91 @@ mod test {
         assert!(balance(&f, &f.treasury_id) >= reserved);
     }
 
+    // ----- withdrawal queue: drain, window, cancel, transfer, views (#277) ---
+
+    /// Σ ticket.remaining over the live queue == QueueReserved.
+    fn assert_queue_consistent(f: &Fixture) {
+        let (head, tail) = f.treasury.queue_bounds();
+        let mut sum = 0;
+        for id in head..tail {
+            if let Some(t) = f.treasury.withdraw_ticket(&id) {
+                assert!(t.remaining > 0, "ticket {id} kept at zero");
+                sum += t.remaining;
+            }
+        }
+        // Nothing live may sit before the head.
+        for id in head.saturating_sub(QUEUE_WINDOW)..head {
+            assert_eq!(f.treasury.withdraw_ticket(&id), None, "ticket {id} behind head");
+        }
+        assert_eq!(sum, f.treasury.queue_reserved(), "Σ remaining != QueueReserved");
+    }
+
+    /// Sends collateral to the treasury without calling it, so no drain runs.
+    fn donate(f: &Fixture, from: &Address, amount: i128) {
+        soroban_sdk::token::TokenClient::new(&f.env, &f.token).transfer(
+            from,
+            &f.treasury_id,
+            &amount,
+        );
+    }
+
+    /// Simulates a loss of idle collateral (e.g. a yield-venue loss).
+    fn lose(f: &Fixture, amount: i128) {
+        let sink = Address::generate(&f.env);
+        f.env.as_contract(&f.treasury_id, || {
+            soroban_sdk::token::TokenClient::new(&f.env, &f.token).transfer(
+                &f.treasury_id,
+                &sink,
+                &amount,
+            );
+        });
+    }
+
+    fn sponsor(f: &Fixture, amount: i128) -> Address {
+        depositor(f, amount)
+    }
+
+    /// `n` depositors of 20 USDC each, capital deployed into complete sets
+    /// so that only 10 USDC stays idle, then every depositor requests a full
+    /// withdrawal. Returns the fixture and the ticket owners in id order
+    /// (ticket `i + 1` belongs to `owners[i]`; the first is partly paid).
+    fn queued_vault(n: u32) -> (Fixture, std::vec::Vec<Address>) {
+        let f = fixture_full(
+            1_000 * USDC,
+            2_000 * USDC,
+            3_000 * USDC,
+            3_000 * USDC,
+            false,
+        );
+        let mut owners = std::vec::Vec::new();
+        for _ in 0..n {
+            let who = depositor(&f, 20 * USDC);
+            f.treasury.deposit(&who, &(20 * USDC));
+            owners.push(who);
+        }
+        let total = 20 * USDC * n as i128;
+        let yes = (total - 10 * USDC) / 2 + 5 * USDC;
+        let no = total - 10 * USDC - yes;
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &yes, &0);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::No, &no, &0);
+        assert_eq!(balance(&f, &f.treasury_id), 10 * USDC);
+        for who in owners.iter() {
+            f.treasury.request_withdraw(who, &f.treasury.shares_of(who));
+        }
+        assert_eq!(f.treasury.queue_bounds(), (1, n as u64 + 1));
+        assert_eq!(balance(&f, &f.treasury_id), 0);
+        assert_queue_consistent(&f);
+        (f, owners)
+    }
+
+    fn remaining(f: &Fixture, id: u64) -> i128 {
+        f.treasury.withdraw_ticket(&id).map(|t| t.remaining).unwrap_or(0)
+    }
+
     #[test]
-    fn claim_withdraw_pays_fifo_after_capital_returns() {
+    fn settle_market_drains_queue_in_same_tx() {
         let (f, alice, bob) = deployed_vault();
         let (_, t1) = f
             .treasury
@@ -7709,41 +8321,571 @@ mod test {
             .treasury
             .request_withdraw(&bob, &f.treasury.shares_of(&bob));
         assert_eq!((t1, t2, paid_bob), (1, 2, 0));
+        let owed = f.treasury.queue_reserved();
+        let (r1, r2) = (remaining(&f, t1), remaining(&f, t2));
+        let (a0, b0) = (balance(&f, &alice), balance(&f, &bob));
+
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        let caller = Address::generate(&f.env);
+        let report = f.treasury.settle_market(&caller, &f.market_id);
+        // Events of the settle_market invocation itself (read before any
+        // other call replaces them): it paid the queue, no claim needed.
+        assert!(has_event(
+            &f,
+            &WithdrawPaid {
+                ticket_id: t1,
+                amount: r1,
+            }
+        ));
+        assert!(has_event(
+            &f,
+            &WithdrawPaid {
+                ticket_id: t2,
+                amount: r2,
+            }
+        ));
+        assert!(report.redeemed > 0);
+        assert_eq!(balance(&f, &alice) - a0, r1);
+        assert_eq!(balance(&f, &bob) - b0, r2);
+        assert_eq!(f.treasury.queue_reserved(), 0);
+        assert_eq!(owed, r1 + r2);
+        assert_eq!(f.treasury.queue_bounds(), (3, 3));
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn pro_rata_window_dust_to_oldest() {
+        let (f, alice, bob) = deployed_vault();
+        f.treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        f.treasury.request_withdraw(&bob, &f.treasury.shares_of(&bob));
+        let (a, b) = (remaining(&f, 1), remaining(&f, 2));
+        let window_owed = a + b;
+        // An odd partial payment that does not divide evenly.
+        let available = window_owed / 3 + 7;
+        let giver = sponsor(&f, available);
+        donate(&f, &giver, available);
+        let (a0, b0) = (balance(&f, &alice), balance(&f, &bob));
+
+        assert_eq!(f.treasury.claim_withdraw(&1), available);
+
+        let floor_a = available * a / window_owed;
+        let floor_b = available * b / window_owed;
+        let dust = available - floor_a - floor_b;
+        assert!(dust > 0, "test needs rounding dust");
+        // Bob gets exactly his floor; all dust goes to the oldest (Alice).
+        assert_eq!(balance(&f, &bob) - b0, floor_b);
+        assert_eq!(balance(&f, &alice) - a0, floor_a + dust);
+        assert_eq!(remaining(&f, 1), a - floor_a - dust);
+        assert_eq!(remaining(&f, 2), b - floor_b);
+        // Floors never add up to more than what was available.
+        assert_eq!(balance(&f, &f.treasury_id), 0);
         assert_eq!(f.treasury.queue_bounds(), (1, 3));
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn no_ticket_outside_window_paid_first() {
+        let n = QUEUE_WINDOW as u32 + 2;
+        let (f, _) = queued_vault(n);
+        let window_owed: i128 = (1..=QUEUE_WINDOW).map(|id| remaining(&f, id)).sum();
+        let outside: std::vec::Vec<i128> =
+            (QUEUE_WINDOW + 1..=n as u64).map(|id| remaining(&f, id)).collect();
+
+        // Less than the window owes: only the window is paid, pro rata.
+        let giver = sponsor(&f, 10_000 * USDC);
+        donate(&f, &giver, window_owed - 1);
+        let last = n as u64;
+        f.treasury.claim_withdraw(&last);
+        for (i, id) in (QUEUE_WINDOW + 1..=n as u64).enumerate() {
+            assert_eq!(remaining(&f, id), outside[i], "ticket {id} paid before the window");
+        }
+        assert!((1..=QUEUE_WINDOW).any(|id| remaining(&f, id) > 0));
+        assert_queue_consistent(&f);
+
+        // Enough for everything: the window is paid off first and the head
+        // moves past it; the call's step budget then stops the drain.
+        let head = f.treasury.queue_bounds().0;
+        let beyond: std::vec::Vec<i128> = (head + QUEUE_WINDOW..=n as u64)
+            .map(|id| remaining(&f, id))
+            .collect();
+        donate(&f, &giver, 1_000 * USDC);
+        f.treasury.claim_withdraw(&last);
+        assert_eq!(f.treasury.queue_bounds().0, head + QUEUE_WINDOW);
+        for (i, id) in (head + QUEUE_WINDOW..=n as u64).enumerate() {
+            assert_eq!(remaining(&f, id), beyond[i]);
+        }
+        // The next drain reaches the rest.
+        f.treasury.claim_withdraw(&last);
+        assert_eq!(f.treasury.queue_reserved(), 0);
+        assert_eq!(f.treasury.queue_bounds(), (n as u64 + 1, n as u64 + 1));
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn drain_bounded_with_many_holes() {
+        let n = 2 * QUEUE_WINDOW as u32 + 2;
+        let (f, owners) = queued_vault(n);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        // Cancel everything except the head and the last ticket: a long run
+        // of holes between two live tickets.
+        for id in 2..n as u64 {
+            f.treasury.cancel_withdraw(&owners[id as usize - 1], &id);
+        }
+        assert_queue_consistent(&f);
+        let last = n as u64;
+        let last_owed = remaining(&f, last);
+        let giver = sponsor(&f, 1_000 * USDC);
+        donate(&f, &giver, 1_000 * USDC);
+
+        // Each call reads at most MAX_QUEUE_STEPS ids, holes included, so
+        // the last ticket is not reached by the first call...
+        f.env.cost_estimate().budget().reset_unlimited();
+        f.treasury.claim_withdraw(&1);
+        assert_eq!(remaining(&f, 1), 0);
+        assert_eq!(remaining(&f, last), last_owed);
+        assert_eq!(f.treasury.queue_bounds().0, 1 + MAX_QUEUE_STEPS as u64);
+        // ...but the head keeps moving through the holes, call after call.
+        let mut calls = 1;
+        while remaining(&f, last) > 0 {
+            let head = f.treasury.queue_bounds().0;
+            f.treasury.claim_withdraw(&last);
+            assert!(
+                remaining(&f, last) == 0 || f.treasury.queue_bounds().0 > head,
+                "every call makes progress"
+            );
+            calls += 1;
+            assert!(calls <= n, "head stalled on holes");
+        }
+        assert_eq!(f.treasury.queue_reserved(), 0);
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn drain_never_underflows_when_idle_below_reserved() {
+        let (f, _) = queued_vault(3);
+        let reserved = f.treasury.queue_reserved();
+        // idle < reserved (as after an admin withdraw or a venue loss).
+        let giver = sponsor(&f, reserved);
+        donate(&f, &giver, reserved / 2);
+        f.treasury.claim_withdraw(&1);
+        assert_eq!(f.treasury.queue_reserved(), reserved - reserved / 2);
+        assert_eq!(balance(&f, &f.treasury_id), 0);
         assert_eq!(
-            f.treasury.try_claim_withdraw(&t2),
+            f.treasury.try_claim_withdraw(&1),
             Err(Ok(Error::NothingToPay))
         );
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn deposit_drains_queue_and_is_priced_before_the_drain() {
+        let (f, alice, _) = deployed_vault();
+        f.treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        let owed = f.treasury.queue_reserved();
+        let nav = f.treasury.nav();
+        let supply = f.treasury.total_shares();
+        let carol = depositor(&f, 50 * USDC);
+        let shares = f.treasury.deposit(&carol, &(50 * USDC));
+        assert_eq!(shares, shares_for_deposit(50 * USDC, nav, supply).unwrap());
+        assert_eq!(f.treasury.queue_reserved(), owed - (50 * USDC).min(owed));
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn cancel_after_loss_capped_at_burned_shares() {
+        let f = vault_fixture();
+        let alice = depositor(&f, 20 * USDC);
+        let bob = depositor(&f, 80 * USDC);
+        let carol = depositor(&f, 100 * USDC);
+        f.treasury.deposit(&alice, &(20 * USDC));
+        f.treasury.deposit(&bob, &(80 * USDC));
+        f.treasury.deposit(&carol, &(100 * USDC));
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(100 * USDC), &0);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::No, &(90 * USDC), &0);
+        // Bob queues first and takes the idle 10 USDC.
+        f.treasury.request_withdraw(&bob, &f.treasury.shares_of(&bob));
+        let rb = f.treasury.queue_reserved();
+        // Collateral comes back but less than Bob is owed, so Alice's
+        // request is fully queued.
+        let giver = sponsor(&f, rb);
+        donate(&f, &giver, rb - 1);
+        let burned = f.treasury.shares_of(&alice);
+        let (paid, t) = f.treasury.request_withdraw(&alice, &burned);
+        assert_eq!(paid, 0);
+        let ra = remaining(&f, t);
+        // A loss after the request, larger than Alice's claim: NAV per share
+        // falls far enough that NAV pricing alone would hand her more shares
+        // than she burned.
+        assert!(2 * ra < rb - 1, "enough idle to lose");
+        lose(&f, 2 * ra);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+
+        let nav_released = f.treasury.nav() + ra;
+        let at_nav = shares_for_deposit(ra, nav_released, f.treasury.total_shares()).unwrap();
+        assert!(at_nav > burned, "the loss must make NAV pricing favour Alice");
+        let minted = f.treasury.cancel_withdraw(&alice, &t);
+        assert!(has_event(
+            &f,
+            &WithdrawCancelled {
+                ticket_id: t,
+                owner: alice.clone(),
+                assets: ra,
+                shares: minted,
+            }
+        ));
+        assert_eq!(minted, burned, "capped at the shares burned for these assets");
+        assert_eq!(f.treasury.shares_of(&alice), burned);
+        assert_eq!(f.treasury.withdraw_ticket(&t), None);
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn cancel_after_gain_mints_at_current_nav() {
+        let (f, alice, bob) = deployed_vault();
+        f.treasury.request_withdraw(&bob, &f.treasury.shares_of(&bob));
+        let burned = f.treasury.shares_of(&alice);
+        let (_, t) = f.treasury.request_withdraw(&alice, &burned);
+        // A gain after the request (fees, a donation...) raises NAV, but
+        // not enough idle arrives to pay the queue.
+        let giver = sponsor(&f, 1_000 * USDC);
+        donate(&f, &giver, 5 * USDC);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        let minted = f.treasury.cancel_withdraw(&alice, &t);
+        assert!(minted < burned, "a gain must not be captured by cancelling");
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn cancel_reads_nav_after_releasing_reservation() {
+        let (f, alice, bob) = deployed_vault();
+        f.treasury.request_withdraw(&bob, &f.treasury.shares_of(&bob));
+        let (_, t) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        let ra = remaining(&f, t);
+        let giver = sponsor(&f, 1_000 * USDC);
+        donate(&f, &giver, 5 * USDC);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        let nav_before = f.treasury.nav();
+        let supply = f.treasury.total_shares();
+        let minted = f.treasury.cancel_withdraw(&alice, &t);
+        // NAV subtracts QueueReserved: read after the release it is
+        // `nav_before + ra`. Reading it before would subtract `ra` twice and
+        // mint more shares.
+        let right = shares_for_deposit(ra, nav_before + ra, supply).unwrap();
+        let wrong = shares_for_deposit(ra, nav_before, supply).unwrap();
+        assert!(wrong > right);
+        assert_eq!(minted, right);
+    }
+
+    #[test]
+    fn cancel_before_delay_rejected() {
+        let (f, alice, bob) = deployed_vault();
+        let (_, t) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        let created = f.treasury.withdraw_ticket(&t).unwrap().created_at;
+        f.env
+            .ledger()
+            .set_timestamp(created + MIN_CANCEL_DELAY - 1);
         assert_eq!(
-            f.treasury.try_claim_withdraw(&t1),
+            f.treasury.try_cancel_withdraw(&alice, &t),
+            Err(Ok(Error::CancelTooEarly))
+        );
+        f.env.ledger().set_timestamp(created + MIN_CANCEL_DELAY);
+        assert_eq!(
+            f.treasury.try_cancel_withdraw(&bob, &t),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            f.treasury.try_cancel_withdraw(&alice, &99),
+            Err(Ok(Error::TicketNotFound))
+        );
+        f.treasury.set_paused(&true);
+        assert_eq!(
+            f.treasury.try_cancel_withdraw(&alice, &t),
+            Err(Ok(Error::Paused))
+        );
+        f.treasury.set_paused(&false);
+        assert!(f.treasury.cancel_withdraw(&alice, &t) > 0);
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn legacy_ticket_not_cancellable() {
+        let (f, alice, _) = deployed_vault();
+        let (_, t) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        // A ticket written before #277 has no TicketMeta.
+        f.env.as_contract(&f.treasury_id, || {
+            f.env.storage().persistent().remove(&DataKey::TicketMeta(t));
+        });
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        assert_eq!(
+            f.treasury.try_cancel_withdraw(&alice, &t),
+            Err(Ok(Error::TicketNotCancellable))
+        );
+        // It still decodes, transfers and drains.
+        let carol = Address::generate(&f.env);
+        f.treasury.transfer_ticket(&alice, &carol, &t);
+        let owed = remaining(&f, t);
+        let giver = sponsor(&f, owed);
+        donate(&f, &giver, owed);
+        assert_eq!(f.treasury.claim_withdraw(&t), owed);
+        assert_eq!(balance(&f, &carol), owed);
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn transfer_then_cancel_by_new_owner() {
+        let (f, alice, _) = deployed_vault();
+        let burned = f.treasury.shares_of(&alice);
+        let (_, t) = f.treasury.request_withdraw(&alice, &burned);
+        let carol = Address::generate(&f.env);
+        let mallory = Address::generate(&f.env);
+        assert_eq!(
+            f.treasury.try_transfer_ticket(&mallory, &carol, &t),
+            Err(Ok(Error::Unauthorized))
+        );
+        f.treasury.transfer_ticket(&alice, &carol, &t);
+        assert!(has_event(
+            &f,
+            &TicketTransferred {
+                ticket_id: t,
+                from: alice.clone(),
+                to: carol.clone(),
+            }
+        ));
+        assert_eq!(f.treasury.withdraw_ticket(&t).unwrap().owner, carol);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        assert_eq!(
+            f.treasury.try_cancel_withdraw(&alice, &t),
+            Err(Ok(Error::Unauthorized))
+        );
+        let minted = f.treasury.cancel_withdraw(&carol, &t);
+        assert!(minted > 0 && minted <= burned);
+        assert_eq!(f.treasury.shares_of(&carol), minted);
+        assert_queue_consistent(&f);
+    }
+
+    #[test]
+    fn cancel_and_transfer_require_owner_auth() {
+        let (f, alice, _) = deployed_vault();
+        let (_, t) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+        f.env.set_auths(&[]);
+        assert!(f.treasury.try_cancel_withdraw(&alice, &t).is_err());
+        assert!(f
+            .treasury
+            .try_transfer_ticket(&alice, &Address::generate(&f.env), &t)
+            .is_err());
+    }
+
+    #[test]
+    fn estimated_unlock_orders_by_close_time() {
+        let f = vault_fixture();
+        let alice = depositor(&f, 20 * USDC);
+        let bob = depositor(&f, 180 * USDC);
+        f.treasury.deposit(&alice, &(20 * USDC));
+        f.treasury.deposit(&bob, &(180 * USDC));
+        // Index order: the late market first (big), the early one second
+        // (small). Sorting by close time must put the early one first.
+        let late = extra_market(&f, 70);
+        f.treasury
+            .agent_buy(&f.agent, &late, &Outcome::Yes, &(85 * USDC), &0);
+        f.treasury
+            .agent_buy(&f.agent, &late, &Outcome::No, &(85 * USDC), &0);
+        let creator = f.market_core.get_market(&f.market_id).creator;
+        let early_close = MARKET_CLOSE - 10 * DAY_SECONDS;
+        let early = f.market_core.create_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[71; 32]),
+            &BytesN::from_array(&f.env, &[171; 32]),
+            &String::from_str(&f.env, "ipfs://early"),
+            &Category::Crypto,
+            &early_close,
+            &(100 * USDC),
+            &5000u32,
+        );
+        f.treasury
+            .agent_buy(&f.agent, &early, &Outcome::Yes, &(15 * USDC), &0);
+        f.treasury
+            .agent_buy(&f.agent, &early, &Outcome::No, &(15 * USDC), &0);
+        assert_eq!(balance(&f, &f.treasury_id), 0);
+        assert_eq!(f.treasury.open_market_at(&0).unwrap().market_id, late);
+
+        let (_, ta) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        let early_floor = f.treasury.market_valuation(&early).floor_value;
+        assert!(remaining(&f, ta) <= early_floor, "alice fits the early market");
+        assert_eq!(f.treasury.estimated_unlock(&ta), Some(early_close));
+
+        let (_, tb) = f
+            .treasury
+            .request_withdraw(&bob, &f.treasury.shares_of(&bob));
+        let pos = f.treasury.queue_position(&tb).unwrap();
+        assert_eq!(
+            pos,
+            QueuePosition {
+                index: 1,
+                owed_ahead: remaining(&f, ta),
+                in_window: true,
+                truncated: false,
+            }
+        );
+        // Bob needs both markets: the later close time.
+        assert_eq!(f.treasury.estimated_unlock(&tb), Some(MARKET_CLOSE));
+        assert_eq!(f.treasury.estimated_unlock(&99), None);
+        // Covered by idle already: unlocks now.
+        let giver = sponsor(&f, 1_000 * USDC);
+        donate(&f, &giver, remaining(&f, ta));
+        assert_eq!(
+            f.treasury.estimated_unlock(&ta),
+            Some(f.env.ledger().timestamp())
+        );
+    }
+
+    #[test]
+    fn queue_views_are_bounded() {
+        let (f, owners) = queued_vault(4);
+        let page = f.treasury.queue_page(&0, &100);
+        assert_eq!(page.len(), 4);
+        assert_eq!(page.get(0).unwrap().ticket_id, 1);
+        assert_eq!(page.get(3).unwrap().ticket.owner, owners[3]);
+        assert_eq!(f.treasury.queue_page(&3, &1).len(), 1);
+        assert_eq!(f.treasury.queue_page(&10, &5).len(), 0);
+        let p = f.treasury.queue_position(&1).unwrap();
+        assert_eq!((p.index, p.owed_ahead, p.in_window), (0, 0, true));
+        assert_eq!(f.treasury.queue_position(&99), None);
+    }
+
+    #[test]
+    fn claim_withdraw_still_permissionless() {
+        let (f, alice, _) = deployed_vault();
+        let (_, t) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        assert_eq!(
+            f.treasury.try_claim_withdraw(&t),
             Err(Ok(Error::NothingToPay))
         );
         assert_eq!(
             f.treasury.try_claim_withdraw(&9),
             Err(Ok(Error::TicketNotFound))
         );
-
-        f.env.ledger().set_timestamp(MARKET_CLOSE);
-        f.market_core.resolve(&f.market_id, &Outcome::Yes);
-        f.treasury.redeem(&f.agent, &f.market_id);
-        let owed_alice = f.treasury.withdraw_ticket(&t1).unwrap().remaining;
-        let owed_bob = f.treasury.withdraw_ticket(&t2).unwrap().remaining;
-        let alice_before = balance(&f, &alice);
-
+        let owed = remaining(&f, t);
+        let giver = sponsor(&f, owed);
+        donate(&f, &giver, owed);
+        let before = balance(&f, &alice);
+        // No auth at all: anyone can trigger the payout, which always goes to
+        // the ticket's owner.
         f.env.set_auths(&[]);
-        assert_eq!(f.treasury.claim_withdraw(&t1), owed_alice);
+        assert_eq!(f.treasury.claim_withdraw(&t), owed);
         assert!(has_event(
             &f,
             &WithdrawPaid {
-                ticket_id: t1,
-                amount: owed_alice
+                ticket_id: t,
+                amount: owed
             }
         ));
-        assert_eq!(balance(&f, &alice), alice_before + owed_alice);
-        assert_eq!(f.treasury.claim_withdraw(&t2), owed_bob);
+        assert_eq!(balance(&f, &alice), before + owed);
+        assert_eq!(f.treasury.withdraw_ticket(&t), None);
         assert_eq!(f.treasury.queue_reserved(), 0);
-        assert_eq!(f.treasury.queue_bounds(), (3, 3));
-        assert_eq!(f.treasury.withdraw_ticket(&t1), None);
+        assert_eq!(f.treasury.queue_bounds(), (2, 2));
+    }
+
+    /// Random request / cancel / proceeds / deposit sequences, in the style
+    /// of `deposit_withdraw_round_trip_never_profits`: Σ remaining ==
+    /// QueueReserved after every step, and cancelling never returns more
+    /// shares than the request burned for the same assets.
+    #[test]
+    fn queue_random_ops_keep_reserved_and_never_profit() {
+        let mut seed: u64 = 0x5DEE_CE66_D1CE_4E5B;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 11
+        };
+        let (f, owners) = queued_vault(4);
+        let giver = sponsor(&f, 100_000 * USDC);
+        // (ticket id, owner index, shares burned, assets at request)
+        let mut live: std::vec::Vec<(u64, usize, i128, i128)> = std::vec::Vec::new();
+        for _ in 0..40 {
+            match next() % 4 {
+                0 => {
+                    // Re-deposit and re-request part of it.
+                    let i = (next() % owners.len() as u64) as usize;
+                    let who = &owners[i];
+                    let amount = MIN_DEPOSIT + (next() % (5 * USDC as u64)) as i128;
+                    mint(&f, who, amount);
+                    f.treasury.deposit(who, &amount);
+                    let shares = f.treasury.shares_of(who);
+                    let part = 1 + (next() as i128 % shares);
+                    let nav = f.treasury.nav();
+                    let assets =
+                        assets_for_shares(part, nav, f.treasury.total_shares()).unwrap();
+                    let (_, id) = f.treasury.request_withdraw(who, &part);
+                    if id != 0 {
+                        live.push((id, i, part, assets));
+                    }
+                }
+                1 => {
+                    f.env
+                        .ledger()
+                        .set_timestamp(f.env.ledger().timestamp() + MIN_CANCEL_DELAY);
+                    live.retain(|(id, ..)| f.treasury.withdraw_ticket(id).is_some());
+                    if let Some(&(id, i, burned, assets)) =
+                        live.get((next() % 8) as usize % live.len().max(1))
+                    {
+                        let owner = f.treasury.withdraw_ticket(&id).unwrap().owner;
+                        let left = remaining(&f, id);
+                        let before = f.treasury.shares_of(&owner);
+                        if let Ok(Ok(minted)) = f.treasury.try_cancel_withdraw(&owner, &id) {
+                            assert!(minted <= burned * left / assets, "cancel profited");
+                            assert_eq!(f.treasury.shares_of(&owner), before + minted);
+                            let _ = i;
+                        }
+                    }
+                }
+                2 => {
+                    // Proceeds arrive and someone triggers the drain.
+                    let amount = (next() % (30 * USDC as u64)) as i128 + 1;
+                    donate(&f, &giver, amount);
+                    let head = f.treasury.queue_bounds().0;
+                    let _ = f.treasury.try_claim_withdraw(&head);
+                }
+                _ => {
+                    let who = depositor(&f, 50 * USDC);
+                    f.treasury
+                        .deposit(&who, &(MIN_DEPOSIT + (next() % (40 * USDC as u64)) as i128));
+                }
+            }
+            assert_queue_consistent(&f);
+        }
     }
 
     #[test]
@@ -9276,6 +10418,28 @@ mod test {
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
+
+    // Scenarios re-run against both market-core registrations (restored
+    // from #75; the invocation was lost in a merge), plus the #277 queue
+    // drains that cross into market-core.
+    both_modes!(
+        enforces_caps_and_closes_exposure,
+        rejects_trade_above_single_trade_cap,
+        rejects_trade_above_daily_cap,
+        agent_sell_returns_capital_without_touching_caps,
+        paused_treasury_rejects_agent_trading,
+        daily_cap_frees_capacity_after_window_slides,
+        burst_across_old_window_boundary_is_rejected,
+        explorer_i4_sequence_stays_within_max_daily,
+        redeem_and_claim_reduce_net_exposure,
+        nav_unchanged_by_redeem_after_resolution,
+        settle_market_redeems_position_after_resolution,
+        settle_market_is_idempotent_and_never_errors_on_retry,
+        market_core_switch_namespaces_exposure_and_allows_legacy_redeem,
+        migrate_then_successor_redeems_after_resolution,
+        settle_market_drains_queue_in_same_tx,
+        estimated_unlock_orders_by_close_time,
+    );
 
     // -----------------------------------------------------------------------
     // Issue #137: Adversarial hostile SEP-41 token suite for treasury

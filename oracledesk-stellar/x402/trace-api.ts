@@ -23,11 +23,14 @@ import {
   type TraceVerdict,
 } from "./trace-verification.js";
 import {
+  LedgerConflict,
   MemoryPaymentLedger,
   paymentIdentity,
   type PaymentLedger,
   type PaymentEntry,
+  type RefundState,
 } from "./payment-ledger.js";
+import { approveRefund, rejectRefund } from "./refunds.js";
 import {
   loadVerdictPolicy,
   decide,
@@ -121,6 +124,13 @@ export interface TraceApiOptions {
   ledger?: PaymentLedger;
   adminToken?: string;
   ledgerSequence?: (network: string) => Promise<number>;
+  /**
+   * Seconds after settlement during which the same payment can re-download
+   * the trace, even past the payment's own `expiresAt`
+   * (`X402_REDELIVERY_WINDOW_SECS`, default 900). Afterwards an undelivered
+   * payment is refunded (refunds.ts).
+   */
+  redeliveryWindowSecs?: number;
   /** #328: structured logger; defaults to the shared redacting pino logger. */
   logger?: Logger;
   /** #328: Prometheus metrics; a private registry is created when omitted. */
@@ -128,6 +138,8 @@ export interface TraceApiOptions {
   /** #330: when set, every settled payment gets a signed delivery receipt. */
   receiptSigner?: ReceiptSigner;
 }
+
+const REFUNDED_STATES = new Set(["refund_pending", "refunding", "refunded"]);
 export class MapTraceRepository implements TraceRepository {
   constructor(private readonly records: ReadonlyMap<string, TraceRecord>) {}
   async get(traceId: string) {
@@ -369,6 +381,10 @@ export function createTraceApi(options: TraceApiOptions): Express {
     throw new Error(
       "traceLoadTimeoutMs must be positive and below half maxTimeoutSeconds",
     );
+  const ledger = options.ledger ?? new MemoryPaymentLedger();
+  const redeliveryWindowMs = (options.redeliveryWindowSecs ?? 900) * 1000;
+  if (!Number.isFinite(redeliveryWindowMs) || redeliveryWindowMs < 0)
+    throw new Error("redeliveryWindowSecs must be a non-negative number");
   const baseLedger = options.ledger ?? new MemoryPaymentLedger();
   const log = options.logger ?? defaultLogger;
   const metrics =
@@ -637,11 +653,31 @@ export function createTraceApi(options: TraceApiOptions): Express {
           return;
         }
         if (existing) {
+          if (REFUNDED_STATES.has(existing.state)) {
+            // Refunded (or being refunded): the trace is never served again.
+            res.status(410).json({
+              error: "Payment refunded",
+              ...(existing.refundTx ? { refundTx: existing.refundTx } : {}),
+            });
+            return;
+          }
           if (
             (existing.state === "settled" || existing.state === "delivered") &&
             existing.responseBody &&
             existing.paymentResponseHeader
           ) {
+            // Redelivery is bounded by the settlement time, not by the
+            // payment's (short) authorization expiry.
+            const settledAt = existing.settledAt ?? existing.updatedAt;
+            if (Date.now() > settledAt + redeliveryWindowMs) {
+              res.status(410).json({
+                error: "Redelivery window closed",
+                ...(existing.state === "settled"
+                  ? { refund: "pending" }
+                  : {}),
+              });
+              return;
+            }
             const body = JSON.parse(existing.responseBody) as {
               traceHash: string;
               content: unknown;
@@ -663,6 +699,26 @@ export function createTraceApi(options: TraceApiOptions): Express {
               body.traceHash !== existing.traceHash
             )
               throw new Error("Corrupt replay record");
+            // Claim the delivery *before* sending: a concurrent refund sweep
+            // and this re-download race on the same CAS, so exactly one wins
+            // (delivered, or refund_pending and this replay answers 410).
+            let claimed: PaymentEntry;
+            try {
+              claimed = await ledger.transition(
+                existing.paymentId,
+                ["settled", "delivered"],
+                "delivered",
+              );
+            } catch (error) {
+              if (!(error instanceof LedgerConflict)) throw error;
+              const now = await ledger.get(existing.paymentId);
+              res.status(410).json({
+                error: "Payment refunded",
+                ...(now?.refundTx ? { refundTx: now.refundTx } : {}),
+              });
+              return;
+            }
+            send(claimed);
             stage = "deliver";
             if (signer && !existing.receipt) {
               // #330: settled before receipts existed. Backfill once, from the
@@ -696,6 +752,24 @@ export function createTraceApi(options: TraceApiOptions): Express {
             retryAfter: 2,
           });
           return;
+        }
+        // Only a new payment is subject to its authorization expiry and
+        // ledger bounds; a settled one is replayed by `settledAt` above.
+        if (identity.expiresAt <= Date.now()) {
+          res.status(402).json({ error: "Payment expired" });
+          return;
+        }
+        if (identity.maxLedger !== undefined) {
+          if (
+            !options.ledgerSequence ||
+            (await options.ledgerSequence(payload.accepted.network)) >=
+              identity.maxLedger
+          ) {
+            res
+              .status(402)
+              .json({ error: "Payment ledger bounds expired or unavailable" });
+            return;
+          }
         }
       }
       const prepareStart = performance.now();
@@ -949,7 +1023,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           settlementTx: s.transaction,
           payer: s.payer,
           paymentResponseHeader: responseHeader,
-          settledAt,
+          settledAt: Date.now(),
           receipt,
         },
       );
@@ -965,16 +1039,28 @@ export function createTraceApi(options: TraceApiOptions): Express {
               : "";
         res.set("X-Trace-Verdict", `${tag}${reason}`);
       }
-      deliver(entry, false);
-      plog.info(
-        {
-          stage: "delivered",
-          verifyMs: Math.round(verifyMs),
-          settleMs: Math.round(settleMs),
-          bytes: prepared.bytes.length,
-        },
-        "x402 trace delivered",
-      );
+      deliver(entry);
+      /** First delivery: recorded only once the response actually finished,
+       * so a client abort leaves the entry `settled` (redeliverable, then
+       * refundable). */
+      function deliver(entry: PaymentEntry) {
+        res.on("finish", () => {
+          void ledger
+            .transition(entry.paymentId, ["settled", "delivered"], "delivered")
+            .catch((error) =>
+              console.error("Payment delivery record failed", error),
+            );
+        });
+        send(entry);
+      }
+      function send(entry: PaymentEntry) {
+        res
+          .set("PAYMENT-RESPONSE", entry.paymentResponseHeader!)
+          .set("Cache-Control", "private, no-store")
+          .status(200)
+          .type("application/json")
+          .send(entry.responseBody);
+      }
     } catch (error) {
       if (verified)
         await verified.cancellationDispatcher
@@ -1017,7 +1103,8 @@ export function createTraceApi(options: TraceApiOptions): Express {
       }
     }
   });
-  app.get("/admin/payments/:paymentId", async (req, res) => {
+  /** Bearer check shared by the admin routes (the signed-admin item replaces it). */
+  function adminAuthorized(req: express.Request, res: Response): boolean {
     const actual = Buffer.from(req.get("authorization") ?? "");
     const expected = Buffer.from(`Bearer ${options.adminToken ?? ""}`);
     if (
@@ -1026,8 +1113,12 @@ export function createTraceApi(options: TraceApiOptions): Express {
       !timingSafeEqual(actual, expected)
     ) {
       res.status(401).json({ error: "Unauthorized" });
-      return;
+      return false;
     }
+    return true;
+  }
+  app.get("/admin/payments/:paymentId", async (req, res) => {
+    if (!adminAuthorized(req, res)) return;
     try {
       const e = await ledger.get(String(req.params.paymentId));
       if (!e) {
@@ -1060,5 +1151,57 @@ export function createTraceApi(options: TraceApiOptions): Express {
       fail(res, "ledger_unavailable");
     }
   });
+  const REFUND_STATES: RefundState[] = [
+    "review",
+    "pending",
+    "submitted",
+    "succeeded",
+    "failed",
+    "rejected",
+  ];
+  app.get("/admin/refunds", async (req, res) => {
+    if (!adminAuthorized(req, res)) return;
+    const state = req.query.state ? String(req.query.state) : undefined;
+    if (state && !REFUND_STATES.includes(state as RefundState)) {
+      res.status(400).json({ error: "Unknown refund state" });
+      return;
+    }
+    const cursor = Number(req.query.cursor ?? 0);
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      res.status(400).json({ error: "Invalid cursor" });
+      return;
+    }
+    try {
+      const page = await ledger.refunds.list(
+        state as RefundState | undefined,
+        cursor,
+        50,
+      );
+      res.set("Cache-Control", "no-store").json({
+        items: page.items.map(({ txXdr: _xdr, ...r }) => r),
+        ...(page.next !== undefined ? { next: page.next } : {}),
+      });
+    } catch {
+      res.status(503).json({ error: "Ledger unavailable" });
+    }
+  });
+  for (const action of ["approve", "reject"] as const)
+    app.post(`/admin/refunds/:paymentId/${action}`, async (req, res) => {
+      if (!adminAuthorized(req, res)) return;
+      const id = String(req.params.paymentId);
+      try {
+        const e =
+          action === "approve"
+            ? await approveRefund(ledger, id)
+            : await rejectRefund(ledger, id);
+        res.set("Cache-Control", "no-store").json({ paymentId: id, state: e.state });
+      } catch (error) {
+        if (error instanceof LedgerConflict) {
+          res.status(409).json({ error: "Refund is not awaiting review" });
+          return;
+        }
+        res.status(503).json({ error: "Ledger unavailable" });
+      }
+    });
   return app;
 }

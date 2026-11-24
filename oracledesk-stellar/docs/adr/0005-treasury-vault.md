@@ -147,11 +147,56 @@ Agents can never spend reserved collateral. `agent_buy` and
 `agent_create_market` fail with `CapitalReserved` unless
 `idle - amount >= queue_reserved`.
 
-`claim_withdraw(ticket_id)` pays the head ticket as far as idle collateral
-allows. Anyone can call it, but the money always goes to the ticket's owner.
-Tickets wait while capital stays deployed, which is bounded by the close
-times of the open markets. UIs can read `queue_reserved()`,
-`queue_bounds()` and `withdraw_ticket(id)`.
+Tickets are paid automatically (#277). `WithdrawTicket` keeps its layout; a
+new `TicketMeta { shares_burned, assets_at_request }` is written next to every
+new ticket. Tickets from before the upgrade have no meta: they drain and can be
+transferred but not cancelled (`TicketNotCancellable`).
+
+**Drain.** Every entrypoint that brings collateral in drains the queue in the
+same transaction, after its own state writes: `settle_market`, `redeem`,
+`claim_pool_remainder`, the `legacy_*` variants, `redeem_many`,
+`claim_pool_remainders`, `agent_sell` / `agent_sell_v2` (and traced variants),
+`recall_from_yield` and `deposit`. A deposit is priced before the drain, and
+NAV already excludes the reservation, so the drain moves no value between
+shareholders. Settlement never fails because of the queue: an overflow stops
+the drain and emits `QueueDrainSkipped`.
+
+`available = min(idle, queue_reserved)`. The drain takes a window of
+`QUEUE_WINDOW = 8` ticket ids from the head (holes left by paid or cancelled
+tickets are skipped but count as steps), and reads at most
+`MAX_QUEUE_STEPS = 8` ids per call. If `available` covers the window it is paid
+in full and the head moves past it; otherwise each ticket gets
+`floor(available * remaining_i / window_owed)`, the rounding dust goes to the
+oldest ticket only (never above what it is owed) and the drain stops. No ticket
+outside the window is paid while one inside it is owed, the floors never exceed
+`available`, and `queue_reserved` never underflows when `idle < reserved`. Every
+ticket read has its TTL bumped. `claim_withdraw(ticket_id)` stays
+permissionless: it runs the same drain and returns the total paid
+(`NothingToPay` if it made no progress). Measured worst cases
+(contracts/budget-tests, `make budget`) stay under 7% of the network
+instruction, read and write limits, so the constants have large headroom.
+
+**Cancel.** `cancel_withdraw(owner, ticket_id)` needs the owner's auth, an
+unpaused treasury and `now >= created_at + MIN_CANCEL_DELAY` (1 day). It
+releases the ticket's reservation *before* reading NAV (NAV subtracts the
+reservation, so reading first would subtract it twice), then re-mints
+`min(shares_for_deposit(remaining, nav, supply), floor(shares_burned *
+remaining / assets_at_request))` shares. The cap stops a holder who requested
+before a loss from cancelling afterwards for more shares than they burned;
+after a gain the holder gets fewer shares at the higher NAV. If epoch pricing
+(#256) lands, cancellation is priced at the next epoch boundary and the cap
+still applies. `transfer_ticket(from, to, ticket_id)` moves the ticket and its
+cancellation right.
+
+**Views.** `queue_page(start, limit <= 25)`; `queue_position(ticket_id)` ->
+`QueuePosition { index, owed_ahead, in_window, truncated }`, walking at most 200
+ids; `estimated_unlock(ticket_id)`, which accumulates the open markets' floor
+values (at most `MAX_OPEN_MARKETS`) in close-time order on top of
+`min(idle, reserved)` and returns the close time of the market that first
+covers `owed_ahead + remaining`, or `None`. It is an estimate only.
+
+UIs can also read `queue_reserved()`, `queue_bounds()` and
+`withdraw_ticket(id)`.
 
 ### Operating modes and the gate table (#272)
 
