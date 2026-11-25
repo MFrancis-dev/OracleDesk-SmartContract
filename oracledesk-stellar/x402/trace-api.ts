@@ -23,11 +23,21 @@ import {
   type TraceVerdict,
 } from "./trace-verification.js";
 import {
+  LedgerConflict,
   MemoryPaymentLedger,
   paymentIdentity,
   type PaymentLedger,
   type PaymentEntry,
+  type RefundState,
 } from "./payment-ledger.js";
+import { approveRefund, rejectRefund } from "./refunds.js";
+import {
+  decodeCursor,
+  encodeCursor,
+  parseCursorKeys,
+  type CursorKeys,
+} from "./discovery.js";
+import { classifyRegistryError } from "./errors.js";
 import {
   loadVerdictPolicy,
   decide,
@@ -70,6 +80,8 @@ export interface TraceListEntry {
   agent: string;
   action: string;
   publishedAt: string;
+  ledger?: number;
+  archived?: boolean;
 }
 
 export interface TraceListPage {
@@ -84,11 +96,12 @@ export interface TraceListPage {
  * "everything agent X published" and "every Buy decision on market 7".
  */
 export interface TraceListRepository {
-  listByAgent(agent: string, cursor?: string, limit?: number): Promise<TraceListPage>;
+  listByAgent(agent: string, cursor?: bigint | string, limit?: number): Promise<TraceListPage>;
+  listByMarket(marketId: string, cursor?: bigint | string, limit?: number): Promise<TraceListPage>;
   listByMarketAction(
     marketId: string,
     action: string,
-    cursor?: string,
+    cursor?: bigint | string,
     limit?: number,
   ): Promise<TraceListPage>;
 }
@@ -121,6 +134,47 @@ export interface TraceApiOptions {
   ledger?: PaymentLedger;
   adminToken?: string;
   ledgerSequence?: (network: string) => Promise<number>;
+  cursorKeys?: CursorKeys;
+  quote?: (traceId: string) => string;
+  listCacheSize?: number;
+  paymentsDisabled?: boolean;
+}
+
+const ACTION_LABELS = new Set([
+  "create_market", "propose_market", "buy", "sell", "skip", "redeem",
+  "claim_remainder", "resolve",
+]);
+function queryDigest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+function publicEntry(entry: TraceListEntry, priceQuote: string): Record<string, unknown> {
+  return {
+    traceId: entry.traceId,
+    marketId: entry.marketId,
+    agent: entry.agent,
+    action: entry.action,
+    publishedAt: entry.publishedAt,
+    ...(entry.ledger === undefined ? {} : { ledger: entry.ledger }),
+    ...(entry.archived ? { archived: true } : {}),
+    priceQuote,
+  };
+}
+function parseMarket(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+  try {
+    const n = BigInt(value);
+    return n <= 18446744073709551615n ? n.toString() : undefined;
+  } catch { return undefined; }
+}
+function parseAgent(value: unknown): string | undefined {
+  return typeof value === "string" && /^G[A-Z2-7]+$/.test(value) ? value : undefined;
+  /**
+   * Seconds after settlement during which the same payment can re-download
+   * the trace, even past the payment's own `expiresAt`
+   * (`X402_REDELIVERY_WINDOW_SECS`, default 900). Afterwards an undelivered
+   * payment is refunded (refunds.ts).
+   */
+  redeliveryWindowSecs?: number;
   /** #328: structured logger; defaults to the shared redacting pino logger. */
   logger?: Logger;
   /** #328: Prometheus metrics; a private registry is created when omitted. */
@@ -128,6 +182,8 @@ export interface TraceApiOptions {
   /** #330: when set, every settled payment gets a signed delivery receipt. */
   receiptSigner?: ReceiptSigner;
 }
+
+const REFUNDED_STATES = new Set(["refund_pending", "refunding", "refunded"]);
 export class MapTraceRepository implements TraceRepository {
   constructor(private readonly records: ReadonlyMap<string, TraceRecord>) {}
   async get(traceId: string) {
@@ -369,6 +425,10 @@ export function createTraceApi(options: TraceApiOptions): Express {
     throw new Error(
       "traceLoadTimeoutMs must be positive and below half maxTimeoutSeconds",
     );
+  const ledger = options.ledger ?? new MemoryPaymentLedger();
+  const redeliveryWindowMs = (options.redeliveryWindowSecs ?? 900) * 1000;
+  if (!Number.isFinite(redeliveryWindowMs) || redeliveryWindowMs < 0)
+    throw new Error("redeliveryWindowSecs must be a non-negative number");
   const baseLedger = options.ledger ?? new MemoryPaymentLedger();
   const log = options.logger ?? defaultLogger;
   const metrics =
@@ -380,6 +440,19 @@ export function createTraceApi(options: TraceApiOptions): Express {
   const ledger = instrumentLedger(baseLedger, metrics);
   const signer = options.receiptSigner;
   const app = express();
+  const cursorKeys = options.cursorKeys ?? parseCursorKeys() ?? {
+    current: { kid: "default", secret: "x402-development-cursor-key" },
+  };
+  const pageCache = new Map<string, TraceListPage>();
+  const cacheGet = async (key: string, load: () => Promise<TraceListPage>) => {
+    const cached = pageCache.get(key);
+    if (cached) return cached;
+    const value = await load();
+    pageCache.set(key, value);
+    while (pageCache.size > (options.listCacheSize ?? 1000))
+      pageCache.delete(pageCache.keys().next().value!);
+    return value;
+  };
   app.locals.metrics = metrics;
   // Request-scoped logger first: every later line carries `reqId`.
   app.use(createHttpLogger(log));
@@ -465,6 +538,95 @@ export function createTraceApi(options: TraceApiOptions): Express {
   // Attach a rejection handler immediately, while preserving rejection for the startup caller.
   void ready.catch(() => {});
   app.locals.ready = ready;
+  app.get("/traces", async (req, res) => {
+    if (!options.listRepository) {
+      res.status(404).json({ error: "Discovery not configured" });
+      return;
+    }
+    const market = req.query.market;
+    const agent = req.query.agent;
+    const action = req.query.action;
+    if ((market === undefined) === (agent === undefined) || (action !== undefined && market === undefined)) {
+      res.status(400).json({ error: "Exactly one of market or agent is required; action requires market" });
+      return;
+    }
+    const marketId = market === undefined ? undefined : parseMarket(market);
+    const agentId = agent === undefined ? undefined : parseAgent(agent);
+    if ((market !== undefined && marketId === undefined) || (agent !== undefined && agentId === undefined)) {
+      res.status(400).json({ error: "Invalid market or agent" });
+      return;
+    }
+    if (action !== undefined && (typeof action !== "string" || (!ACTION_LABELS.has(action) && !action.startsWith("other:")))) {
+      res.status(400).json({ error: "Invalid action" });
+      return;
+    }
+    const order = req.query.order === undefined ? "desc" : req.query.order;
+    if (order !== "asc" && order !== "desc") {
+      res.status(400).json({ error: "order must be asc or desc" });
+      return;
+    }
+    const rawLimit = req.query.limit === undefined ? 25 : Number(req.query.limit);
+    if (!Number.isInteger(rawLimit) || rawLimit < 1) {
+      res.status(400).json({ error: "limit must be between 1 and 25" });
+      return;
+    }
+    const limit = Math.min(rawLimit, 25);
+    const canonical = JSON.stringify({ market: marketId, agent: agentId, action: action ?? null, order, limit });
+    const digest = queryDigest(canonical);
+    const supplied = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+    let cursor = supplied ? decodeCursor(supplied, cursorKeys, digest) : undefined;
+    if (supplied && !cursor) {
+      res.status(400).json({ error: "Invalid or expired cursor" });
+      return;
+    }
+    let start = cursor ? BigInt(cursor.next) : 0n;
+    let anchorTotal = cursor ? BigInt(cursor.anchorTotal) : undefined;
+    try {
+      const ledgerNumber = options.ledgerSequence
+        ? await options.ledgerSequence(options.networks[0].network)
+        : 0;
+      const loadPage = (at: bigint) => {
+        if (marketId !== undefined && action !== undefined)
+          return options.listRepository!.listByMarketAction(marketId, action, at, limit);
+        if (marketId !== undefined) return options.listRepository!.listByMarket(marketId, at, limit);
+        return options.listRepository!.listByAgent(agentId!, at, limit);
+      };
+      if (order === "desc" && !cursor) {
+        const first = await cacheGet(`${ledgerNumber}:${canonical}:0`, () => loadPage(0n));
+        anchorTotal = BigInt(first.total);
+        start = anchorTotal > BigInt(limit) ? anchorTotal - BigInt(limit) : 0n;
+      }
+      const load = async () => {
+        let page: TraceListPage;
+        page = await cacheGet(`${ledgerNumber}:${canonical}:${start}`, () => loadPage(start));
+        if (anchorTotal === undefined) anchorTotal = BigInt(page.total);
+        page = { ...page, total: anchorTotal.toString() };
+        if (order === "desc") {
+          page = { ...page, items: [...page.items].reverse() };
+          const next = start > BigInt(limit) ? start - BigInt(limit) : 0n;
+          page = { ...page, next: next.toString(), total: anchorTotal.toString() };
+        }
+        return page;
+      };
+      const page = await load();
+      const next = BigInt(page.next);
+      const hasNext = order === "desc" ? next > 0n : next < BigInt(page.total);
+      const nextCursor = hasNext
+        ? encodeCursor({ q: digest, order, next: next.toString(), anchorTotal: (anchorTotal ?? BigInt(page.total)).toString(), exp: Math.floor(Date.now() / 1000) + 86400 }, cursorKeys)
+        : null;
+      const items = page.items.map((entry) => publicEntry({ ...entry, ledger: ledgerNumber }, options.quote?.(entry.traceId) ?? options.price));
+      res.set("Cache-Control", "public, max-age=5").json({ items, nextCursor, total: page.total });
+    } catch (error) {
+      const classified = classifyRegistryError(error);
+      if (classified.kind === "upstream") {
+        res.set("Retry-After", "2").status(503).json({ error: "Registry unavailable", retryAfter: 2 });
+      } else if (classified.kind === "contract" && classified.code === 3001) {
+        res.status(400).json({ error: "Page too large" });
+      } else {
+        res.status(503).json({ error: "Registry unavailable" });
+      }
+    }
+  });
 
   /** Sends `{ error: kind, message, ...extra }` and counts the kind. */
   function fail(
@@ -637,11 +799,31 @@ export function createTraceApi(options: TraceApiOptions): Express {
           return;
         }
         if (existing) {
+          if (REFUNDED_STATES.has(existing.state)) {
+            // Refunded (or being refunded): the trace is never served again.
+            res.status(410).json({
+              error: "Payment refunded",
+              ...(existing.refundTx ? { refundTx: existing.refundTx } : {}),
+            });
+            return;
+          }
           if (
             (existing.state === "settled" || existing.state === "delivered") &&
             existing.responseBody &&
             existing.paymentResponseHeader
           ) {
+            // Redelivery is bounded by the settlement time, not by the
+            // payment's (short) authorization expiry.
+            const settledAt = existing.settledAt ?? existing.updatedAt;
+            if (Date.now() > settledAt + redeliveryWindowMs) {
+              res.status(410).json({
+                error: "Redelivery window closed",
+                ...(existing.state === "settled"
+                  ? { refund: "pending" }
+                  : {}),
+              });
+              return;
+            }
             const body = JSON.parse(existing.responseBody) as {
               traceHash: string;
               content: unknown;
@@ -663,6 +845,26 @@ export function createTraceApi(options: TraceApiOptions): Express {
               body.traceHash !== existing.traceHash
             )
               throw new Error("Corrupt replay record");
+            // Claim the delivery *before* sending: a concurrent refund sweep
+            // and this re-download race on the same CAS, so exactly one wins
+            // (delivered, or refund_pending and this replay answers 410).
+            let claimed: PaymentEntry;
+            try {
+              claimed = await ledger.transition(
+                existing.paymentId,
+                ["settled", "delivered"],
+                "delivered",
+              );
+            } catch (error) {
+              if (!(error instanceof LedgerConflict)) throw error;
+              const now = await ledger.get(existing.paymentId);
+              res.status(410).json({
+                error: "Payment refunded",
+                ...(now?.refundTx ? { refundTx: now.refundTx } : {}),
+              });
+              return;
+            }
+            send(claimed);
             stage = "deliver";
             if (signer && !existing.receipt) {
               // #330: settled before receipts existed. Backfill once, from the
@@ -696,6 +898,24 @@ export function createTraceApi(options: TraceApiOptions): Express {
             retryAfter: 2,
           });
           return;
+        }
+        // Only a new payment is subject to its authorization expiry and
+        // ledger bounds; a settled one is replayed by `settledAt` above.
+        if (identity.expiresAt <= Date.now()) {
+          res.status(402).json({ error: "Payment expired" });
+          return;
+        }
+        if (identity.maxLedger !== undefined) {
+          if (
+            !options.ledgerSequence ||
+            (await options.ledgerSequence(payload.accepted.network)) >=
+              identity.maxLedger
+          ) {
+            res
+              .status(402)
+              .json({ error: "Payment ledger bounds expired or unavailable" });
+            return;
+          }
         }
       }
       const prepareStart = performance.now();
@@ -949,7 +1169,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           settlementTx: s.transaction,
           payer: s.payer,
           paymentResponseHeader: responseHeader,
-          settledAt,
+          settledAt: Date.now(),
           receipt,
         },
       );
@@ -965,16 +1185,28 @@ export function createTraceApi(options: TraceApiOptions): Express {
               : "";
         res.set("X-Trace-Verdict", `${tag}${reason}`);
       }
-      deliver(entry, false);
-      plog.info(
-        {
-          stage: "delivered",
-          verifyMs: Math.round(verifyMs),
-          settleMs: Math.round(settleMs),
-          bytes: prepared.bytes.length,
-        },
-        "x402 trace delivered",
-      );
+      deliver(entry);
+      /** First delivery: recorded only once the response actually finished,
+       * so a client abort leaves the entry `settled` (redeliverable, then
+       * refundable). */
+      function deliver(entry: PaymentEntry) {
+        res.on("finish", () => {
+          void ledger
+            .transition(entry.paymentId, ["settled", "delivered"], "delivered")
+            .catch((error) =>
+              console.error("Payment delivery record failed", error),
+            );
+        });
+        send(entry);
+      }
+      function send(entry: PaymentEntry) {
+        res
+          .set("PAYMENT-RESPONSE", entry.paymentResponseHeader!)
+          .set("Cache-Control", "private, no-store")
+          .status(200)
+          .type("application/json")
+          .send(entry.responseBody);
+      }
     } catch (error) {
       if (verified)
         await verified.cancellationDispatcher
@@ -1017,7 +1249,8 @@ export function createTraceApi(options: TraceApiOptions): Express {
       }
     }
   });
-  app.get("/admin/payments/:paymentId", async (req, res) => {
+  /** Bearer check shared by the admin routes (the signed-admin item replaces it). */
+  function adminAuthorized(req: express.Request, res: Response): boolean {
     const actual = Buffer.from(req.get("authorization") ?? "");
     const expected = Buffer.from(`Bearer ${options.adminToken ?? ""}`);
     if (
@@ -1026,8 +1259,12 @@ export function createTraceApi(options: TraceApiOptions): Express {
       !timingSafeEqual(actual, expected)
     ) {
       res.status(401).json({ error: "Unauthorized" });
-      return;
+      return false;
     }
+    return true;
+  }
+  app.get("/admin/payments/:paymentId", async (req, res) => {
+    if (!adminAuthorized(req, res)) return;
     try {
       const e = await ledger.get(String(req.params.paymentId));
       if (!e) {
@@ -1060,5 +1297,57 @@ export function createTraceApi(options: TraceApiOptions): Express {
       fail(res, "ledger_unavailable");
     }
   });
+  const REFUND_STATES: RefundState[] = [
+    "review",
+    "pending",
+    "submitted",
+    "succeeded",
+    "failed",
+    "rejected",
+  ];
+  app.get("/admin/refunds", async (req, res) => {
+    if (!adminAuthorized(req, res)) return;
+    const state = req.query.state ? String(req.query.state) : undefined;
+    if (state && !REFUND_STATES.includes(state as RefundState)) {
+      res.status(400).json({ error: "Unknown refund state" });
+      return;
+    }
+    const cursor = Number(req.query.cursor ?? 0);
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      res.status(400).json({ error: "Invalid cursor" });
+      return;
+    }
+    try {
+      const page = await ledger.refunds.list(
+        state as RefundState | undefined,
+        cursor,
+        50,
+      );
+      res.set("Cache-Control", "no-store").json({
+        items: page.items.map(({ txXdr: _xdr, ...r }) => r),
+        ...(page.next !== undefined ? { next: page.next } : {}),
+      });
+    } catch {
+      res.status(503).json({ error: "Ledger unavailable" });
+    }
+  });
+  for (const action of ["approve", "reject"] as const)
+    app.post(`/admin/refunds/:paymentId/${action}`, async (req, res) => {
+      if (!adminAuthorized(req, res)) return;
+      const id = String(req.params.paymentId);
+      try {
+        const e =
+          action === "approve"
+            ? await approveRefund(ledger, id)
+            : await rejectRefund(ledger, id);
+        res.set("Cache-Control", "no-store").json({ paymentId: id, state: e.state });
+      } catch (error) {
+        if (error instanceof LedgerConflict) {
+          res.status(409).json({ error: "Refund is not awaiting review" });
+          return;
+        }
+        res.status(503).json({ error: "Ledger unavailable" });
+      }
+    });
   return app;
 }

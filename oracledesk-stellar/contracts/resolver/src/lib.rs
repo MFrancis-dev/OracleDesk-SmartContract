@@ -7107,6 +7107,32 @@ mod test {
         assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
     }
 
+    /// Finding of `fuzz_resolver_spec_decode` (issue #278): a `Signers` rule
+    /// listing the same address twice passes `validate_rule` with a
+    /// threshold only reachable by counting that address twice, but
+    /// `record_attestation` dedups per address, so the market can never
+    /// reach quorum. Not fixed here (the issue keeps fixes in separate PRs):
+    /// tracked by this ignored regression test and the fuzz allow-list entry
+    /// `dup-signers` (fuzz/README.md). Un-ignore with the fix.
+    #[test]
+    #[ignore = "tracked finding dup-signers (#278): validate_rule accepts duplicate signer addresses"]
+    fn signers_rule_rejects_duplicate_addresses() {
+        let f = fixture(|env, _r, a, _b| {
+            ResolutionSpec::Signers(SignerConfig {
+                signers: Vec::from_array(env, [a.clone(), a.clone()]),
+                threshold: 2,
+                dispute_window: 100,
+            })
+        });
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(
+            f.resolver.try_register_signer_spec(&f.market_id, &spec),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
     #[test]
     fn bump_market_entries_skips_missing_keys() {
         let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));

@@ -67,6 +67,14 @@ export class AgentConfigError extends ConfigError {
   }
 }
 
+export interface InventoryConfig {
+  maxDeltaBps: bigint;
+  rebalanceBps: bigint;
+  maxHedgeStroops: bigint;
+  dailyHedgeStroops: bigint;
+  minSecsToClose: number;
+}
+
 // ─── Field parsers ───────────────────────────────────────────────────────────
 // Unset (undefined) takes the default. A set value, including "", must parse.
 
@@ -241,6 +249,11 @@ export const EnvSchema = z.object({
   VOL_CALIBRATION_REPORT_HASH: z.string().regex(/^[0-9a-fA-F]{64}$/, "must be a sha256 hex digest").optional(),
   TRADE_SIZE_STROOPS: stroopsField(100_000_000n),
   DEFAULT_SEED_STROOPS: stroopsField(1_500_000_000n, MIN_SEED_STROOPS),
+  MAKER_INVENTORY_MAX_DELTA_BPS: bpsField(3000),
+  MAKER_INVENTORY_REBALANCE_BPS: bpsField(1000),
+  MAKER_HEDGE_MAX_STROOPS: stroopsField(100_000_000n, 1n),
+  MAKER_HEDGE_DAILY_STROOPS: stroopsField(1_000_000_000n, 1n),
+  MAKER_HEDGE_MIN_SECS_TO_CLOSE: intField(300, 0, 365 * 86_400),
   DEADLINE_SECS: intField(60, 1, 86_400),
   MARKET_CLOSE_IN_SECS: intField(3600, 1, 365 * 86_400),
   AGENT_STARTUP_PROBE_TIMEOUT_MS: intField(DEFAULT_PROBE_TIMEOUT_MS, 1, 600_000),
@@ -524,6 +537,7 @@ export interface Tunables {
   fee: FeePolicy;
   trading: TradingConfig;
   maker: MakerConfig;
+  inventory: InventoryConfig;
   events: EventsConfig;
   watcher: WatcherConfig;
   arb: ArbConfig;
@@ -599,6 +613,13 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       confidenceThresholdBps: e.CONFIDENCE_THRESHOLD_BPS!,
       defaultSeedStroops: e.DEFAULT_SEED_STROOPS,
       closeInSecs: e.MARKET_CLOSE_IN_SECS!,
+    },
+    inventory: {
+      maxDeltaBps: BigInt(e.MAKER_INVENTORY_MAX_DELTA_BPS!),
+      rebalanceBps: BigInt(e.MAKER_INVENTORY_REBALANCE_BPS!),
+      maxHedgeStroops: e.MAKER_HEDGE_MAX_STROOPS,
+      dailyHedgeStroops: e.MAKER_HEDGE_DAILY_STROOPS,
+      minSecsToClose: e.MAKER_HEDGE_MIN_SECS_TO_CLOSE!,
     },
     events: {
       stateDir: e.EVENTS_STATE_DIR ?? "./.events",
@@ -817,7 +838,7 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, fee, trading, maker, events, watcher, arb, ...rest } = cfg;
+  const { env: _env, agentSecret, fee, trading, maker, inventory, events, watcher, arb, ...rest } = cfg;
   const { feePayerSecret, ...feeRest } = fee;
   const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
   const printableFee = {
@@ -845,6 +866,7 @@ export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
       },
     },
     maker: { ...maker, defaultSeedStroops: maker.defaultSeedStroops.toString() },
+    inventory: { ...inventory, maxHedgeStroops: inventory.maxHedgeStroops.toString(), dailyHedgeStroops: inventory.dailyHedgeStroops.toString() },
   };
 }
 

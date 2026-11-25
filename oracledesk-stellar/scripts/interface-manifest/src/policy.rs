@@ -116,8 +116,9 @@ pub fn check(pkg: &Path, base: &str) -> Result<String, Box<dyn std::error::Error
     if old.schema != new.schema || old.contract != new.contract {
         return Err("Manifest schema/contract mismatch".into());
     }
-    let old_pkg: serde_json::Value =
-        parse_json(&git_file(base, &format!("{rel}/package.json"))?.ok_or("Missing base package.json")?)?;
+    let old_pkg: serde_json::Value = parse_json(
+        &git_file(base, &format!("{rel}/package.json"))?.ok_or("Missing base package.json")?,
+    )?;
     let a = Version::parse(old_pkg["version"].as_str().ok_or("Missing old version")?)?;
     let report = crate::diff::diff(&old, &new);
     validate(&report, &a, &b, &changelog)?;

@@ -76,6 +76,28 @@
         "outputs": []
       }
     },
+    "accept_predecessor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "The successor admin records the old vault before the old vault can announce. This prevents a successor from accepting arbitrary packets.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "predecessor",
+            "type_": "address"
+          }
+        ],
+        "name": "accept_predecessor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "acknowledge_drawdown": {
       "kind": "function_v0",
       "spec": {
@@ -806,6 +828,23 @@
         ]
       }
     },
+    "assets_of": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          }
+        ],
+        "name": "assets_of",
+        "outputs": [
+          "i128"
+        ]
+      }
+    },
     "audit_mark": {
       "kind": "function_v0",
       "spec": {
@@ -847,6 +886,28 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "begin_migration": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "successor",
+            "type_": "address"
+          }
+        ],
+        "name": "begin_migration",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -928,6 +989,22 @@
         ]
       }
     },
+    "cancel_migration": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_migration",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "cancel_price_policy": {
       "kind": "function_v0",
       "spec": {
@@ -955,6 +1032,33 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_withdraw": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cancels `ticket_id` and re-mints shares for what it is still owed. Shares minted = `min(shares_for_deposit(remaining, nav, supply), floor(shares_burned * remaining / assets_at_request))`: after a NAV loss the owner cannot get back more shares than were burned for the same assets; after a gain they get fewer shares at the higher NAV. Either way request-then-cancel never profits at the expense of other shareholders. The reservation is released *before* NAV is read, because NAV subtracts `QueueReserved`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "cancel_withdraw",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -1045,7 +1149,7 @@
     "claim_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Pays the ticket at the head of the queue as far as idle collateral allows. Permissionless: the money always goes to the ticket's owner. Only the head ticket can be paid (`NothingToPay` for later ones).",
+        "doc": "Permissionless wrapper around the queue drain (`drain_queue`): pays queued tickets from idle collateral, pro rata across the `QUEUE_WINDOW` head window, reading at most `MAX_QUEUE_STEPS` ids. The money always goes to each ticket's owner. `ticket_id` must name a live ticket (`TicketNotFound`); returns the total paid across all tickets, or `NothingToPay` when the drain made no progress. A call that only moved the head past a run of holes pays nothing but returns `Ok(0)`: failing would revert the head move and let a long run of cancelled tickets stall `claim_withdraw` forever.",
         "inputs": [
           {
             "doc": "",
@@ -1286,6 +1390,27 @@
         ]
       }
     },
+    "estimated_unlock": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Rough unlock time for `ticket_id`: now if the collateral already held for the queue covers it; otherwise the close time of the open market whose settlement (floor value, in close-time order) first covers `owed_ahead + remaining`. `None` if the ticket is not live or the open markets cannot cover it. An estimate only: it ignores new deposits, trading and market resolution delays.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "estimated_unlock",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "execute_agent": {
       "kind": "function_v0",
       "spec": {
@@ -1389,6 +1514,33 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "exit_to_successor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "name": "exit_to_successor",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -1675,18 +1827,38 @@
         ]
       }
     },
-    "migrate_market": {
+    "migrate_idle": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Moves the treasury's position in `market_id` — and the LP role, when the treasury is the market's creator and has not claimed the remainder yet — to the successor set via `set_successor`, then closes the local exposure. Admin-only: relocating capital is not an agent trading action, and the agent key must not be able to drain positions. market-core's `transfer_position` / `transfer_lp` require the treasury itself to authorize. Because the treasury is their *direct* caller here, the implicit invoker authorization covers both — no `authorize_as_current_contract` entry is needed (unlike the nested token transfer in `agent_buy`, see `docs/adr/0002-treasury-nested-auth.md`).",
+        "doc": "",
+        "inputs": [],
+        "name": "migrate_idle",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "migrate_markets": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
         "inputs": [
           {
             "doc": "",
-            "name": "market_id",
-            "type_": "u64"
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
           }
         ],
-        "name": "migrate_market",
+        "name": "migrate_markets",
         "outputs": [
           {
             "result": {
@@ -1721,6 +1893,36 @@
               "ok_type": "u32"
             }
           }
+        ]
+      }
+    },
+    "migration_state": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "migration_state",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "MigrationState"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "migration_version": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "migration_version",
+        "outputs": [
+          "u32"
         ]
       }
     },
@@ -1910,6 +2112,21 @@
         ]
       }
     },
+    "predecessor": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "predecessor",
+        "outputs": [
+          {
+            "option": {
+              "value_type": "address"
+            }
+          }
+        ]
+      }
+    },
     "propose_config": {
       "kind": "function_v0",
       "spec": {
@@ -1994,6 +2211,61 @@
         ]
       }
     },
+    "queue_page": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Live tickets with ids in `[start, start + limit)` (`limit` capped at `MAX_QUEUE_PAGE`), in queue order. Holes are skipped, so a page can hold fewer than `limit` rows; continue from `start + limit`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "queue_page",
+        "outputs": [
+          {
+            "vec": {
+              "element_type": {
+                "udt": {
+                  "name": "QueueEntry"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "queue_position": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Position of `ticket_id` in the queue, or `None` if it is not live. Walks at most `MAX_POSITION_SCAN` ids ahead of it (`truncated` otherwise).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "queue_position",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "QueuePosition"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "queue_reserved": {
       "kind": "function_v0",
       "spec": {
@@ -2065,6 +2337,64 @@
             "result": {
               "error_type": "error",
               "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "receive_collateral": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "predecessor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "receive_collateral",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "receive_migration": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "predecessor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "packet",
+            "type_": {
+              "udt": {
+                "name": "MigrationPacket"
+              }
+            }
+          }
+        ],
+        "name": "receive_migration",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -2183,7 +2513,7 @@
     "request_withdraw": {
       "kind": "function_v0",
       "spec": {
-        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket (FIFO, paid by `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
+        "doc": "Burns `shares` of `owner` at the current NAV, pays what free idle collateral allows now and queues the rest as a ticket. Queued tickets are paid automatically by every transaction that brings collateral in (`drain_queue`, #277), pro rata within the `QUEUE_WINDOW` head window. Returns `(paid_now, ticket_id)`, `ticket_id` 0 when nothing was queued.",
         "inputs": [
           {
             "doc": "",
@@ -2460,28 +2790,6 @@
         ]
       }
     },
-    "set_successor": {
-      "kind": "function_v0",
-      "spec": {
-        "doc": "Sets the successor treasury that `migrate_market` hands positions and the LP role to. Admin-only; overwrites any previous successor (the `SuccessorSet` events are the audit trail).",
-        "inputs": [
-          {
-            "doc": "",
-            "name": "successor",
-            "type_": "address"
-          }
-        ],
-        "name": "set_successor",
-        "outputs": [
-          {
-            "result": {
-              "error_type": "error",
-              "ok_type": "void"
-            }
-          }
-        ]
-      }
-    },
     "set_yield_venue": {
       "kind": "function_v0",
       "spec": {
@@ -2578,6 +2886,70 @@
           {
             "udt": {
               "name": "TracePolicyConfig"
+            }
+          }
+        ]
+      }
+    },
+    "transfer_shares": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "transfer_shares",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "transfer_ticket": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Moves `ticket_id` (and its cancellation right) from `from` to `to`.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "to",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "transfer_ticket",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -3302,6 +3674,152 @@
         "name": "MarketPnl"
       }
     },
+    "MigrationPacket": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "exposure_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "floor_value",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "lp",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "net",
+            "type_": {
+              "udt": {
+                "name": "NetPosition"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "pnl",
+            "type_": {
+              "udt": {
+                "name": "MarketPnl"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "version",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "yes",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "MigrationPacket"
+      }
+    },
+    "MigrationPhase": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Announced"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Migrated"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Migrating"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "None"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "MigrationPhase"
+      }
+    },
+    "MigrationState": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "announced_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "markets_left",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "migrate_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "phase",
+            "type_": {
+              "udt": {
+                "name": "MigrationPhase"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "successor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "successor_shares",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "MigrationState"
+      }
+    },
     "NavDetail": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -3629,6 +4147,60 @@
         ],
         "lib": "",
         "name": "PricePolicy"
+      }
+    },
+    "QueueEntry": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One row of `queue_page`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "ticket",
+            "type_": {
+              "udt": {
+                "name": "WithdrawTicket"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "ticket_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "QueueEntry"
+      }
+    },
+    "QueuePosition": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Where a ticket stands in the withdrawal queue (`queue_position`).",
+        "fields": [
+          {
+            "doc": "Inside the pro-rata head window (`QUEUE_WINDOW` ids from the head).",
+            "name": "in_window",
+            "type_": "bool"
+          },
+          {
+            "doc": "Live tickets ahead of this one (holes are not counted).",
+            "name": "index",
+            "type_": "u32"
+          },
+          {
+            "doc": "Sum of `remaining` over those tickets.",
+            "name": "owed_ahead",
+            "type_": "i128"
+          },
+          {
+            "doc": "The walk stopped after `MAX_POSITION_SCAN` ids, so `index` and `owed_ahead` are lower bounds.",
+            "name": "truncated",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "QueuePosition"
       }
     },
     "Realized": {
@@ -3976,6 +4548,12 @@
           {
             "void_v0": {
               "doc": "",
+              "name": "Closed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
               "name": "Duplicate"
             }
           },
@@ -4180,7 +4758,7 @@
     "WithdrawTicket": {
       "kind": "udt_struct_v0",
       "spec": {
-        "doc": "Collateral still owed to `owner` for shares already burned.",
+        "doc": "Collateral still owed to `owner` for shares already burned. Layout frozen: tickets queued before the drain/cancel upgrade (#277) must still decode. Everything new lives in [`TicketMeta`].",
         "fields": [
           {
             "doc": "",
@@ -4214,9 +4792,19 @@
             "value": 13
           },
           {
+            "doc": "",
+            "name": "AlreadyMigrated",
+            "value": 86
+          },
+          {
             "doc": "Close-date bucket exposure would exceed its cap (#49).",
             "name": "BucketCapExceeded",
             "value": 60
+          },
+          {
+            "doc": "`cancel_withdraw` before `created_at + MIN_CANCEL_DELAY`.",
+            "name": "CancelTooEarly",
+            "value": 78
           },
           {
             "doc": "",
@@ -4262,6 +4850,11 @@
             "doc": "",
             "name": "DrawdownTripped",
             "value": 46
+          },
+          {
+            "doc": "",
+            "name": "IncompatibleSuccessor",
+            "value": 85
           },
           {
             "doc": "",
@@ -4316,12 +4909,12 @@
           {
             "doc": "",
             "name": "MarketCoreAlreadyClaimed",
-            "value": 35
+            "value": 2038
           },
           {
-            "doc": "",
+            "doc": "Cross-contract market-core errors, mapped into the treasury's own range by `core_call` / `map_market_core_code` (docs/adr/0006-cross-contract-errors.md, #60).",
             "name": "MarketCoreCallFailed",
-            "value": 40
+            "value": 2031
           },
           {
             "doc": "",
@@ -4331,52 +4924,52 @@
           {
             "doc": "",
             "name": "MarketCoreInsufficientLiquidity",
-            "value": 33
+            "value": 2036
           },
           {
             "doc": "",
             "name": "MarketCoreInsufficientShares",
-            "value": 34
+            "value": 2037
           },
           {
             "doc": "",
             "name": "MarketCoreInvalidAmount",
-            "value": 37
+            "value": 2040
           },
           {
             "doc": "",
             "name": "MarketCoreMarketClosed",
-            "value": 32
+            "value": 2035
           },
           {
-            "doc": "Typed market-core failures: one variant per condition the treasury can surface, so a caller sees *why* the core rejected the call instead of an opaque `MarketCoreError`. Placed in codes 29..=40, previously unused.",
+            "doc": "",
             "name": "MarketCoreMarketNotFound",
-            "value": 29
+            "value": 2032
           },
           {
             "doc": "",
             "name": "MarketCoreMarketNotOpen",
-            "value": 31
+            "value": 2034
           },
           {
             "doc": "",
             "name": "MarketCoreNotFinal",
-            "value": 30
+            "value": 2033
           },
           {
             "doc": "",
             "name": "MarketCoreNothingToRedeem",
-            "value": 36
+            "value": 2039
           },
           {
             "doc": "",
             "name": "MarketCoreOverflow",
-            "value": 38
+            "value": 2041
           },
           {
             "doc": "",
             "name": "MarketCoreSlippageExceeded",
-            "value": 39
+            "value": 2042
           },
           {
             "doc": "",
@@ -4387,6 +4980,16 @@
             "doc": "",
             "name": "MarketNotOpen",
             "value": 8
+          },
+          {
+            "doc": "",
+            "name": "MigrationInProgress",
+            "value": 83
+          },
+          {
+            "doc": "",
+            "name": "MigrationNotReady",
+            "value": 84
           },
           {
             "doc": "",
@@ -4472,6 +5075,11 @@
             "doc": "",
             "name": "StaleMarks",
             "value": 75
+          },
+          {
+            "doc": "The ticket predates #277 (no `TicketMeta`) and cannot be cancelled; it still drains and can be transferred.",
+            "name": "TicketNotCancellable",
+            "value": 77
           },
           {
             "doc": "",
@@ -5027,13 +5635,13 @@
         ]
       }
     },
-    "MarketMigrated": {
+    "MarketMigratedOut": {
       "kind": "event_v0",
       "spec": {
         "data_format": "map",
         "doc": "",
         "lib": "",
-        "name": "MarketMigrated",
+        "name": "MarketMigratedOut",
         "params": [
           {
             "doc": "",
@@ -5043,31 +5651,17 @@
           },
           {
             "doc": "",
-            "location": "topic_list",
-            "name": "successor",
-            "type_": "address"
-          },
-          {
-            "doc": "",
             "location": "data",
-            "name": "yes",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "no",
-            "type_": "i128"
-          },
-          {
-            "doc": "",
-            "location": "data",
-            "name": "lp",
-            "type_": "bool"
+            "name": "packet",
+            "type_": {
+              "udt": {
+                "name": "MigrationPacket"
+              }
+            }
           }
         ],
         "prefix_topics": [
-          "market_migrated"
+          "market_migrated_out"
         ]
       }
     },
@@ -5106,6 +5700,109 @@
         ],
         "prefix_topics": [
           "market_settled"
+        ]
+      }
+    },
+    "MigrationAnnounced": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MigrationAnnounced",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "successor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "migrate_after",
+            "type_": "u64"
+          }
+        ],
+        "prefix_topics": [
+          "migration_announced"
+        ]
+      }
+    },
+    "MigrationCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MigrationCancelled",
+        "params": [],
+        "prefix_topics": [
+          "migration_cancelled"
+        ]
+      }
+    },
+    "MigrationCompleted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MigrationCompleted",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "successor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "collateral",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "migration_completed"
+        ]
+      }
+    },
+    "MigrationReceived": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "MigrationReceived",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "predecessor",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "migration_received"
         ]
       }
     },
@@ -5329,33 +6026,55 @@
         ]
       }
     },
-    "SuccessorSet": {
+    "QueueDrainSkipped": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "A drain hit an arithmetic overflow and stopped; the entrypoint that brought the proceeds still succeeded (settlement never fails because of the queue). `paid` is what was paid before the stop.",
+        "lib": "",
+        "name": "QueueDrainSkipped",
+        "params": [
+          {
+            "doc": "",
+            "location": "data",
+            "name": "paid",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "queue_drain_skipped"
+        ]
+      }
+    },
+    "TicketTransferred": {
       "kind": "event_v0",
       "spec": {
         "data_format": "map",
         "doc": "",
         "lib": "",
-        "name": "SuccessorSet",
+        "name": "TicketTransferred",
         "params": [
           {
             "doc": "",
-            "location": "data",
-            "name": "old",
-            "type_": {
-              "option": {
-                "value_type": "address"
-              }
-            }
+            "location": "topic_list",
+            "name": "ticket_id",
+            "type_": "u64"
           },
           {
             "doc": "",
             "location": "data",
-            "name": "new",
+            "name": "from",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "to",
             "type_": "address"
           }
         ],
         "prefix_topics": [
-          "successor_set"
+          "ticket_transferred"
         ]
       }
     },
@@ -5400,6 +6119,44 @@
         ],
         "prefix_topics": [
           "trade_authorized"
+        ]
+      }
+    },
+    "WithdrawCancelled": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "`cancel_withdraw`: the ticket's `assets` went back into the vault and `shares` were re-minted to `owner`.",
+        "lib": "",
+        "name": "WithdrawCancelled",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "ticket_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "owner",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "assets",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "shares",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "withdraw_cancelled"
         ]
       }
     },

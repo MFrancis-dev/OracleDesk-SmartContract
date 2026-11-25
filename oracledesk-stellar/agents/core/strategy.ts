@@ -69,7 +69,7 @@ export interface MarketMakerDecision {
  */
 export function decideMarketProposal(
   signal: MarketSignal,
-  opts: { confidenceThresholdBps: number; defaultSeedStroops: bigint },
+  opts: { confidenceThresholdBps: number; defaultSeedStroops: bigint; bookDelta?: bigint; inventoryMaxDeltaBps?: bigint; minSeedStroops?: bigint },
 ): MarketMakerDecision {
   if (!signal.proposedQuestion || signal.fairValueBps === undefined) {
     return { action: "skip", reasoning: `signal from ${signal.source} has no actionable question/estimate` };
@@ -81,12 +81,21 @@ export function decideMarketProposal(
       reasoning: `fair value ${signal.fairValueBps}bps is within ${opts.confidenceThresholdBps}bps of 50/50 — not confident enough to seed a market`,
     };
   }
+  const defaultSeed = opts.defaultSeedStroops;
+  const band = opts.inventoryMaxDeltaBps ?? 3000n;
+  const book = opts.bookDelta === undefined ? 0n : (opts.bookDelta < 0n ? -opts.bookDelta : opts.bookDelta);
+  const seed = opts.bookDelta === undefined || defaultSeed <= 0n
+    ? defaultSeed
+    : (defaultSeed * (band > book ? band - book : 0n)) / (band || 1n);
+  const minSeed = opts.minSeedStroops ?? 100n * 10_000_000n;
+  const adjustedSeed = seed < minSeed ? minSeed : seed;
+  const adjustment = adjustedSeed === defaultSeed ? "" : `; seed adjusted from ${defaultSeed} to ${adjustedSeed} for correlated book delta ${opts.bookDelta}`;
   return {
     action: "propose_market",
-    reasoning: `${signal.source} implies fair value ${signal.fairValueBps}bps, ${distanceFrom50}bps from 50/50: "${signal.summary}"`,
+    reasoning: `${signal.source} implies fair value ${signal.fairValueBps}bps, ${distanceFrom50}bps from 50/50: "${signal.summary}"${adjustment}`,
     question: signal.proposedQuestion,
     initialYesBps: signal.fairValueBps,
-    seedAmountStroops: opts.defaultSeedStroops,
+    seedAmountStroops: adjustedSeed,
   };
 }
 

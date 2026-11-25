@@ -8,6 +8,7 @@
 //! This crate contains no `mock_all_auths` call; `scripts/check-no-mock-all-auths.sh`
 //! greps for it in CI. Setup helpers use targeted mocks.
 
+use ::treasury::MIN_CANCEL_DELAY;
 use integration_tests::{
     market_core,
     reasoning_registry::TraceAction,
@@ -15,7 +16,7 @@ use integration_tests::{
     world::{World, MARKET_CLOSE, SEED, USDC},
 };
 use soroban_sdk::{
-    testutils::{AuthorizedFunction, AuthorizedInvocation},
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
     Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
@@ -1043,12 +1044,12 @@ fn auth_treasury_admin_actions_and_role_separation() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_request_withdraw(&w.random, &1i128);
+        .try_withdraw(&w.random, &1i128);
     assert!(result.is_err(), "agent must not withdraw vault capital");
 
     w.env.set_auths(&[]);
@@ -1087,25 +1088,25 @@ fn auth_treasury_admin_actions_and_role_separation() {
 fn auth_treasury_admin_withdraw_and_collect_market_fees() {
     let w = World::new();
     w.env.set_auths(&[]);
-    let args: Vec<Val> = (w.admin.clone(), 10 * USDC).into_val(&w.env);
+    let args: Vec<Val> = (w.random.clone(), 1i128).into_val(&w.env);
     w.treasury
         .mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &w.admin,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: args.clone(),
                 sub_invokes: &[],
             },
         }])
-        .request_withdraw(&w.admin, &(10 * USDC));
+        .withdraw(&w.random, &1i128);
     assert_eq!(
         w.env.auths(),
         vec![invocation(
             &w.env,
             &w.admin,
             &w.treasury_id,
-            "request_withdraw",
+            "withdraw",
             args.clone(),
             vec![],
         )]
@@ -1201,6 +1202,228 @@ fn auth_treasury_close_trade_redeem_and_remainder_are_agent_actions() {
         }])
         .try_close_trade(&w.trader, &market);
     assert!(result.is_err());
+}
+
+#[test]
+fn auth_treasury_ticket_transfer_and_cancel_are_owner_actions() {
+    let w = World::new();
+    let alice = Address::generate(&w.env);
+    let bob = Address::generate(&w.env);
+    let deposit = 20 * USDC;
+    w.mint_to(&alice, deposit);
+
+    let pull = soroban_sdk::testutils::MockAuthInvoke {
+        contract: &w.collateral,
+        fn_name: "transfer",
+        args: (alice.clone(), w.treasury_id.clone(), deposit).into_val(&w.env),
+        sub_invokes: &[],
+    };
+    w.env.set_auths(&[]);
+    let shares = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "deposit",
+                args: (alice.clone(), deposit).into_val(&w.env),
+                sub_invokes: core::slice::from_ref(&pull),
+            },
+        }])
+        .deposit(&alice, &deposit);
+    assert!(shares > 0);
+
+    // The agent moves idle capital into market positions and the seeded admin
+    // takes the rest, so Alice's request has to queue.
+    for outcome in [treasury::Outcome::Yes, treasury::Outcome::No] {
+        w.env.set_auths(&[]);
+        w.treasury
+            .mock_auths(&[soroban_sdk::testutils::MockAuth {
+                address: &w.agent,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &w.treasury_id,
+                    fn_name: "agent_buy",
+                    args: (
+                        w.agent.clone(),
+                        w.signer_market,
+                        outcome.clone(),
+                        2 * USDC,
+                        0i128,
+                    )
+                        .into_val(&w.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .agent_buy(&w.agent, &w.signer_market, &outcome, &(2 * USDC), &0i128);
+    }
+    let admin_shares = w.treasury.shares_of(&w.admin);
+    w.env.set_auths(&[]);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "request_withdraw",
+                args: (w.admin.clone(), admin_shares).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .request_withdraw(&w.admin, &admin_shares);
+    w.env.set_auths(&[]);
+    let (_, ticket) = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "request_withdraw",
+                args: (alice.clone(), shares).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .request_withdraw(&alice, &shares);
+    assert!(ticket > 0, "part of Alice's withdrawal must be queued");
+
+    // transfer_ticket moves the ticket on the owner's authority alone.
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (alice.clone(), bob.clone(), ticket).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &alice,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "transfer_ticket",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_ticket(&alice, &bob, &ticket);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &alice,
+            &w.treasury_id,
+            "transfer_ticket",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    w.env.set_auths(&[]);
+    let stranger = w.random.clone();
+    let rejected = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &stranger,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "transfer_ticket",
+                args: (stranger.clone(), alice.clone(), ticket).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_transfer_ticket(&stranger, &alice, &ticket);
+    assert!(rejected.is_err());
+
+    // cancel_withdraw is the ticket owner's action.
+    let created = w.treasury.withdraw_ticket(&ticket).unwrap().created_at;
+    w.set_time(created + MIN_CANCEL_DELAY);
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (bob.clone(), ticket).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &bob,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "cancel_withdraw",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .cancel_withdraw(&bob, &ticket);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &bob,
+            &w.treasury_id,
+            "cancel_withdraw",
+            args.clone(),
+            vec![],
+        )]
+    );
+}
+
+#[test]
+fn auth_treasury_batch_settlement_is_agent_only() {
+    let w = World::new();
+    let ids = soroban_sdk::vec![&w.env, w.price_market];
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (w.agent.clone(), ids.clone()).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.agent,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "redeem_many",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .redeem_many(&w.agent, &ids);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.treasury_id,
+            "redeem_many",
+            args.clone(),
+            vec![],
+        )]
+    );
+
+    w.env.set_auths(&[]);
+    let rejected = w
+        .treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.random,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "redeem_many",
+                args: (w.random.clone(), ids.clone()).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_redeem_many(&w.random, &ids);
+    assert!(rejected.is_err());
+
+    w.env.set_auths(&[]);
+    let args: Vec<Val> = (w.agent.clone(), ids.clone()).into_val(&w.env);
+    w.treasury
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &w.agent,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &w.treasury_id,
+                fn_name: "claim_pool_remainders",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }])
+        .claim_pool_remainders(&w.agent, &ids);
+    assert_eq!(
+        w.env.auths(),
+        vec![invocation(
+            &w.env,
+            &w.agent,
+            &w.treasury_id,
+            "claim_pool_remainders",
+            args.clone(),
+            vec![],
+        )]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,12 +1731,12 @@ fn treasury_admin_cannot_trade_and_agent_cannot_withdraw() {
             address: &w.agent,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &w.treasury_id,
-                fn_name: "request_withdraw",
+                fn_name: "withdraw",
                 args: (w.random.clone(), 1i128).into_val(&w.env),
                 sub_invokes: &[],
             },
         }])
-        .try_request_withdraw(&w.random, &1i128);
+        .try_withdraw(&w.random, &1i128);
     assert!(agent_withdraw.is_err());
 }
 
@@ -1529,9 +1752,6 @@ const MATRIX: &[(&str, &[&str])] = &[
         "market-core",
         &[
             "create_market",
-            "create_market_with_collateral",
-            "add_collateral",
-            "set_collateral_enabled",
             "buy",
             "sell",
             "redeem",
@@ -1564,9 +1784,22 @@ const MATRIX: &[(&str, &[&str])] = &[
             "deposit",
             "agent_buy",
             "set_paused",
-            "request_withdraw",
+            "withdraw",
             "collect_market_fees",
             "close_trade",
+            "begin_migration",
+            "cancel_migration",
+            "migrate_markets",
+            "migrate_idle",
+            "accept_predecessor",
+            "receive_migration",
+            "receive_collateral",
+            "transfer_shares",
+            "exit_to_successor",
+            "cancel_withdraw",
+            "transfer_ticket",
+            "redeem_many",
+            "claim_pool_remainders",
         ],
     ),
     (
@@ -1600,10 +1833,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "pending_admin",
             "market_count",
             "get_market",
-            "get_market_collateral",
-            "market_collateral_info",
-            "collateral_params",
-            "locked",
             "get_position",
             "get_price",
             "get_config",
@@ -1640,14 +1869,17 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "finalize_market",
             "get_cat_market",
             "get_cat_position",
+            "get_market_view",
             "get_prices_cat",
             "get_scalar_meta",
+            "is_closed",
             "market_kind",
             "market_resolver",
             "max_batch",
             "observe",
             "price_cumulative",
             "propose_market_resolver",
+            "purge_closed_positions",
             "quote_buy_at",
             "quote_buy_cat",
             "redeem_cat",
@@ -1726,22 +1958,19 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "total_shares",
             "queue_reserved",
             "queue_bounds",
+            "queue_page",
+            "queue_position",
+            "estimated_unlock",
             "deposit",
-            "deposit_token",
             "request_withdraw",
             "claim_withdraw",
             "emergency_withdraw",
-            "set_token_caps",
-            "token_caps",
-            "available_capital_of",
             "agent_sell",
             "agent_sell_v2",
             "agent_buy_v2",
             "agent_create_market",
-            "agent_create_market_collateral",
             "agent_create_market_and_reveal",
             "agent_claim_lp_fees",
-            "collect_market_fees",
             "agent_daily_usage",
             "agent_at",
             "agent_count",
@@ -1765,27 +1994,6 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "drawdown_status",
             "acknowledge_drawdown",
             "reset_pnl_window",
-            "set_mode",
-            "mode",
-            "set_unwinder",
-            "unwinder",
-            "set_exit_floor",
-            "set_default_exit_floor",
-            "exit_floor",
-            "unwound",
-            "unwind_sell",
-            "propose_op",
-            "execute_op",
-            "cancel_op",
-            "pending_op",
-            "correlation_caps",
-            "category_exposure",
-            "bucket_exposure",
-            "correlation_headroom",
-            "pending_correlation_caps",
-            "propose_correlation_caps",
-            "execute_correlation_caps",
-            "cancel_correlation_caps",
             "set_drawdown_config",
             "get_creation_policy",
             "creation_usage",
@@ -1814,11 +2022,11 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "allocate_to_yield",
             "recall_from_yield",
             "disable_yield",
-            "set_successor",
-            "migrate_markets",
+            "migration_version",
+            "migration_state",
+            "predecessor",
+            "assets_of",
             "settle_market",
-            "redeem_many",
-            "claim_pool_remainders",
             "legacy_redeem",
             "legacy_claim_pool_remainder",
             "withdraw_ticket",
