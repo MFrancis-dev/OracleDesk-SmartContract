@@ -559,6 +559,17 @@ pub struct PendingAdmin {
     pub expires_at: u64,
 }
 
+/// #149: a market's resolution bounty. The resolver holds it in the collateral
+/// token until the market is finalized (paid to the finalizing caller) or
+/// refunded to `funder`; `paid` records that one of those has happened.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyEscrow {
+    pub amount: i128,
+    pub funder: Address,
+    pub paid: bool,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -608,6 +619,19 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    /// #149: a bounty operation ran before `set_bounty_token`.
+    BountyTokenNotSet = 44,
+    /// #149: bounty amounts must be positive.
+    InvalidBounty = 45,
+    /// #149: bounties are funded only before the market's `close_time`.
+    BountyFundingClosed = 46,
+    /// #149: a market's escrow has one funder; any other address can neither
+    /// top it up nor reclaim it.
+    BountyFunderMismatch = 47,
+    /// #149: no bounty was funded for this market.
+    NoBounty = 48,
+    /// #149: a bounty can be reclaimed only once the market is final.
+    BountyNotFinal = 49,
     // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
     MarketCoreMarketNotFound      = 1044,
     MarketCoreNotFinal            = 1045,
@@ -692,6 +716,11 @@ pub enum DataKey {
     /// #314: extended hybrid spec with richer fallback authority.
     /// Appended last to preserve existing discriminant positions.
     HybridV2(u64),
+    /// #149: collateral token the bounty escrow holds (instance storage).
+    /// Appended last to preserve existing discriminant positions.
+    BountyToken,
+    /// #149: a market's bounty escrow (persistent storage). Appended last.
+    Bounty(u64),
 }
 
 /// #297: A committee member set snapshotted at a specific epoch. Loaded from
@@ -997,6 +1026,37 @@ pub struct AdminTransferred {
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferCancelled {}
+
+/// #149: a market's bounty was escrowed (`total` is the escrow after top-up).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyFunded {
+    #[topic]
+    pub market_id: u64,
+    pub funder: Address,
+    pub amount: i128,
+    pub total: i128,
+}
+
+/// #149: a market's bounty was paid to the caller that finalized it.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyPaid {
+    #[topic]
+    pub market_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+}
+
+/// #149: an unpaid bounty went back to its funder.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyRefunded {
+    #[topic]
+    pub market_id: u64,
+    pub funder: Address,
+    pub amount: i128,
+}
 
 /// SEP-40 Oracle Consumer interface, as implemented by Reflector feeds.
 /// `decimals` and `resolution` are the feed's fixed-point scale and record
@@ -1718,6 +1778,8 @@ impl Resolver {
         core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
+        // #149: a voided market pays no bounty; the escrow goes back to its funder.
+        Self::refund_bounty(&env, market_id)?;
         Self::bump_market_entries(&env, market_id, market.close_time);
         GuardianAction {
             market_id,
@@ -2556,6 +2618,138 @@ impl Resolver {
         Ok(())
     }
 
+    /// #149: records the token that resolution bounties are escrowed in. It
+    /// must be market-core's collateral token, so bounties and market
+    /// collateral share one asset. Because the only accepted value is the
+    /// collateral address, this setter cannot repoint existing escrow at a
+    /// different token, and no entrypoint lets an admin withdraw escrow.
+    pub fn set_bounty_token(env: Env, token: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let collateral = MarketCoreClient::new(&env, &market_core)
+            .get_config()
+            .collateral;
+        if token != collateral {
+            return Err(Error::InvalidConfig);
+        }
+        env.storage().instance().set(&DataKey::BountyToken, &token);
+        ttl::bump_instance(&env);
+        Ok(())
+    }
+
+    /// #149: escrows `amount` of the bounty token for `market_id`. Anyone may
+    /// fund a market before its `close_time`. An escrow has a single funder
+    /// (refunds go back to it), so a top-up must come from that same address.
+    pub fn fund_bounty(
+        env: Env,
+        funder: Address,
+        market_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        funder.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidBounty);
+        }
+        let token = Self::bounty_token(&env)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() >= market.close_time {
+            return Err(Error::BountyFundingClosed);
+        }
+        if Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::AlreadyFinalized);
+        }
+        let key = DataKey::Bounty(market_id);
+        let total = match env.storage().persistent().get::<_, BountyEscrow>(&key) {
+            Some(escrow) => {
+                if escrow.funder != funder {
+                    return Err(Error::BountyFunderMismatch);
+                }
+                escrow
+                    .amount
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidBounty)?
+            }
+            None => amount,
+        };
+        token::Client::new(&env, &token).transfer(
+            &funder,
+            env.current_contract_address(),
+            &amount,
+        );
+        env.storage().persistent().set(
+            &key,
+            &BountyEscrow {
+                amount: total,
+                funder: funder.clone(),
+                paid: false,
+            },
+        );
+        ttl::bump_persistent(&env, &key, ttl::market_target(&env, market.close_time));
+        BountyFunded {
+            market_id,
+            funder,
+            amount,
+            total,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// #149: [`Resolver::resolve_price`] that pays the market's bounty to
+    /// `caller`. The payout happens in the same invocation that makes the
+    /// market final, so a call that fails also pays nothing.
+    pub fn resolve_price_for(env: Env, caller: Address, market_id: u64) -> Result<Outcome, Error> {
+        caller.require_auth();
+        let outcome = Self::resolve_price(env.clone(), market_id)?;
+        Self::pay_finalizer(&env, market_id, &caller)?;
+        Ok(outcome)
+    }
+
+    /// #149: [`Resolver::finalize_signers`] that pays the market's bounty to
+    /// `caller`, with the same single-invocation guarantee as
+    /// [`Resolver::resolve_price_for`].
+    pub fn finalize_signers_for(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+    ) -> Result<AttestedOutcome, Error> {
+        caller.require_auth();
+        let outcome = Self::finalize_signers(env.clone(), market_id)?;
+        Self::pay_finalizer(&env, market_id, &caller)?;
+        Ok(outcome)
+    }
+
+    /// #149: returns an unpaid escrow to its funder once the market is final.
+    /// This covers a market finalized through `resolve_price` or
+    /// `finalize_signers` rather than their `_for` variants, which would
+    /// otherwise leave the escrow stranded. Returns the amount refunded.
+    pub fn reclaim_bounty(env: Env, funder: Address, market_id: u64) -> Result<i128, Error> {
+        funder.require_auth();
+        if !Self::resolution_state(&env, market_id).is_terminal() {
+            return Err(Error::BountyNotFinal);
+        }
+        let escrow: BountyEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(market_id))
+            .ok_or(Error::NoBounty)?;
+        if escrow.funder != funder {
+            return Err(Error::BountyFunderMismatch);
+        }
+        let amount = Self::release_bounty(&env, market_id, &funder)?;
+        if amount > 0 {
+            BountyRefunded {
+                market_id,
+                funder,
+                amount,
+            }
+            .publish(&env);
+        }
+        Ok(amount)
+    }
+
     /// Pure view: no TTL extensions. The instance and the market's entries
     /// are kept alive by the mutating entrypoints above, so a view-only
     /// simulation stays read-only.
@@ -2665,6 +2859,74 @@ impl Resolver {
             let target = ttl::market_target(env, close_time);
             ttl::bump_persistent(env, &key, target);
         }
+    }
+
+    /// #149: the bounty token, set by `set_bounty_token`.
+    fn bounty_token(env: &Env) -> Result<Address, Error> {
+        ttl::bump_instance(env);
+        env.storage()
+            .instance()
+            .get(&DataKey::BountyToken)
+            .ok_or(Error::BountyTokenNotSet)
+    }
+
+    /// #149: moves an unpaid escrow to `to` and marks it paid. The mark is
+    /// written before the transfer (effects before interactions). Returns the
+    /// amount moved, which is zero when there is no unpaid escrow.
+    fn release_bounty(env: &Env, market_id: u64, to: &Address) -> Result<i128, Error> {
+        let key = DataKey::Bounty(market_id);
+        let Some(mut escrow) = env.storage().persistent().get::<_, BountyEscrow>(&key) else {
+            return Ok(0);
+        };
+        if escrow.paid || escrow.amount <= 0 {
+            return Ok(0);
+        }
+        let token = Self::bounty_token(env)?;
+        let amount = escrow.amount;
+        escrow.paid = true;
+        env.storage().persistent().set(&key, &escrow);
+        token::Client::new(env, &token).transfer(&env.current_contract_address(), to, &amount);
+        Ok(amount)
+    }
+
+    /// #149: pays the bounty to the caller whose successful resolution made the
+    /// market final. A non-terminal market pays nothing, though a successful
+    /// resolution always leaves it terminal.
+    fn pay_finalizer(env: &Env, market_id: u64, caller: &Address) -> Result<(), Error> {
+        if !Self::resolution_state(env, market_id).is_terminal() {
+            return Ok(());
+        }
+        let amount = Self::release_bounty(env, market_id, caller)?;
+        if amount > 0 {
+            BountyPaid {
+                market_id,
+                caller: caller.clone(),
+                amount,
+            }
+            .publish(env);
+        }
+        Ok(())
+    }
+
+    /// #149: refunds an unpaid escrow to its funder, used when a market is voided.
+    fn refund_bounty(env: &Env, market_id: u64) -> Result<(), Error> {
+        let Some(escrow) = env
+            .storage()
+            .persistent()
+            .get::<_, BountyEscrow>(&DataKey::Bounty(market_id))
+        else {
+            return Ok(());
+        };
+        let amount = Self::release_bounty(env, market_id, &escrow.funder)?;
+        if amount > 0 {
+            BountyRefunded {
+                market_id,
+                funder: escrow.funder,
+                amount,
+            }
+            .publish(env);
+        }
+        Ok(())
     }
 
     fn deadline(market: &market_core::Market) -> u64 {
@@ -4619,6 +4881,158 @@ mod test {
         v2_fixture(salt, |env, _r, a, b| {
             ResolutionSpec::Signers(signer_spec(env, a, b))
         })
+    }
+
+    // ---- #149: resolution bounties ----------------------------------------
+
+    /// Funds a bounty of `amount` from a fresh address and returns that funder.
+    fn funded_bounty(f: &Fixture, amount: i128) -> Address {
+        let funder = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &amount);
+        f.resolver.set_bounty_token(&collateral);
+        f.resolver.fund_bounty(&funder, &f.market_id, &amount);
+        funder
+    }
+
+    // spec: RS-FUND_BOUNTY-AUTH-1, RS-FUND_BOUNTY-POST-1, RS-FUND_BOUNTY-POST-2
+    #[test]
+    fn fund_bounty_escrows_tokens_in_resolver() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 500);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        assert_eq!(coll.balance(&f.resolver_id), 500);
+        assert_eq!(coll.balance(&funder), 0);
+
+        // A top-up from the same funder adds to the one escrow.
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &250);
+        f.resolver.fund_bounty(&funder, &f.market_id, &250);
+        assert_eq!(coll.balance(&f.resolver_id), 750);
+    }
+
+    // spec: RS-FUND_BOUNTY-PRE-3, RS-FUND_BOUNTY-PRE-4, RS-FUND_BOUNTY-ERR-3, RS-FUND_BOUNTY-ERR-4
+    #[test]
+    fn fund_bounty_rejects_second_funder_and_non_positive_amounts() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 500);
+        let other = Address::generate(&f.env);
+        assert_eq!(
+            f.resolver.try_fund_bounty(&other, &f.market_id, &10),
+            Err(Ok(Error::BountyFunderMismatch))
+        );
+        assert_eq!(
+            f.resolver.try_fund_bounty(&funder, &f.market_id, &0),
+            Err(Ok(Error::InvalidBounty))
+        );
+    }
+
+    // spec: RS-FUND_BOUNTY-PRE-2, RS-FUND_BOUNTY-ERR-2
+    #[test]
+    fn fund_bounty_rejected_after_close() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let collateral = f.market_core.get_config().collateral;
+        f.resolver.set_bounty_token(&collateral);
+        let funder = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &collateral).mint(&funder, &100);
+        f.env.ledger().set_timestamp(2_000);
+        assert_eq!(
+            f.resolver.try_fund_bounty(&funder, &f.market_id, &100),
+            Err(Ok(Error::BountyFundingClosed))
+        );
+    }
+
+    // spec: RS-SET_BOUNTY_TOKEN-PRE-2, RS-SET_BOUNTY_TOKEN-ERR-2
+    #[test]
+    fn set_bounty_token_accepts_only_market_collateral() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let other = f.env.register_stellar_asset_contract_v2(Address::generate(&f.env));
+        assert_eq!(
+            f.resolver.try_set_bounty_token(&other.address()),
+            Err(Ok(Error::InvalidConfig))
+        );
+    }
+
+    // spec: RS-RESOLVE_PRICE_FOR-POST-2, RS-PAY_BOUNTY-PRE-1, RS-PAY_BOUNTY-PRE-2, RS-PAY_BOUNTY-POST-1, RS-PAY_BOUNTY-POST-2, RS-PAY_BOUNTY-EVT-1
+    #[test]
+    fn resolve_price_for_pays_bounty_once() {
+        let f = price_fixture(2_500, 1_999);
+        let funder = funded_bounty(&f, 300);
+        let caller = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert_eq!(
+            f.resolver.resolve_price_for(&caller, &f.market_id),
+            Outcome::Yes
+        );
+        assert_eq!(coll.balance(&caller), 300);
+        assert_eq!(coll.balance(&f.resolver_id), 0);
+
+        // The market is final, so a second finalization pays nothing.
+        assert_eq!(
+            f.resolver.try_resolve_price_for(&caller, &f.market_id),
+            Err(Ok(Error::AlreadyFinalized))
+        );
+        assert_eq!(coll.balance(&caller), 300);
+        // The escrow was paid, so the funder has nothing left to reclaim.
+        assert_eq!(f.resolver.reclaim_bounty(&funder, &f.market_id), 0);
+    }
+
+    // spec: RS-RESOLVE_PRICE_FOR-ERR-1, RS-RECLAIM_BOUNTY-ERR-1
+    #[test]
+    fn failed_resolution_pays_nothing_and_keeps_escrow() {
+        // No spec is revealed, so resolution fails and the escrow must stay put.
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 300);
+        let caller = Address::generate(&f.env);
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        f.env.ledger().set_timestamp(2_000);
+
+        assert!(f
+            .resolver
+            .try_resolve_price_for(&caller, &f.market_id)
+            .is_err());
+        assert_eq!(coll.balance(&caller), 0);
+        assert_eq!(coll.balance(&f.resolver_id), 300);
+        assert_eq!(
+            f.resolver.try_reclaim_bounty(&funder, &f.market_id),
+            Err(Ok(Error::BountyNotFinal))
+        );
+    }
+
+    // spec: RS-RECLAIM_BOUNTY-PRE-1, RS-RECLAIM_BOUNTY-POST-1, RS-RECLAIM_BOUNTY-EVT-1
+    #[test]
+    fn reclaim_bounty_refunds_funder_after_unpaid_finalization() {
+        let f = price_fixture(2_500, 1_999);
+        let funder = funded_bounty(&f, 300);
+        f.env.ledger().set_timestamp(2_000);
+        // Plain `resolve_price` does not pay the bounty to anyone.
+        assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
+
+        assert_eq!(f.resolver.reclaim_bounty(&funder, &f.market_id), 300);
+        let collateral = f.market_core.get_config().collateral;
+        assert_eq!(token::Client::new(&f.env, &collateral).balance(&funder), 300);
+    }
+
+    // spec: RS-REFUND_BOUNTY-PRE-1, RS-REFUND_BOUNTY-POST-1, RS-REFUND_BOUNTY-POST-2, RS-REFUND_BOUNTY-EVT-1
+    #[test]
+    fn guardian_void_refunds_bounty_to_funder() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let funder = funded_bounty(&f, 300);
+        // Never revealed, so the guardian may void once the reveal grace ends.
+        f.env
+            .ledger()
+            .set_timestamp(2_000 + REVEAL_GRACE_SECS + 1);
+        f.resolver
+            .guardian_void_market(&f.market_id, &GuardianReason::UnrevealedSpec);
+
+        let collateral = f.market_core.get_config().collateral;
+        let coll = token::Client::new(&f.env, &collateral);
+        assert_eq!(coll.balance(&funder), 300);
+        assert_eq!(coll.balance(&f.resolver_id), 0);
     }
 
     #[test]
