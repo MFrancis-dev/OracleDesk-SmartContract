@@ -1315,6 +1315,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "outcome-token"
+version = "0.1.0"
+dependencies = [
+ "oracledesk-types",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "outcome-token-factory"
+version = "0.1.0"
+dependencies = [
+ "market-core",
+ "oracledesk-types",
+ "outcome-token",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
