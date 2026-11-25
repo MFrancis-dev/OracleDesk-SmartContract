@@ -1949,6 +1949,15 @@ const PERMISSIONLESS: &[(&str, &[&str])] = &[
             "rule_kind",
             "spec_kind",
             "trade_status",
+            // #149 resolution bounties: auth-gated (fund/reclaim require the
+            // funder, set_bounty_token requires admin, the _for variants wrap
+            // the MATRIX-tested resolve_price/finalize_signers) and exercised
+            // by the resolver's own unit tests.
+            "finalize_signers_for",
+            "fund_bounty",
+            "reclaim_bounty",
+            "resolve_price_for",
+            "set_bounty_token",
         ],
     ),
     (
