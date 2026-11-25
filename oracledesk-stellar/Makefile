@@ -88,6 +88,9 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
+spec-check:
+	python3 scripts/spec-trace.py
+
 auth-matrix: build
 	cargo test -p integration-tests --test auth_matrix
 	./scripts/check-no-mock-all-auths.sh
