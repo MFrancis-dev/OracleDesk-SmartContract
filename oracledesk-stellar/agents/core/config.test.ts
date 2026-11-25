@@ -94,9 +94,13 @@ test("an unset AGENT_MODE defaults to dry-run with documented defaults", async (
   assert.equal(cfg.rpcUrl, NETWORKS.testnet.rpcUrl);
   assert.equal(cfg.trading.minEdgeBps, 500);
   assert.equal(cfg.trading.tradeSizeStroops, 100_000_000n);
+  assert.deepEqual(cfg.trading.kellyFraction, { numerator: 1n, denominator: 4n });
+  assert.equal(cfg.trading.sizingBufferBps, 25);
+  assert.equal(cfg.trading.minTradeStroops, 1_000_000n);
+  assert.equal(cfg.trading.fairUncertaintyBps, 500);
   assert.equal(cfg.maker.defaultSeedStroops, 1_500_000_000n);
   assert.equal(cfg.agentSecret, undefined);
-  assert.match(cfg.deploymentsFile, /deployments\/testnet\.json$/);
+  assert.match(cfg.deploymentsFile, /deployments[\\/]testnet\.json$/);
 });
 
 test("unknown and empty agent modes are rejected", async () => {
@@ -315,4 +319,97 @@ test("live startup runs both probes", async () => {
 test("parseTunables validates the same fields without a deployment", () => {
   assert.equal(parseTunables({ SLIPPAGE_BPS: "100" }).trading.slippageBps, 100);
   assert.throws(() => parseTunables({ SLIPPAGE_BPS: "1.0" }), AgentConfigError);
+  assert.deepEqual(parseTunables({ KELLY_FRACTION: "0.125" }).trading.kellyFraction, {
+    numerator: 125n,
+    denominator: 1000n,
+  });
+  assert.throws(() => parseTunables({ KELLY_FRACTION: "0" }), AgentConfigError);
+  assert.throws(() => parseTunables({ KELLY_FRACTION: "1.1" }), AgentConfigError);
+});
+
+// ─── Proposal watcher (#275) ─────────────────────────────────────────────────
+
+const WATCHER = keypair(7);
+
+test("the watcher is off by default and its limits have conservative defaults", () => {
+  const w = parseTunables({}).watcher;
+  assert.equal(w.enabled, false);
+  assert.deepEqual([w.minConfidenceBps, w.minLeadSecs, w.maxDisputesPerDay], [9_500, 60, 5]);
+  assert.equal(w.maxBondStroops <= w.budgetStroops, true, "one bond fits in the budget");
+});
+
+test("watcher settings parse and invalid ones are reported", () => {
+  const w = parseTunables({ WATCHER_ENABLED: "1", WATCHER_MIN_CONFIDENCE_BPS: "9800", WATCHER_MAX_BOND_STROOPS: "250000000", WATCHER_BUDGET_STROOPS: "750000000" }).watcher;
+  assert.deepEqual([w.enabled, w.minConfidenceBps, w.maxBondStroops, w.budgetStroops], [true, 9_800, 250_000_000n, 750_000_000n]);
+  assert.throws(() => parseTunables({ WATCHER_MIN_CONFIDENCE_BPS: "10001" }), AgentConfigError);
+  assert.throws(() => parseTunables({ WATCHER_MAX_BOND_STROOPS: "-1" }), AgentConfigError);
+  assert.throws(() => parseTunables({ WATCHER_ENABLED: "yes" }), AgentConfigError);
+});
+
+test("the watcher signs with WATCHER_SECRET_KEY and never falls back to the treasury agent's key", async () => {
+  const live = { AGENT_MODE: "live", WATCHER_ENABLED: "1" };
+  const cfg = await load({ ...live, WATCHER_SECRET_KEY: WATCHER.secret() }, { role: "watcher" }).run();
+  assert.equal(cfg.agentAddress, WATCHER.publicKey());
+  assert.equal(cfg.agentSecret, WATCHER.secret());
+
+  const issues = await issuesOf(load({ ...live, AGENT_SECRET_KEY: AGENT.secret() }, { role: "watcher" }).run());
+  assert.ok(issues.some((i) => /WATCHER_SECRET_KEY/.test(i)), issues.join(" | "));
+});
+
+test("the watcher key must be dedicated: a treasury agent's key is refused", async () => {
+  const issues = await issuesOf(load({ AGENT_MODE: "live", WATCHER_SECRET_KEY: AGENT.secret() }, { role: "watcher" }).run());
+  assert.ok(issues.some((i) => /dedicated/.test(i)), issues.join(" | "));
+});
+
+test("watcher settings are printable without any secret", async () => {
+  const cfg = await load({ WATCHER_ENABLED: "1" }, { role: "watcher" }).run();
+  const described = JSON.stringify(describeConfig(cfg), (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  assert.match(described, /"watcher":\{"enabled":true/);
+});
+
+// ── #331 volatility estimator config ──────────────────────────────────────
+
+test("live mode rejects FAIR_VALUE_BPS; dry-run keeps it for tests", async () => {
+  const issues = await issuesOf(load({ ...LIVE, FAIR_VALUE_BPS: "6000" }).run());
+  assert.ok(issues.some((i) => /FAIR_VALUE_BPS is for tests and dry-run only/.test(i)), issues.join(" | "));
+  const cfg = await load({ FAIR_VALUE_BPS: "6000" }).run();
+  assert.equal(cfg.trading.fairValueBps, 6000);
+});
+
+test("VOL_LIVE_ENABLED requires a calibration report that passes the gate", async () => {
+  const { reportHash } = await import("./calibration.js");
+  const passing = JSON.stringify({ version: 1, markets: 100, brier: 0.1, baselineBrier: 0.2 });
+  const losing = JSON.stringify({ version: 1, markets: 100, brier: 0.3, baselineBrier: 0.2 });
+  const reader = (report: string) => (path: string) =>
+    path === "/cal/report.json" ? report : JSON.stringify(deployment());
+  const missing = await issuesOf(load({ ...LIVE, VOL_LIVE_ENABLED: "1" }).run());
+  assert.ok(missing.some((i) => /VOL_CALIBRATION_REPORT/.test(i)), missing.join(" | "));
+  const env = { ...LIVE, VOL_LIVE_ENABLED: "1", VOL_CALIBRATION_REPORT: "/cal/report.json" };
+  const wrongHash = await issuesOf(
+    load({ ...env, VOL_CALIBRATION_REPORT_HASH: "0".repeat(64) }, { readFile: reader(passing) }).run(),
+  );
+  assert.ok(wrongHash.some((i) => /hash does not match/.test(i)), wrongHash.join(" | "));
+  const lose = await issuesOf(
+    load({ ...env, VOL_CALIBRATION_REPORT_HASH: reportHash(losing) }, { readFile: reader(losing) }).run(),
+  );
+  assert.ok(lose.some((i) => /does not beat/.test(i)), lose.join(" | "));
+  const cfg = await load({ ...env, VOL_CALIBRATION_REPORT_HASH: reportHash(passing) }, { readFile: reader(passing) }).run();
+  assert.equal(cfg.trading.volatility.liveEnabled, true);
+  assert.equal(cfg.trading.volatility.enabled, true);
+});
+
+test("volatility estimator defaults", async () => {
+  const cfg = await load({}).run();
+  assert.deepEqual(
+    { ...cfg.trading.volatility },
+    {
+      enabled: false,
+      liveEnabled: false,
+      estimator: "ewma",
+      historySlots: 96,
+      hybridFeedFailureBps: 200,
+      calibrationReport: undefined,
+      calibrationReportHash: undefined,
+    },
+  );
 });

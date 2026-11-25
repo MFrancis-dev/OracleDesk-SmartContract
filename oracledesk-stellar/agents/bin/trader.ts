@@ -21,7 +21,9 @@
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
+import { redactString } from "../core/redact.js";
 import { describeConfig, loadAgentConfig, type AgentConfig, type Tunables } from "../core/config.js";
+import type { DueDiligenceVerdict } from "../core/due-diligence.js";
 import { LocalTraceStore } from "../core/trace.js";
 import { followTask } from "../runtime/follow.js";
 import { arbitrageTask } from "../runtime/tasks/arbitrage.js";
@@ -44,10 +46,11 @@ export async function main(
   adapter: StellarAdapter,
   run: Tunables,
   now: () => number = () => Math.floor(Date.now() / 1000),
+  dueDiligence?: (marketId: bigint) => Promise<DueDiligenceVerdict>,
 ): Promise<void> {
   const deployments = (adapter as Partial<StellarAdapter>).deployments;
   const runtime = new Runtime({
-    tasks: [traderTask(traderDeps(run, adapter, deployments, now), { intervalMs: 0 }), ...arbTasks(run, adapter, now, 0)],
+    tasks: [traderTask(traderDeps(run, adapter, deployments, now, dueDiligence), { intervalMs: 0 }), ...arbTasks(run, adapter, now, 0)],
     state: await createStateStore(adapter.mode, run.env, deployments?.contracts.treasury ?? "unbound"),
     lease: createLease(run.env),
     ...runtimeOptions(run.env),
@@ -107,7 +110,7 @@ if (isMain) {
       return main(buildAdapter(cfg), cfg);
     })
     .catch((err) => {
-      console.error(err instanceof ConfigError ? err.message : err);
+      console.error(redactString(err instanceof Error ? err.message : String(err)));
       process.exit(err instanceof LeaseHeldError ? EXIT_TEMPFAIL : err instanceof ConfigError ? EXIT_CONFIG : 1);
     });
 }

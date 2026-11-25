@@ -12,12 +12,14 @@ import { executeArbPlan, FileArbJournal, recoverArbitrage, type ArbChain, type A
 import { parseRelations, planArbitrage, validateRelation, type Holding, type MarketSnapshot } from "../../core/strategies/arbitrage.js";
 import type { TraceStore } from "../../core/trace.js";
 import type { StellarAdapter } from "../../stellar/adapter.js";
+import { openingsAllowed } from "./mode.js";
 import type { Task, TaskContext } from "../runtime.js";
 
 export type ArbAdapter = Pick<
   StellarAdapter,
   "mode" | "agent" | "getMarket" | "treasuryPosition" | "riskCaps" | "marketSpent" | "agentBuy" | "agentSell" | "publishTrace"
->;
+> &
+  Partial<Pick<StellarAdapter, "treasuryMode">>;
 
 export interface ArbDeps {
   adapter: ArbAdapter;
@@ -82,6 +84,8 @@ export async function arbitrageTick(d: ArbDeps, ctx: TaskContext): Promise<void>
     for (const r of await ctx.submit(() => recoverArbitrage(executor), "arb:recover")) ctx.log.info("ARB_RECOVERED", { ...r });
   }
 
+  // Recovery above may unwind (a reduction); planning new legs opens exposure.
+  if (!(await openingsAllowed(d.adapter, ctx, "ARB"))) return;
   const graph = parseRelations((d.readFile ?? ((p) => readFileSync(p, "utf8")))(d.cfg.relationsFile!));
   const caps = await d.adapter.riskCaps();
   const dailyRemaining = caps.maxDaily > caps.dailyUsed ? caps.maxDaily - caps.dailyUsed : 0n;

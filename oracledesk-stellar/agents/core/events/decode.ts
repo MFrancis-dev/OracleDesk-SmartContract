@@ -52,6 +52,10 @@ export type OracleDeskEvent = EventMeta &
     | { kind: "MarketResolved"; marketId: bigint; outcome: Side | null }
     | { kind: "ResolutionProposed"; marketId: bigint; outcome: AttestedOutcome; proposedAt: bigint }
     | { kind: "ResolutionFinalized"; marketId: bigint; outcome: AttestedOutcome; finalizedAt: bigint }
+    /** `alternative` is null when the disputer claims the market is invalid. */
+    | { kind: "Disputed"; marketId: bigint; disputer: string; bond: bigint; alternative: Side | null }
+    /** `verdict` is the escalation ruling; a timeout reports Invalid with `disputerWon` false. */
+    | { kind: "DisputeSettled"; marketId: bigint; verdict: AttestedOutcome; disputerWon: boolean; payout: bigint }
     | { kind: "PriceResolution"; marketId: bigint; price: bigint; priceTimestamp: bigint; outcome: Side; fromSnapshot: boolean }
     | { kind: "TracePublished"; traceId: bigint; marketId: bigint; agent: string; action: string; traceHash: string; ipfsCid: string }
     /** Not a typed variant: `name` is the spec event name when it decoded. */
@@ -148,6 +152,24 @@ export class EventDecoder {
         return { ...meta, kind: "ResolutionProposed", marketId: d.market_id as bigint, outcome: tag(d.outcome) as AttestedOutcome, proposedAt: d.proposed_at as bigint };
       case "resolver.ResolutionFinalizedV2":
         return { ...meta, kind: "ResolutionFinalized", marketId: d.market_id as bigint, outcome: tag(d.outcome) as AttestedOutcome, finalizedAt: d.finalized_at as bigint };
+      case "resolver.Disputed":
+        return {
+          ...meta,
+          kind: "Disputed",
+          marketId: d.market_id as bigint,
+          disputer: d.disputer as string,
+          bond: d.bond as bigint,
+          alternative: d.alternative == null ? null : side(d.alternative),
+        };
+      case "resolver.DisputeSettled":
+        return {
+          ...meta,
+          kind: "DisputeSettled",
+          marketId: d.market_id as bigint,
+          verdict: tag(d.verdict) as AttestedOutcome,
+          disputerWon: d.disputer_won as boolean,
+          payout: d.payout as bigint,
+        };
       case "resolver.PriceResolution":
       case "resolver.PriceResolutionV2":
         return {

@@ -12,6 +12,19 @@ import { main } from "./trader.js";
 const FAIR_VALUE_BPS = 6000;
 const QUOTE_SHARES = 123_456n;
 
+const approved = async (marketId: bigint) => ({
+  outcome: "allow" as const,
+  reasons: [],
+  commitments: "verified" as const,
+  metadata: "verified" as const,
+  resolutionPath: "verified" as const,
+  oracleTrust: "not_applicable" as const,
+  signerTrust: "not_applicable" as const,
+  marketId: marketId.toString(),
+  stateFingerprint: "fixture-market-state",
+  checkedAt: Date.now(),
+});
+
 function fakeAdapter(quoteShares: bigint, calls: Record<string, unknown>[]): StellarAdapter {
   return {
     mode: "dry-run" as const,
@@ -27,7 +40,7 @@ function fakeAdapter(quoteShares: bigint, calls: Record<string, unknown>[]): Ste
 test("trader computes non-zero min_shares_out and limit_price_bps from a fresh quote", async () => {
   const calls: Record<string, unknown>[] = [];
   const env = { TRACE_STORE_DIR: await mkdtemp(join(tmpdir(), "trader-test-")) };
-  await main(fakeAdapter(QUOTE_SHARES, calls), parseTunables(env), () => 1_000_000);
+  await main(fakeAdapter(QUOTE_SHARES, calls), parseTunables(env), () => 1_000_000, approved);
 
   assert.equal(calls.length, 1);
   const args = calls[0];
@@ -49,7 +62,7 @@ test("trader honours SLIPPAGE_BPS and DEADLINE_SECS overrides", async () => {
     SLIPPAGE_BPS: "100",
     DEADLINE_SECS: "30",
   };
-  await main(fakeAdapter(QUOTE_SHARES, calls), parseTunables(env), () => 2_000_000);
+  await main(fakeAdapter(QUOTE_SHARES, calls), parseTunables(env), () => 2_000_000, approved);
 
   const args = calls[0];
   assert.equal(args.min_shares_out, (QUOTE_SHARES * 9_900n) / 10_000n);

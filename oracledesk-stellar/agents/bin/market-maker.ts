@@ -15,6 +15,7 @@
  * exits, `--offline` skips the network probes in dry-run.
  */
 import "dotenv/config";
+import { redactString } from "../core/redact.js";
 import { describeConfig, loadAgentConfig } from "../core/config.js";
 import { ConfigError, EXIT_CONFIG, EXIT_TEMPFAIL } from "../runtime/config.js";
 import { LeaseHeldError } from "../runtime/lease.js";
@@ -40,6 +41,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err instanceof ConfigError ? err.message : err);
+  console.error(redactString(err instanceof Error ? err.message : String(err)));
   process.exit(err instanceof LeaseHeldError ? EXIT_TEMPFAIL : err instanceof ConfigError ? EXIT_CONFIG : 1);
 });

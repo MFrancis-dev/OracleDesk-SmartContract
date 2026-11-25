@@ -61,6 +61,44 @@ test("resolver proposals, finalization and price resolutions decode", async () =
   }
 });
 
+test("Disputed decodes the disputer, bond and optional alternative", async () => {
+  const yes = await decodeOne({
+    contract: "resolver",
+    name: "Disputed",
+    ledger: 5,
+    values: { market_id: 8n, disputer: TRADER, bond: 250_000_000n, alternative: { tag: "Yes", values: undefined } },
+  });
+  assert.equal(yes?.kind, "Disputed");
+  if (yes?.kind !== "Disputed") return;
+  assert.deepEqual([yes.marketId, yes.disputer, yes.bond, yes.alternative], [8n, TRADER, 250_000_000n, "Yes"]);
+  const invalid = await decodeOne({
+    contract: "resolver",
+    name: "Disputed",
+    ledger: 5,
+    values: { market_id: 9n, disputer: TRADER, bond: 1n, alternative: undefined },
+  });
+  assert.equal(invalid?.kind === "Disputed" ? invalid.alternative : "unset", null);
+});
+
+test("DisputeSettled decodes the verdict, winner flag and payout", async () => {
+  const settled = await decodeOne({
+    contract: "resolver",
+    name: "DisputeSettled",
+    ledger: 6,
+    values: { market_id: 8n, verdict: { tag: "No", values: undefined }, disputer_won: true, payout: 250_000_000n },
+  });
+  assert.equal(settled?.kind, "DisputeSettled");
+  if (settled?.kind !== "DisputeSettled") return;
+  assert.deepEqual([settled.marketId, settled.verdict, settled.disputerWon, settled.payout], [8n, "No", true, 250_000_000n]);
+  const timeout = await decodeOne({
+    contract: "resolver",
+    name: "DisputeSettled",
+    ledger: 7,
+    values: { market_id: 9n, verdict: { tag: "Invalid", values: undefined }, disputer_won: false, payout: 1n },
+  });
+  assert.equal(timeout?.kind === "DisputeSettled" && timeout.verdict, "Invalid");
+});
+
 test("registry and treasury events decode through their own specs", async () => {
   const traced = await decodeOne({
     contract: "reasoning_registry",

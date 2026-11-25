@@ -4,23 +4,32 @@ import { MemoryPaymentLedger, SqlitePaymentLedger } from "./payment-ledger.js";
 import {
   createTraceApi,
   MapTraceRepository,
+  type TraceListRepository,
   type TraceRecord,
   type TraceRepository,
 } from "./trace-api.js";
-import { createRegistryTraceRepository } from "./registry-trace-repository.js";
+import {
+  createRegistryTraceRepository,
+  type RegistryTraceRepository,
+} from "./registry-trace-repository.js";
+import { logger } from "./logger.js";
+import { createMetrics, startMetricsServer } from "./metrics.js";
+import { receiptSignerFromEnv } from "./receipt-keys.js";
 
 interface BuiltRepository {
   repository: TraceRepository;
   listRepository?: TraceListRepository;
+  registryRepository?: RegistryTraceRepository;
 }
 
 async function buildRepository(): Promise<BuiltRepository> {
   const contractId = process.env.REASONING_REGISTRY_CONTRACT_ID;
   if (contractId) {
-    console.log(
-      `OracleDesk x402: reading traces from reasoning-registry ${contractId}`,
+    logger.info(
+      { event: "x402_repository", source: "reasoning-registry", contractId },
+      "reading traces from reasoning-registry",
     );
-    return createRegistryTraceRepository({
+    const repository = await createRegistryTraceRepository({
       contractId,
       rpcUrl:
         process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org",
@@ -30,15 +39,18 @@ async function buildRepository(): Promise<BuiltRepository> {
     });
     return { repository, listRepository: repository };
   }
-  console.log(
-    "OracleDesk x402: REASONING_REGISTRY_CONTRACT_ID not set — falling back to TRACE_RECORDS_JSON",
+  logger.warn(
+    { event: "x402_repository", source: "TRACE_RECORDS_JSON" },
+    "REASONING_REGISTRY_CONTRACT_ID not set; falling back to TRACE_RECORDS_JSON",
   );
   const records = JSON.parse(
     process.env.TRACE_RECORDS_JSON ?? "[]",
   ) as TraceRecord[];
-  return new MapTraceRepository(
-    new Map(records.map((record) => [record.traceId, record])),
-  );
+  return {
+    repository: new MapTraceRepository(
+      new Map(records.map((record) => [record.traceId, record])),
+    ),
+  };
 }
 
 async function main() {
@@ -50,8 +62,72 @@ async function main() {
     mode === "memory"
       ? new MemoryPaymentLedger()
       : new SqlitePaymentLedger(ledgerPath);
-  await ledger.reconcileStuck(0);
+  // #300: no longer clobber in-flight payments at startup. Reconciliation
+  // is age-based and only touches entries older than the settlement bound.
+  const reconcileMs = Number(process.env.X402_RECONCILE_MS ?? 30_000);
+  const reconcileBatch = Number(process.env.X402_RECONCILE_BATCH ?? 50);
+  const settleBound = Number(
+    (process.env.X402_MAX_TIMEOUT_SECONDS ?? 60) as number,
+  ) * 1000 + Number(process.env.X402_FACILITATOR_TIMEOUT_MS ?? 5000);
+  let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  // Select settling entries older than the bound and mark them indeterminate
+  // (the reconciler then decides their fate from chain state). Live requests
+  // owned by another replica are never touched.
+  const reconcile = () =>
+    ledger.reconcileStuck(settleBound).then((n) => {
+      if (n > 0)
+        logger.warn(
+          { event: "x402_reconciled", count: n },
+          "reconciled stuck payments",
+        );
+    }).catch((err) =>
+      logger.error({ event: "x402_reconcile_failed", err }, "reconciliation error"),
+    );
+  reconcileTimer = setInterval(reconcile, reconcileMs);
+  // #330: fails startup when receipts are configured (or required) but the
+  // key set is missing or invalid; payments are never settled unreceipted.
+  let receiptSigner;
+  try {
+    receiptSigner = await receiptSignerFromEnv();
+  } catch (error) {
+    if (reconcileTimer) clearInterval(reconcileTimer);
+    ledger.close();
+    throw error;
+  }
+  const built = await buildRepository();
+  const networks = [
+    ...(process.env.TESTNET_SERVER_STELLAR_ADDRESS &&
+    process.env.TESTNET_FACILITATOR_URL
+      ? [
+          {
+            network: "stellar:testnet" as const,
+            payTo: process.env.TESTNET_SERVER_STELLAR_ADDRESS,
+            facilitatorUrl: process.env.TESTNET_FACILITATOR_URL,
+            facilitatorApiKey: process.env.TESTNET_FACILITATOR_API_KEY,
+          },
+        ]
+      : []),
+    ...(process.env.MAINNET_SERVER_STELLAR_ADDRESS &&
+    process.env.MAINNET_FACILITATOR_URL
+      ? [
+          {
+            network: "stellar:pubnet" as const,
+            payTo: process.env.MAINNET_SERVER_STELLAR_ADDRESS,
+            facilitatorUrl: process.env.MAINNET_FACILITATOR_URL,
+            facilitatorApiKey: process.env.MAINNET_FACILITATOR_API_KEY,
+          },
+        ]
+      : []),
+  ];
+  const metrics = createMetrics({
+    networks: networks.map((n) => n.network),
+    countByState: () => ledger.countByState(),
+    defaultMetrics: true,
+  });
   const app = createTraceApi({
+    logger,
+    metrics,
+    receiptSigner,
     ledger,
     ledgerSequence: async (network) => {
       const url =
@@ -70,34 +146,10 @@ async function main() {
     facilitatorTimeoutMs: Number(
       process.env.X402_FACILITATOR_TIMEOUT_MS ?? 5000,
     ),
-    repository: await buildRepository(),
+    ...built,
     ipfsGateway: process.env.IPFS_GATEWAY_URL ?? "https://ipfs.io/ipfs",
     price: process.env.TRACE_PRICE_USDC ?? "0.01",
-    paymentsDisabled: process.env.PAYMENTS_DISABLED === "1",
-    networks: [
-      ...(process.env.TESTNET_SERVER_STELLAR_ADDRESS &&
-      process.env.TESTNET_FACILITATOR_URL
-        ? [
-            {
-              network: "stellar:testnet" as const,
-              payTo: process.env.TESTNET_SERVER_STELLAR_ADDRESS,
-              facilitatorUrl: process.env.TESTNET_FACILITATOR_URL,
-              facilitatorApiKey: process.env.TESTNET_FACILITATOR_API_KEY,
-            },
-          ]
-        : []),
-      ...(process.env.MAINNET_SERVER_STELLAR_ADDRESS &&
-      process.env.MAINNET_FACILITATOR_URL
-        ? [
-            {
-              network: "stellar:pubnet" as const,
-              payTo: process.env.MAINNET_SERVER_STELLAR_ADDRESS,
-              facilitatorUrl: process.env.MAINNET_FACILITATOR_URL,
-              facilitatorApiKey: process.env.MAINNET_FACILITATOR_API_KEY,
-            },
-          ]
-        : []),
-    ],
+    networks,
   });
 
   try {
@@ -106,13 +158,30 @@ async function main() {
     ledger.close();
     throw error;
   }
-  console.log("OracleDesk x402 networks:", app.locals.networks);
+  logger.info(
+    {
+      event: "x402_networks",
+      networks: app.locals.networks,
+      receipts: receiptSigner ? receiptSigner.kid : null,
+    },
+    "x402 networks ready",
+  );
   const port = Number(process.env.PORT ?? 3001);
   const server = app.listen(port, () => {
-    console.log(`OracleDesk x402 trace API listening on port ${port}`);
+    logger.info({ event: "x402_listening", port }, "x402 trace API listening");
   });
+  // Separate listener: /metrics is never exposed on the public API port.
+  const metricsPort = process.env.METRICS_PORT
+    ? Number(process.env.METRICS_PORT)
+    : undefined;
+  const metricsServer =
+    metricsPort !== undefined ? startMetricsServer(metricsPort, metrics) : undefined;
+  if (metricsServer)
+    logger.info({ event: "x402_metrics_listening", port: metricsPort }, "metrics listening");
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
+      if (reconcileTimer) clearInterval(reconcileTimer);
+      metricsServer?.close();
       server.close(() => {
         ledger.close();
       });
@@ -120,6 +189,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  logger.fatal({ err }, "x402 startup failed");
   process.exit(1);
 });

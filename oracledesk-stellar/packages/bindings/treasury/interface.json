@@ -159,6 +159,109 @@
         ]
       }
     },
+    "agent_buy_cat": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Categorical counterpart of `agent_buy`: buys `outcome_index` shares of a categorical market using treasury capital (`ROLE_TRADE`). The binary price band is a Yes/No concept so it does not apply here, but the per-trade / per-market / daily caps, the reserved-capital check, the net-exposure reserve and the nested transfer pre-authorization all do (see `do_agent_buy`).",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_index",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          }
+        ],
+        "name": "agent_buy_cat",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_buy_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Buys with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "min_shares_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_buy_traced",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
     "agent_buy_v2": {
       "kind": "function_v0",
       "spec": {
@@ -396,6 +499,75 @@
         ]
       }
     },
+    "agent_create_market_reveal_v2": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "question_hash",
+            "type_": {
+              "bytes_n": {
+                "n": 32
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "meta_uri",
+            "type_": "string"
+          },
+          {
+            "doc": "",
+            "name": "category",
+            "type_": {
+              "udt": {
+                "name": "Category"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "close_time",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "seed_amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "initial_yes_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "spec_v2",
+            "type_": {
+              "udt": {
+                "name": "ResolutionSpecV2"
+              }
+            }
+          }
+        ],
+        "name": "agent_create_market_reveal_v2",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
     "agent_daily_usage": {
       "kind": "function_v0",
       "spec": {
@@ -417,6 +589,33 @@
                   "name": "DailyUsage"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "agent_halt": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "reason",
+            "type_": "u32"
+          }
+        ],
+        "name": "agent_halt",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -458,6 +657,67 @@
           }
         ],
         "name": "agent_sell",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "agent_sell_traced": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sells with a prior decision-bearing trace consumed atomically.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome",
+            "type_": {
+              "udt": {
+                "name": "Outcome"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "collateral_out",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_shares_in",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "limit_price_bps",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "deadline",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "trace_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "agent_sell_traced",
         "outputs": [
           {
             "result": {
@@ -546,6 +806,36 @@
         ]
       }
     },
+    "audit_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "audit_mark",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "MarkRecord"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "available_capital": {
       "kind": "function_v0",
       "spec": {
@@ -600,12 +890,66 @@
         ]
       }
     },
+    "cancel_data_budget": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Cancels a pending `DataBudget` proposal. Admin only.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "cancel_data_budget",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "cancel_price_policy": {
       "kind": "function_v0",
       "spec": {
         "doc": "",
         "inputs": [],
         "name": "cancel_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "cancel_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "cancel_trace_policy",
         "outputs": [
           {
             "result": {
@@ -658,6 +1002,41 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "claim_pool_remainders": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Claims the LP pool remainders of up to `MAX_BATCH` treasury-created markets in one call, delegating to market-core's `claim_pool_remainders` (skips, never aborts on, markets the treasury did not create, markets not settled, or markets already claimed — see `redeem_many` for the batching rationale). (`ROLE_SETTLE`.)",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "claim_pool_remainders",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
             }
           }
         ]
@@ -945,12 +1324,93 @@
         ]
       }
     },
+    "execute_data_budget": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Executes a proposed `DataBudget` once the timelock has elapsed.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          }
+        ],
+        "name": "execute_data_budget",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_max_mark_age",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "execute_price_policy": {
       "kind": "function_v0",
       "spec": {
         "doc": "Applies the pending price policy once its delay has passed. Permissionless.",
         "inputs": [],
         "name": "execute_price_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "execute_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "execute_trace_policy",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "fund_data_spend": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Records a data-spend of `amount` stroops for `agent`. The agent must be active, its `DataBudget` must be active, and the deduction must not exceed the per-agent daily cap. Only the budget's registered `account` may call this.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "fund_data_spend",
         "outputs": [
           {
             "result": {
@@ -1204,6 +1664,17 @@
         ]
       }
     },
+    "max_mark_age_ledgers": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "max_mark_age_ledgers",
+        "outputs": [
+          "u32"
+        ]
+      }
+    },
     "migrate_market": {
       "kind": "function_v0",
       "spec": {
@@ -1226,6 +1697,33 @@
         ]
       }
     },
+    "migrate_marks": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "start",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "migrate_marks",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "u32"
+            }
+          }
+        ]
+      }
+    },
     "nav": {
       "kind": "function_v0",
       "spec": {
@@ -1237,6 +1735,21 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "nav_detail": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "nav_detail",
+        "outputs": [
+          {
+            "udt": {
+              "name": "NavDetail"
             }
           }
         ]
@@ -1359,6 +1872,25 @@
         ]
       }
     },
+    "pending_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "pending_max_mark_age",
+        "outputs": [
+          {
+            "option": {
+              "value_type": {
+                "udt": {
+                  "name": "PendingMarkAge"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "pending_price_policy": {
       "kind": "function_v0",
       "spec": {
@@ -1394,6 +1926,46 @@
           }
         ],
         "name": "propose_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "propose_trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "registry",
+            "type_": {
+              "option": {
+                "value_type": "address"
+              }
+            }
+          }
+        ],
+        "name": "propose_trace_policy",
         "outputs": [
           {
             "result": {
@@ -1520,6 +2092,67 @@
             "result": {
               "error_type": "error",
               "ok_type": "i128"
+            }
+          }
+        ]
+      }
+    },
+    "redeem_many": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Redeems the treasury's positions in up to `MAX_BATCH` markets in one call (market-core issue #15), delegating to market-core's `redeem_many`. `market_ids` must be strictly ascending; markets that cannot be paid out right now are reported as skipped rather than aborting the batch. The single aggregated token transfer at the end amortizes fixed per-call costs, keeping the treasury inside the per-transaction resource limits even when it holds positions in many markets. (`ROLE_SETTLE`.)",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "redeem_many",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "BatchResult"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "refresh_mark": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "market_ids",
+            "type_": {
+              "vec": {
+                "element_type": "u64"
+              }
+            }
+          }
+        ],
+        "name": "refresh_mark",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -1676,6 +2309,60 @@
         ]
       }
     },
+    "set_data_budget": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Proposes a new `DataBudget` for `agent`, subject to the config timelock. Admin only. The budget takes effect once `execute_data_budget` is called.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "max_daily",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "account",
+            "type_": "address"
+          }
+        ],
+        "name": "set_data_budget",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_data_global_cap": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Sets the network-wide global ceiling for all data budgets. Admin only. Setting `cap` to 0 removes the ceiling.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "cap",
+            "type_": "i128"
+          }
+        ],
+        "name": "set_data_global_cap",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "set_drawdown_config": {
       "kind": "function_v0",
       "spec": {
@@ -1693,6 +2380,28 @@
           }
         ],
         "name": "set_drawdown_config",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
+    "set_max_mark_age": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "name": "set_max_mark_age",
         "outputs": [
           {
             "result": {
@@ -1859,6 +2568,21 @@
         ]
       }
     },
+    "trace_policy": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "",
+        "inputs": [],
+        "name": "trace_policy",
+        "outputs": [
+          {
+            "udt": {
+              "name": "TracePolicyConfig"
+            }
+          }
+        ]
+      }
+    },
     "window_pnl": {
       "kind": "function_v0",
       "spec": {
@@ -1959,6 +2683,92 @@
         "name": "AgentPolicy"
       }
     },
+    "BatchItem": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "payout",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "status",
+            "type_": {
+              "udt": {
+                "name": "BatchStatus"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "BatchItem"
+      }
+    },
+    "BatchResult": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "items",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "BatchItem"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "BatchResult"
+      }
+    },
+    "BatchStatus": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Settled"
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Skipped",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SkipReason"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "BatchStatus"
+      }
+    },
     "CapitalBreakdown": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -1982,6 +2792,40 @@
         ],
         "lib": "",
         "name": "CapitalBreakdown"
+      }
+    },
+    "CatSignerConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "dispute_window",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "outcome_count",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "signers",
+            "type_": {
+              "vec": {
+                "element_type": "address"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "threshold",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "CatSignerConfig"
       }
     },
     "Category": {
@@ -2223,6 +3067,55 @@
         "name": "Escalation"
       }
     },
+    "FallbackAuthority": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Committee",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CommitteeRef"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Signers",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "SignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "WeightedKeys",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "WeightedKeyConfig"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "FallbackAuthority"
+      }
+    },
     "GlobalConfig": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2296,6 +3189,94 @@
         "name": "HybridConfig"
       }
     },
+    "HybridConfigV2": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "fallback",
+            "type_": {
+              "udt": {
+                "name": "FallbackAuthority"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "fallback_after",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "price",
+            "type_": {
+              "udt": {
+                "name": "PriceConfig"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "HybridConfigV2"
+      }
+    },
+    "MarkRecord": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "contribution",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "lp",
+            "type_": "bool"
+          },
+          {
+            "doc": "",
+            "name": "lp_floor",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "pos_no",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "pos_yes",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "refreshed_ledger",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "status_final",
+            "type_": "bool"
+          }
+        ],
+        "lib": "",
+        "name": "MarkRecord"
+      }
+    },
     "MarketPnl": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2319,6 +3300,31 @@
         ],
         "lib": "",
         "name": "MarketPnl"
+      }
+    },
+    "NavDetail": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "holdings",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "oldest_refresh",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "stale_lp_markets",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "NavDetail"
       }
     },
     "NetPosition": {
@@ -2467,6 +3473,26 @@
         ],
         "lib": "",
         "name": "PendingConfig"
+      }
+    },
+    "PendingMarkAge": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "executable_at",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "ledgers",
+            "type_": "u32"
+          }
+        ],
+        "lib": "",
+        "name": "PendingMarkAge"
       }
     },
     "PendingPricePolicy": {
@@ -2637,6 +3663,19 @@
           {
             "tuple_v0": {
               "doc": "",
+              "name": "CategoricalSigners",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "CatSignerConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
               "name": "Committee",
               "type_": [
                 {
@@ -2663,11 +3702,37 @@
           {
             "tuple_v0": {
               "doc": "",
+              "name": "HybridV2",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "HybridConfigV2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
               "name": "Price",
               "type_": [
                 {
                   "udt": {
                     "name": "PriceConfig"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tuple_v0": {
+              "doc": "",
+              "name": "Scalar",
+              "type_": [
+                {
+                  "udt": {
+                    "name": "ScalarPriceConfig"
                   }
                 }
               ]
@@ -2805,6 +3870,45 @@
         "name": "RiskConfig"
       }
     },
+    "ScalarPriceConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "asset",
+            "type_": {
+              "udt": {
+                "name": "OracleAsset"
+              }
+            }
+          },
+          {
+            "doc": "",
+            "name": "lower",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "name": "max_staleness",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "reflector",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "upper",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ScalarPriceConfig"
+      }
+    },
     "SettlementReport": {
       "kind": "udt_struct_v0",
       "spec": {
@@ -2857,6 +3961,104 @@
         ],
         "lib": "",
         "name": "SignerConfig"
+      }
+    },
+    "SkipReason": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "AlreadyClaimed"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Duplicate"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotCreator"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFinal"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NotFound"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "NothingToRedeem"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "SkipReason"
+      }
+    },
+    "TracePolicy": {
+      "kind": "udt_union_v0",
+      "spec": {
+        "cases": [
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Off"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Optional"
+            }
+          },
+          {
+            "void_v0": {
+              "doc": "",
+              "name": "Required"
+            }
+          }
+        ],
+        "doc": "",
+        "lib": "",
+        "name": "TracePolicy"
+      }
+    },
+    "TracePolicyConfig": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "",
+        "fields": [
+          {
+            "doc": "",
+            "name": "max_trace_age_ledgers",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "name": "policy",
+            "type_": {
+              "udt": {
+                "name": "TracePolicy"
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "TracePolicyConfig"
       }
     },
     "UsageWindow": {
@@ -3014,7 +4216,7 @@
           {
             "doc": "Close-date bucket exposure would exceed its cap (#49).",
             "name": "BucketCapExceeded",
-            "value": 30
+            "value": 60
           },
           {
             "doc": "",
@@ -3024,7 +4226,7 @@
           {
             "doc": "Category exposure would exceed its correlation cap (#49).",
             "name": "CategoryCapExceeded",
-            "value": 29
+            "value": 59
           },
           {
             "doc": "",
@@ -3094,7 +4296,7 @@
           {
             "doc": "`agent_create_market_and_reveal` was given a malformed resolution envelope or a rule outside the two primary modes (#64).",
             "name": "InvalidResolution",
-            "value": 33
+            "value": 63
           },
           {
             "doc": "",
@@ -3103,13 +4305,78 @@
           },
           {
             "doc": "",
+            "name": "MarkBatchTooLarge",
+            "value": 76
+          },
+          {
+            "doc": "",
             "name": "MarketCapExceeded",
             "value": 6
           },
           {
             "doc": "",
+            "name": "MarketCoreAlreadyClaimed",
+            "value": 35
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreCallFailed",
+            "value": 40
+          },
+          {
+            "doc": "",
             "name": "MarketCoreError",
             "value": 45
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientLiquidity",
+            "value": 33
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInsufficientShares",
+            "value": 34
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreInvalidAmount",
+            "value": 37
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketClosed",
+            "value": 32
+          },
+          {
+            "doc": "Typed market-core failures: one variant per condition the treasury can surface, so a caller sees *why* the core rejected the call instead of an opaque `MarketCoreError`. Placed in codes 29..=40, previously unused.",
+            "name": "MarketCoreMarketNotFound",
+            "value": 29
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreMarketNotOpen",
+            "value": 31
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNotFinal",
+            "value": 30
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreNothingToRedeem",
+            "value": 36
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreOverflow",
+            "value": 38
+          },
+          {
+            "doc": "",
+            "name": "MarketCoreSlippageExceeded",
+            "value": 39
           },
           {
             "doc": "",
@@ -3129,7 +4396,7 @@
           {
             "doc": "`accept_admin`/`cancel_admin_transfer` called with nothing proposed.",
             "name": "NoPendingAdmin",
-            "value": 31
+            "value": 61
           },
           {
             "doc": "",
@@ -3169,7 +4436,7 @@
           {
             "doc": "A proposed admin handover was not accepted within its `expires_at`.",
             "name": "PendingAdminExpired",
-            "value": 32
+            "value": 62
           },
           {
             "doc": "",
@@ -3203,6 +4470,11 @@
           },
           {
             "doc": "",
+            "name": "StaleMarks",
+            "value": 75
+          },
+          {
+            "doc": "",
             "name": "TicketNotFound",
             "value": 22
           },
@@ -3215,6 +4487,61 @@
             "doc": "",
             "name": "TooManyOpenMarkets",
             "value": 18
+          },
+          {
+            "doc": "",
+            "name": "TraceAgentMismatch",
+            "value": 67
+          },
+          {
+            "doc": "",
+            "name": "TraceConsumed",
+            "value": 70
+          },
+          {
+            "doc": "",
+            "name": "TraceDecisionMismatch",
+            "value": 65
+          },
+          {
+            "doc": "",
+            "name": "TraceFlagged",
+            "value": 68
+          },
+          {
+            "doc": "",
+            "name": "TraceMismatch",
+            "value": 66
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyNotPending",
+            "value": 73
+          },
+          {
+            "doc": "",
+            "name": "TracePolicyPending",
+            "value": 72
+          },
+          {
+            "doc": "",
+            "name": "TraceRegistryCallFailed",
+            "value": 71
+          },
+          {
+            "doc": "",
+            "name": "TraceRequired",
+            "value": 64
+          },
+          {
+            "doc": "",
+            "name": "TraceStale",
+            "value": 69
+          },
+          {
+            "doc": "",
+            "name": "TraceTimelockActive",
+            "value": 74
           },
           {
             "doc": "",
@@ -3254,6 +4581,38 @@
     }
   },
   "events": {
+    "AgentHalted": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "",
+        "lib": "",
+        "name": "AgentHalted",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "agent",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "reason",
+            "type_": "u32"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "roles_after",
+            "type_": "u32"
+          }
+        ],
+        "prefix_topics": [
+          "agent_halted"
+        ]
+      }
+    },
     "AgentPolicyCancelled": {
       "kind": "event_v0",
       "spec": {

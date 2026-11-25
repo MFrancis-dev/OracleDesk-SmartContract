@@ -281,28 +281,41 @@ struct RegistryFixture {
     agent: Address,
 }
 
+/// Registers the registry with its real constructor `(admin, market_core)`
+/// (#329) and one market for traces to reference.
 fn registry_fixture() -> RegistryFixture {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.cost_estimate().disable_resource_limits();
-    env.ledger().set_timestamp(BASE_TS);
-    env.ledger().set_sequence_number(1);
-    let admin = Address::generate(&env);
+    let mc = mc_fixture();
+    create_market(&mc);
+    let env = mc.env.clone();
     let agent = Address::generate(&env);
-    let contract_id = env.register(registry_wasm::WASM, (admin,));
+    let contract_id = env.register(registry_wasm::WASM, (mc.admin.clone(), mc.client.address.clone()));
     let client = registry_wasm::Client::new(&env, &contract_id);
     client.register_agent(&agent);
     RegistryFixture { env, client, agent }
 }
 
+fn registry_action(env: &Env, action: &str) -> registry_wasm::TraceAction {
+    registry_wasm::TraceAction::Other(soroban_sdk::Symbol::new(env, action))
+}
+
+fn registry_publish_raw(fx: &RegistryFixture, seed: u8) -> u64 {
+    fx.client.publish_trace(
+        &fx.agent,
+        &0u64,
+        &registry_wasm::TraceAction::Buy,
+        &BytesN::from_array(&fx.env, &[seed; 32]),
+        &String::from_str(&fx.env, "ipfs://small"),
+    )
+}
+
 fn registry_publish(fx: &RegistryFixture, action: &str, cid: &str) -> Metrics {
-    let action = String::from_str(&fx.env, action);
+    let action = registry_action(&fx.env, action);
     let cid = String::from_str(&fx.env, cid);
     let env = fx.env.clone();
     measure(&env, || {
         fx.client.publish_trace(
             &fx.agent,
-            &1u64,
+            &0u64,
             &action,
             &BytesN::from_array(&env, &[9u8; 32]),
             &cid,
@@ -312,30 +325,66 @@ fn registry_publish(fx: &RegistryFixture, action: &str, cid: &str) -> Metrics {
 
 fn reg_publish_small() -> Metrics {
     let fx = registry_fixture();
-    registry_publish(&fx, "buy yes", "ipfs://small")
+    registry_publish(&fx, "buy_yes", "ipfs://small")
 }
 
 fn reg_publish_cid_1k() -> Metrics {
     let fx = registry_fixture();
-    registry_publish(&fx, "buy yes", &"c".repeat(1_024))
+    // MAX_CID_LEN (128) is the longest accepted CID since #57.
+    registry_publish(&fx, "buy_yes", &"c".repeat(128))
 }
 
 fn reg_publish_action_1k() -> Metrics {
     let fx = registry_fixture();
-    registry_publish(&fx, &"a".repeat(1_024), "ipfs://cid")
+    // Symbols are at most 32 chars; the longest accepted `Other` action.
+    registry_publish(&fx, &"a".repeat(32), "ipfs://cid")
+}
+
+/// #329: first trace on a market writes every audit/index key at the
+/// market's audit target and caches its close time.
+fn reg_publish_audit_class() -> Metrics {
+    let fx = registry_fixture();
+    let env = fx.env.clone();
+    measure(&env, || registry_publish_raw(&fx, 1))
 }
 
 fn reg_get_trace() -> Metrics {
     let fx = registry_fixture();
-    let trace_id = fx.client.publish_trace(
-        &fx.agent,
-        &1u64,
-        &String::from_str(&fx.env, "buy yes"),
-        &BytesN::from_array(&fx.env, &[9u8; 32]),
-        &String::from_str(&fx.env, "ipfs://small"),
-    );
+    let trace_id = registry_publish_raw(&fx, 9);
     let env = fx.env.clone();
     measure(&env, || fx.client.get_trace(&trace_id))
+}
+
+fn reg_traces_by_market_page25() -> Metrics {
+    let fx = registry_fixture();
+    for seed in 0..25u8 {
+        registry_publish_raw(&fx, seed);
+    }
+    let env = fx.env.clone();
+    measure(&env, || fx.client.traces_by_market(&0u64, &0u64, &25u32))
+}
+
+fn reg_extend_traces_32() -> Metrics {
+    let fx = registry_fixture();
+    let mut ids = soroban_sdk::Vec::new(&fx.env);
+    for seed in 0..32u8 {
+        ids.push_back(registry_publish_raw(&fx, seed));
+    }
+    let env = fx.env.clone();
+    measure(&env, || fx.client.extend_traces(&ids))
+}
+
+/// #329: registry views must have read-only footprints.
+#[test]
+fn registry_views_write_nothing() {
+    for (name, f) in [
+        ("get_trace.read_only", reg_get_trace as fn() -> Metrics),
+        ("traces_by_market.page25.read_only", reg_traces_by_market_page25),
+    ] {
+        let m = f();
+        assert_eq!(m.write_entries, 0, "{name} wrote ledger entries");
+        assert_eq!(m.write_bytes, 0, "{name} wrote ledger bytes");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +417,14 @@ fn scenarios() -> Vec<Scenario> {
         ("registry.publish_trace.small", reg_publish_small),
         ("registry.publish_trace.cid_1k", reg_publish_cid_1k),
         ("registry.publish_trace.action_1k", reg_publish_action_1k),
+        ("registry.publish_trace.audit_class", reg_publish_audit_class),
         ("registry.view.get_trace", reg_get_trace),
+        ("registry.get_trace.read_only", reg_get_trace),
+        (
+            "registry.traces_by_market.page25.read_only",
+            reg_traces_by_market_page25,
+        ),
+        ("registry.extend_traces.32", reg_extend_traces_32),
     ]
 }
 

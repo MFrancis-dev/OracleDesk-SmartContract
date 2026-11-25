@@ -28,6 +28,7 @@ import {
   type FeeBumpTransaction,
   type Transaction,
 } from "@stellar/stellar-sdk";
+import { resourceFeeOf, type FeeDistribution, type FeeStatsResponse } from "../../stellar/fees.js";
 import type { ContractArtifact, ContractName } from "./artifacts.js";
 import { FaultPlan, type Fault, type RpcMethod } from "./faults.js";
 import { invoke, isWrite, type ModelEvent, type ModelState } from "./model.js";
@@ -56,6 +57,13 @@ interface TxRecord {
   resultMetaXdr: string;
   closeTime: number;
   hiddenPolls: number;
+  feeCharged: string;
+  feeBump: boolean;
+}
+
+interface ParsedEnvelope {
+  tx: Transaction;
+  feeBump?: FeeBumpTransaction;
 }
 
 interface StoredEvent {
@@ -70,12 +78,12 @@ interface StoredEvent {
 export interface FakeRpcOptions {
   networkPassphrase: string;
   contracts: Record<string, ContractArtifact>;
-  /** Starting sequence number per G... account. */
   accounts: Record<string, bigint>;
   state: ModelState;
   treasuryAddress: string;
   plan?: FaultPlan;
   clock?: Partial<LedgerClock>;
+  surge?: { minInclusion: string | number | bigint; ledgers: number };
 }
 
 const RESOURCE_FEE = 50_000;
@@ -90,9 +98,11 @@ export class FakeSorobanRpc {
   /** Transactions the fake accepted for inclusion, in order. */
   readonly submissions: Submission[] = [];
   private readonly txs = new Map<string, TxRecord>();
+  private readonly queued = new Map<string, ParsedEnvelope>();
   private readonly events: StoredEvent[] = [];
   private readonly sequences: Map<string, bigint>;
   private readonly ids: Map<string, ContractArtifact>;
+  private surge?: { minInclusion: bigint; untilLedger: number };
   private server?: Server;
 
   constructor(private readonly o: FakeRpcOptions) {
@@ -101,6 +111,7 @@ export class FakeSorobanRpc {
     this.state = o.state;
     this.sequences = new Map(Object.entries(o.accounts));
     this.ids = new Map(Object.entries(o.contracts));
+    if (o.surge) this.setSurge(o.surge.minInclusion, o.surge.ledgers);
   }
 
   get url(): string {
@@ -121,6 +132,47 @@ export class FakeSorobanRpc {
   advance(ledgers = 1): void {
     this.clock.sequence += ledgers;
     this.clock.closeTime += ledgers * this.clock.secsPerLedger;
+  }
+
+  setSurge(minInclusion: string | number | bigint, ledgers: number): void {
+    this.surge = { minInclusion: BigInt(minInclusion), untilLedger: this.clock.sequence + ledgers };
+  }
+
+  private surgeActive(): boolean {
+    return this.surge !== undefined && this.clock.sequence < this.surge.untilLedger;
+  }
+
+  private feeDistribution(): FeeDistribution {
+    const typical = this.surgeActive() ? this.surge!.minInclusion : BigInt(BASE_FEE);
+    const value = typical.toString();
+    const high = this.surgeActive() ? (typical * 10n).toString() : "1000";
+    return {
+      max: high,
+      min: "100",
+      mode: value,
+      p10: "100",
+      p20: "100",
+      p30: "100",
+      p40: "100",
+      p50: value,
+      p60: value,
+      p70: value,
+      p80: high,
+      p90: high,
+      p95: high,
+      p99: high,
+      transactionCount: "100",
+      ledgerCount: 100,
+    };
+  }
+
+  private getFeeStats(): FeeStatsResponse {
+    const distribution = this.feeDistribution();
+    return {
+      sorobanInclusionFee: distribution,
+      inclusionFee: distribution,
+      latestLedger: this.clock.sequence,
+    };
   }
 
   async start(): Promise<string> {
@@ -152,6 +204,11 @@ export class FakeSorobanRpc {
     this.requests.push({ method, fn });
     const faults = this.plan.next(method, fn);
     for (const f of faults) if (f.kind === "latency") await sleep(f.ms);
+    if (method === "getFeeStats" || method === "sendTransaction") {
+      for (const f of faults) {
+        if (f.kind === "surge") this.setSurge(f.minInclusion, f.ledgers);
+      }
+    }
     const fatal = faults.find((f) => f.kind === "timeout" || f.kind === "http" || f.kind === "rpc-error");
     if (fatal?.kind === "timeout") {
       await sleep(fatal.ms);
@@ -196,6 +253,8 @@ export class FakeSorobanRpc {
         return { id: Buffer.alloc(32, this.clock.sequence % 256).toString("hex"), protocolVersion: 23, sequence: this.clock.sequence };
       case "getLedgerEntries":
         return this.getLedgerEntries(p.keys as string[]);
+      case "getFeeStats":
+        return this.getFeeStats();
       case "simulateTransaction":
         return this.simulate(p.transaction as string, faults);
       case "sendTransaction":
@@ -281,10 +340,21 @@ export class FakeSorobanRpc {
 
   // ─── Contract calls ────────────────────────────────────────────────────────
 
-  private parse(envelope: string): Transaction {
+  private parse(envelope: string): ParsedEnvelope {
     const tx = TransactionBuilder.fromXDR(envelope, this.o.networkPassphrase) as Transaction | FeeBumpTransaction;
-    if ("innerTransaction" in tx) throw new Error("fee-bump transactions are not modelled");
-    return tx;
+    if ("innerTransaction" in tx) return { tx: tx.innerTransaction, feeBump: tx };
+    return { tx };
+  }
+
+  private inclusionRate(envelope: string, parsed = this.parse(envelope)): bigint {
+    const outer = parsed.feeBump ?? parsed.tx;
+    return BigInt(outer.fee);
+  }
+
+  private feeCharged(parsed: ParsedEnvelope): bigint {
+    const resource = resourceFeeOf(parsed.tx);
+    const operations = BigInt(parsed.tx.operations.length + (parsed.feeBump ? 1 : 0));
+    return BigInt((parsed.feeBump ?? parsed.tx).fee) * operations + resource;
   }
 
   private callOf(tx: Transaction) {
@@ -308,7 +378,7 @@ export class FakeSorobanRpc {
   private functionOf(method: string, p: Record<string, unknown>): string | undefined {
     if (method !== "simulateTransaction" && method !== "sendTransaction") return undefined;
     try {
-      return this.callOf(this.parse(p.transaction as string)).fn;
+      return this.callOf(this.parse(p.transaction as string).tx).fn;
     } catch {
       return undefined;
     }
@@ -332,7 +402,7 @@ export class FakeSorobanRpc {
   }
 
   private simulate(envelope: string, faults: Fault[]) {
-    const tx = this.parse(envelope);
+    const { tx } = this.parse(envelope);
     const { artifact, contractId, fn, args, call } = this.callOf(tx);
     const base = { latestLedger: this.clock.sequence, events: [] as string[] };
     const injected = faults.find((f) => f.kind === "contract-error");
@@ -371,7 +441,7 @@ export class FakeSorobanRpc {
     };
   }
 
-  private txResult(code: "txSUCCESS" | "txFAILED" | "txBAD_SEQ" | "txTOO_LATE" | "txINSUFFICIENT_FEE" | "txBAD_AUTH", fee = BASE_FEE): xdr.TransactionResult {
+  private txResult(code: "txSUCCESS" | "txFAILED" | "txBAD_SEQ" | "txTOO_LATE" | "txINSUFFICIENT_FEE" | "txBAD_AUTH", fee: string | number = BASE_FEE): xdr.TransactionResult {
     const R = xdr.TransactionResultResult;
     const result =
       code === "txSUCCESS"
@@ -399,25 +469,49 @@ export class FakeSorobanRpc {
   }
 
   private send(envelope: string, faults: Fault[]) {
-    const tx = this.parse(envelope);
-    const hash = tx.hash().toString("hex");
+    const parsed = this.parse(envelope);
+    const tx = parsed.tx;
+    const outer = parsed.feeBump ?? tx;
+    const hash = outer.hash().toString("hex");
+    const innerHash = tx.hash().toString("hex");
     const meta = { hash, latestLedger: this.clock.sequence, latestLedgerCloseTime: String(this.clock.closeTime) };
-    if (this.txs.has(hash) || faults.some((f) => f.kind === "duplicate")) return { status: "DUPLICATE", ...meta };
+    if (this.txs.has(hash) || (!parsed.feeBump && this.queued.has(innerHash)) || faults.some((f) => f.kind === "duplicate")) {
+      return { status: "DUPLICATE", ...meta };
+    }
     if (faults.some((f) => f.kind === "try-again-later")) return { status: "TRY_AGAIN_LATER", ...meta };
     const injected = faults.find((f) => f.kind === "tx-error");
     if (injected?.kind === "tx-error") return this.rejected(hash, injected.code);
 
-    const source = tx.source;
-    const sig = tx.signatures[0];
-    if (!sig || !Keypair.fromPublicKey(source).verify(tx.hash(), sig.signature())) return this.rejected(hash, "txBAD_AUTH");
-    const current = this.sequences.get(source);
+    const outerSig = outer.signatures[0];
+    const outerSource = parsed.feeBump ? parsed.feeBump.feeSource : tx.source;
+    if (!outerSig || !Keypair.fromPublicKey(outerSource).verify(outer.hash(), outerSig.signature())) {
+      return this.rejected(hash, "txBAD_AUTH");
+    }
+    const innerSig = tx.signatures[0];
+    if (!innerSig || !Keypair.fromPublicKey(tx.source).verify(tx.hash(), innerSig.signature())) {
+      return this.rejected(hash, "txBAD_AUTH");
+    }
+    if (parsed.feeBump && this.txs.has(innerHash)) {
+      const existing = this.txs.get(innerHash)!;
+      this.txs.set(hash, { ...existing, envelopeXdr: envelope, feeBump: true });
+      this.queued.delete(innerHash);
+      return { status: "PENDING", ...meta };
+    }
+
+    const current = this.sequences.get(tx.source);
     if (current === undefined || BigInt(tx.sequence) !== current + 1n) return this.rejected(hash, "txBAD_SEQ");
     const maxTime = Number(tx.timeBounds?.maxTime ?? 0);
     const closeTime = this.clock.closeTime + this.clock.secsPerLedger;
     if (maxTime !== 0 && closeTime > maxTime) return this.rejected(hash, "txTOO_LATE");
 
-    // Accepted: the sequence number and fee are consumed whatever happens next.
-    this.sequences.set(source, current + 1n);
+    const rate = this.inclusionRate(envelope, parsed);
+    if (this.surgeActive() && rate < this.surge!.minInclusion) {
+      if (!parsed.feeBump) this.queued.set(innerHash, parsed);
+      return { status: "PENDING", ...meta };
+    }
+
+    this.sequences.set(tx.source, current + 1n);
+    this.queued.delete(innerHash);
     this.advance();
     const { artifact, contractId, fn, args } = this.callOf(tx);
     const divergence = faults.find((f) => f.kind === "apply-failure");
@@ -426,7 +520,7 @@ export class FakeSorobanRpc {
       ? ({ ok: false, error: divergence.error } as const)
       : this.run(work, artifact, fn, args, this.clock.closeTime);
     const submission: Submission = {
-      hash,
+      hash: innerHash,
       contract: artifact.name,
       fn,
       args,
@@ -438,19 +532,23 @@ export class FakeSorobanRpc {
     if (outcome.ok) {
       Object.assign(this.state, work);
       returnValue = this.returnScVal(artifact, fn, outcome.value);
-      outcome.events.forEach((e, i) => this.recordEvent(e, contractId, hash, i));
+      outcome.events.forEach((e, i) => this.recordEvent(e, contractId, innerHash, i));
     }
     this.submissions.push(submission);
     const notFound = faults.find((f) => f.kind === "not-found");
-    this.txs.set(hash, {
+    const feeCharged = this.feeCharged(parsed).toString();
+    const record: TxRecord = {
       submission,
-      envelopeXdr: envelope,
-      resultXdr: this.txResult(outcome.ok ? "txSUCCESS" : "txFAILED", BASE_FEE + RESOURCE_FEE).toXDR("base64"),
-      // A failed Soroban transaction still has Soroban meta, with a void return value.
+      envelopeXdr: tx.toXDR(),
+      resultXdr: this.txResult(outcome.ok ? "txSUCCESS" : "txFAILED", feeCharged).toXDR("base64"),
       resultMetaXdr: this.meta(returnValue ?? xdr.ScVal.scvVoid()).toXDR("base64"),
       closeTime: this.clock.closeTime,
       hiddenPolls: notFound?.kind === "not-found" ? notFound.polls : 0,
-    });
+      feeCharged,
+      feeBump: parsed.feeBump !== undefined,
+    };
+    this.txs.set(innerHash, record);
+    if (hash !== innerHash) this.txs.set(hash, { ...record, envelopeXdr: envelope });
     return { status: "PENDING", ...meta };
   }
 
@@ -485,7 +583,8 @@ export class FakeSorobanRpc {
       ledger: tx.submission.ledger,
       createdAt: String(tx.closeTime),
       applicationOrder: 1,
-      feeBump: false,
+      feeBump: tx.feeBump,
+      feeCharged: tx.feeCharged,
       envelopeXdr: tx.envelopeXdr,
       resultXdr: tx.resultXdr,
       resultMetaXdr: tx.resultMetaXdr,

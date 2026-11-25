@@ -14,6 +14,7 @@ export type RpcMethod =
   | "getNetwork"
   | "getLatestLedger"
   | "getLedgerEntries"
+  | "getFeeStats"
   | "simulateTransaction"
   | "sendTransaction"
   | "getTransaction"
@@ -41,7 +42,8 @@ export type Fault =
   /** sendTransaction: simulation succeeded, but application fails with this `Error` variant (fee charged). */
   | { kind: "apply-failure"; error: string }
   /** sendTransaction: accepted and applied, then the connection is reset before the response. */
-  | { kind: "reset-after-accept" };
+  | { kind: "reset-after-accept" }
+  | { kind: "surge"; minInclusion: string | number | bigint; ledgers: number };
 
 export interface FaultRule {
   method: RpcMethod;

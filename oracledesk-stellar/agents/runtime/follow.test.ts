@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { DueDiligenceVerdict } from "../core/due-diligence.js";
 import { LocalTraceStore } from "../core/trace.js";
 import { FakeEventsRpc, IDS, testDecoder, trade } from "../core/events/testing.js";
 import { followTask, type FollowAdapter } from "./follow.js";
@@ -12,6 +13,18 @@ import { MemoryStateStore } from "./state.js";
 import type { TraderCandidate } from "./tasks/trader.js";
 
 const NOW = 1_700_000_000;
+const approved = (marketId: bigint): DueDiligenceVerdict => ({
+  outcome: "allow",
+  reasons: [],
+  commitments: "verified",
+  metadata: "verified",
+  resolutionPath: "verified",
+  oracleTrust: "not_applicable",
+  signerTrust: "not_applicable",
+  marketId: marketId.toString(),
+  stateFingerprint: "fixture-state",
+  checkedAt: Date.now(),
+});
 
 function fakeAdapter(buys: bigint[], exposure: Record<string, bigint>): FollowAdapter {
   return {
@@ -24,6 +37,11 @@ function fakeAdapter(buys: bigint[], exposure: Record<string, bigint>): FollowAd
     getMarket: async () => ({ creator: "G", questionHash: "", resolutionHash: "", closeTime: BigInt(NOW + 3600), status: "Open", reserveYes: 600n, reserveNo: 400n, feeBps: 100n }),
     treasuryPosition: async (id) => ({ yes: exposure[String(id)] ?? 0n, no: 0n }),
     resolutionState: async () => "SignersPending",
+    // Market 1 committed a 900 s window; market 3 exposes none (falls back to the config constant).
+    disputableConfig: async (id) =>
+      id === 1n
+        ? { signers: [], threshold: 1, disputeWindow: 900n, disputeBond: 1n, escalation: "Guardian", escalationTimeout: 1n }
+        : undefined,
     quoteBuy: async () => 1_000n,
     agentBuyV2: async (args) => {
       buys.push(args.market_id);
@@ -56,6 +74,7 @@ async function setup(exposure: Record<string, bigint> = {}) {
       slippageBps: 50n,
       deadlineSecs: 60,
       nowSecs: () => NOW,
+      dueDiligence: async (marketId) => approved(marketId),
     },
     rpc,
     decoder: await testDecoder(),
@@ -97,7 +116,16 @@ test("--follow alerts on a resolution proposal where the treasury has exposure",
   const alerts = s.logs.filter((l) => l.event === "PROPOSAL_ALERT");
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].fields?.marketId, 1n);
-  assert.equal(alerts[0].fields?.disputeDeadline, BigInt(NOW + 600));
+  assert.equal(alerts[0].fields?.disputeDeadline, BigInt(NOW + 900), "uses the market's committed dispute_window, not EVENTS_DISPUTE_WINDOW_SECS");
+});
+
+test("--follow falls back to EVENTS_DISPUTE_WINDOW_SECS when the market exposes no committed window", async () => {
+  const s = await setup({ "3": 400n });
+  await s.runtime.runOnce();
+  s.rpc.emit({ contract: "resolver", name: "ResolutionProposedV2", ledger: 1_001, values: { market_id: 3n, outcome: { tag: "No", values: undefined }, proposed_at: BigInt(NOW) } });
+  await s.runtime.runOnce();
+  const alerts = s.logs.filter((l) => l.event === "PROPOSAL_ALERT");
+  assert.equal(alerts[0]?.fields?.disputeDeadline, BigInt(NOW + 600));
 });
 
 test("a retention gap in follow mode re-evaluates every tradable market", async () => {

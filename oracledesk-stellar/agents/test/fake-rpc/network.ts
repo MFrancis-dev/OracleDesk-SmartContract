@@ -14,7 +14,9 @@
  */
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { toTraceAction } from "../../core/trace.js";
-import { StellarAdapter, type Deployments } from "../../stellar/adapter.js";
+import { StellarAdapter, type Deployments, type FeeReport } from "../../stellar/adapter.js";
+import type { FeePolicy } from "../../stellar/fees.js";
+import type { TransactionJournal } from "../../stellar/journal.js";
 import { contractIdFor, CONTRACT_NAMES, loadArtifact, type ContractArtifact, type ContractName, type ProbeCall } from "./artifacts.js";
 import { FaultPlan } from "./faults.js";
 import { initialState, seedMarket, type ModelMarket } from "./model.js";
@@ -24,6 +26,7 @@ export const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
 
 /** The agent's key, fixed so every run signs identical transactions. */
 export const AGENT = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x0a));
+export const FEE_PAYER = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x0f));
 const DEPLOYER = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x0b));
 
 const yes = { tag: "Yes", values: undefined };
@@ -86,8 +89,25 @@ export interface FakeNetwork {
   stop(): Promise<void>;
 }
 
-export async function startFakeNetwork(opts: { plan?: FaultPlan; maxTrade?: bigint; startSequence?: bigint } = {}): Promise<FakeNetwork> {
+export interface FakeNetworkOptions {
+  plan?: FaultPlan;
+  maxTrade?: bigint;
+  startSequence?: bigint;
+  surge?: { minInclusion: string | number | bigint; ledgers: number };
+  feePolicy?: FeePolicy;
+  journal?: TransactionJournal;
+  task?: string;
+  onFeeCharged?: (report: FeeReport) => void;
+}
+
+export async function startFakeNetwork(opts: FakeNetworkOptions = {}): Promise<FakeNetwork> {
   const arts = await artifacts();
+  const feePolicy = opts.feePolicy
+    ? { ...opts.feePolicy, feePayerSecret: opts.feePolicy.feePayerSecret ?? FEE_PAYER.secret() }
+    : undefined;
+  const feePayerKey = feePolicy?.feePayerSecret
+    ? Keypair.fromSecret(feePolicy.feePayerSecret).publicKey()
+    : FEE_PAYER.publicKey();
   const ids = Object.fromEntries(CONTRACT_NAMES.map((n) => [n, contractIdFor(n)])) as Record<ContractName, string>;
   const deployments: Deployments = {
     deployer: DEPLOYER.publicKey(),
@@ -104,10 +124,14 @@ export async function startFakeNetwork(opts: { plan?: FaultPlan; maxTrade?: bigi
   const rpc = new FakeSorobanRpc({
     networkPassphrase: NETWORK_PASSPHRASE,
     contracts: Object.fromEntries(CONTRACT_NAMES.map((n) => [ids[n], arts[n]])),
-    accounts: { [AGENT.publicKey()]: opts.startSequence ?? 4_294_967_296n },
+    accounts: {
+      [AGENT.publicKey()]: opts.startSequence ?? 4_294_967_296n,
+      [feePayerKey]: 4_294_967_296n,
+    },
     state,
     treasuryAddress: ids.treasury,
     plan: opts.plan,
+    surge: opts.surge,
   });
   const market = seedMarket(state, {
     seed: 10_000_000_000n,
@@ -125,7 +149,17 @@ export async function startFakeNetwork(opts: { plan?: FaultPlan; maxTrade?: bigi
     artifacts: arts,
     market,
     adapter: () =>
-      new StellarAdapter({ mode: "live", agentSecret: AGENT.secret(), networkPassphrase: NETWORK_PASSPHRASE, rpcUrl: url, deployments }),
+      new StellarAdapter({
+        mode: "live",
+        agentSecret: AGENT.secret(),
+        networkPassphrase: NETWORK_PASSPHRASE,
+        rpcUrl: url,
+        deployments,
+        feePolicy,
+        journal: opts.journal,
+        task: opts.task,
+        onFeeCharged: opts.onFeeCharged,
+      }),
     stop: async () => {
       Date.now = realNow;
       await rpc.stop();
