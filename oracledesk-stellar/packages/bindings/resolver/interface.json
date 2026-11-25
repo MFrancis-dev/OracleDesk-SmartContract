@@ -667,6 +667,69 @@
         ]
       }
     },
+    "finalize_signers_for": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: [`Resolver::finalize_signers`] that pays the market's bounty to `caller`, with the same single-invocation guarantee as [`Resolver::resolve_price_for`].",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "finalize_signers_for",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "AttestedOutcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "fund_bounty": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: escrows `amount` of the bounty token for `market_id`. Anyone may fund a market before its `close_time`. An escrow has a single funder (refunds go back to it), so a top-up must come from that same address.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "name": "fund_bounty",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
+            }
+          }
+        ]
+      }
+    },
     "get_committee": {
       "kind": "function_v0",
       "spec": {
@@ -937,6 +1000,33 @@
             "result": {
               "error_type": "error",
               "ok_type": "u64"
+            }
+          }
+        ]
+      }
+    },
+    "reclaim_bounty": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: returns an unpaid escrow to its funder once the market is final. This covers a market finalized through `resolve_price` or `finalize_signers` rather than their `_for` variants, which would otherwise leave the escrow stranded. Returns the amount refunded.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "reclaim_bounty",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "i128"
             }
           }
         ]
@@ -1362,6 +1452,37 @@
         ]
       }
     },
+    "resolve_price_for": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: [`Resolver::resolve_price`] that pays the market's bounty to `caller`. The payout happens in the same invocation that makes the market final, so a call that fails also pays nothing.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "name": "resolve_price_for",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "Outcome"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "resolve_scalar_price": {
       "kind": "function_v0",
       "spec": {
@@ -1430,6 +1551,28 @@
                   "name": "RuleKind"
                 }
               }
+            }
+          }
+        ]
+      }
+    },
+    "set_bounty_token": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "#149: records the token that resolution bounties are escrowed in. It must be market-core's collateral token, so bounties and market collateral share one asset. Because the only accepted value is the collateral address, this setter cannot repoint existing escrow at a different token, and no entrypoint lets an admin withdraw escrow.",
+        "inputs": [
+          {
+            "doc": "",
+            "name": "token",
+            "type_": "address"
+          }
+        ],
+        "name": "set_bounty_token",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": "void"
             }
           }
         ]
@@ -3050,6 +3193,26 @@
             "value": 17
           },
           {
+            "doc": "#149: a market's escrow has one funder; any other address can neither top it up nor reclaim it.",
+            "name": "BountyFunderMismatch",
+            "value": 47
+          },
+          {
+            "doc": "#149: bounties are funded only before the market's `close_time`.",
+            "name": "BountyFundingClosed",
+            "value": 46
+          },
+          {
+            "doc": "#149: a bounty can be reclaimed only once the market is final.",
+            "name": "BountyNotFinal",
+            "value": 49
+          },
+          {
+            "doc": "#149: a bounty operation ran before `set_bounty_token`.",
+            "name": "BountyTokenNotSet",
+            "value": 44
+          },
+          {
             "doc": "",
             "name": "CommitteeNotFound",
             "value": 26
@@ -3130,14 +3293,19 @@
             "value": 39
           },
           {
+            "doc": "#149: bounty amounts must be positive.",
+            "name": "InvalidBounty",
+            "value": 45
+          },
+          {
             "doc": "",
             "name": "InvalidConfig",
             "value": 3
           },
           {
-            "doc": "`attest_cat` outcome index not below the committed `outcome_count`.",
+            "doc": "`attest_cat` outcome index not below the committed `outcome_count`. Renumbered after develop's #149 bounty codes claimed 44..=49.",
             "name": "InvalidOutcomeIndex",
-            "value": 44
+            "value": 50
           },
           {
             "doc": "",
@@ -3218,6 +3386,11 @@
             "doc": "",
             "name": "MarketNotConfigured",
             "value": 5
+          },
+          {
+            "doc": "#149: no bounty was funded for this market.",
+            "name": "NoBounty",
+            "value": 48
           },
           {
             "doc": "",
@@ -3440,6 +3613,108 @@
         ],
         "prefix_topics": [
           "attested"
+        ]
+      }
+    },
+    "BountyFunded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: a market's bounty was escrowed (`total` is the escrow after top-up).",
+        "lib": "",
+        "name": "BountyFunded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "total",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_funded"
+        ]
+      }
+    },
+    "BountyPaid": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: a market's bounty was paid to the caller that finalized it.",
+        "lib": "",
+        "name": "BountyPaid",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "caller",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_paid"
+        ]
+      }
+    },
+    "BountyRefunded": {
+      "kind": "event_v0",
+      "spec": {
+        "data_format": "map",
+        "doc": "#149: an unpaid bounty went back to its funder.",
+        "lib": "",
+        "name": "BountyRefunded",
+        "params": [
+          {
+            "doc": "",
+            "location": "topic_list",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "funder",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "location": "data",
+            "name": "amount",
+            "type_": "i128"
+          }
+        ],
+        "prefix_topics": [
+          "bounty_refunded"
         ]
       }
     },
