@@ -1340,6 +1340,24 @@ risks; with no treasury position on the right side, it never disputes. It does
 not attest, does not act as an escalation committee member, and is a
 safety net for the treasury's own capital, not a general-purpose oracle.
 
+## Resolution bounties (#149)
+
+The resolver now holds funds: `fund_bounty` escrows the market's collateral in the resolver, one funder per market. `resolve_price_for` and `finalize_signers_for` pay the escrow to the caller that makes the market final, in the same invocation as the resolution, so a failed resolution pays nothing. `guardian_void_market` refunds an unpaid escrow to its funder. `reclaim_bounty` returns an unpaid escrow after a plain (unpaid) finalization. No entrypoint lets an admin withdraw escrow. `set_bounty_token` accepts only market-core's collateral address. This is a new trust surface: the resolver's escrow balance is outside market-core's solvency invariant, and the resolver's instance and bounty entries are TTL-extended on touch.
+
+## Outcome tokens (#146)
+
+A market position can be wrapped into a standard SEP-41 token, so shares can move to other wallets and into the wider Stellar ecosystem. The normative clauses are in `docs/spec/`; this section describes the design.
+
+- **`market-core.transfer_position(from, to, market_id, outcome, amount)`** moves shares between two market-core positions. `from` must authorize. It is allowed until the market is closed out.
+- **`outcome-token`** (one contract per `(market, outcome)`) is a SEP-41 token. Its own market-core position backs its supply, so `total_supply` equals that position before redemption. Only the factory may mint, unwrap, and redeem. Holders may transfer, approve, and burn. Burning is an unwrap: the shares go back to the burner's position.
+- **`outcome-token-factory`** derives each token's address from `sha256("oracledesk.outcome-token.v1" || market_id_be || outcome_byte)`, so clients can compute it before deployment. `deploy_token` is idempotent. `wrap` and `unwrap` move shares in and out. `redeem_wrapped` pays a holder their pro-rata share of the market's payout: 1:1 for the winning outcome, half (rounded down) for a void market, and zero for the losing outcome.
+
+Auth for `wrap`: the holder signs the `wrap` invocation, and the nested `transfer_position` (holder to token) is a sub-invocation the holder also authorizes. The token calls market-core as its own direct caller, so its outgoing transfers need no extra auth entry.
+
+Redemption happens once. The first `redeem_wrapped` redeems the token's whole market-core position and records the payout with the supply at that moment. Each holder's payout is their balance times that payout, divided by that fixed supply. Wrapping and unwrapping are closed after redemption.
+
+Known limits: the void payout rounds down, so one unit of dust per void can stay in the token. A token redeemed after market-core's redemption window closes cannot be redeemed. The factory does not check that `collateral` matches market-core's collateral; the deployer must pass the right address.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
